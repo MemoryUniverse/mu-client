@@ -29,3 +29,7 @@ data/
 
 # stray run logs
 *.log
+
+# tooling + captured run artifacts (never commit — logs hold conversation content)
+.serena/
+logs/

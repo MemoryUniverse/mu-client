@@ -22,8 +22,17 @@ def test_storage_reuses_mu_core_storage_settings_class() -> None:
 def test_model_profile_points_at_mu_dev_slm_by_default() -> None:
     settings = ClientSettings()
     assert settings.model == ModelProfileSettings()
-    assert settings.model.base_url == "http://127.0.0.1:11435"
+    assert settings.model is not None
+    assert settings.model.base_url == "http://127.0.0.1:11435/v1"
     assert settings.model.model_name == "qwen2.5:0.5b"
+    assert settings.model.provider == "openai"
+
+
+def test_model_profile_can_opt_out_to_none_for_heuristic_mode() -> None:
+    """Backward-compat escape hatch: an explicit ``model=None`` keeps ``LocalMemoryHost.start()``
+    in heuristic mode (mirrors ``mu_local``'s own ``StorageSettings(llm=None)`` default)."""
+    settings = ClientSettings(model=None)
+    assert settings.model is None
 
 
 def test_daemon_and_outbox_paths_default_under_memory_universe_dir() -> None:

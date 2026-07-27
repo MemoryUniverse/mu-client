@@ -9,11 +9,13 @@ Deliberately reuses mu-core's shapes rather than re-inventing them:
   identical class, not a re-shaped copy. mu-client shares mu-core's ``MU_`` env-var namespace (same
   prefix, same nested delimiter, same ``.env``/``.env.test`` files) so ONE env file configures both
   the engine's connection endpoints *and* mu-client's own subtrees below — no translation layer.
-* ``model`` is new here (mu-local's ``StorageSettings.llm`` is deliberately ``None`` this phase —
-  Azure PARKED, ``mu_local/config.py``) — a forward-looking config surface a LATER phase's LLM-aware
-  ``LocalContainer`` wiring will consume; it already defaults at the mu-dev-slm sidecar
-  (``127.0.0.1:11435``, an Ollama-compatible endpoint) so pointing the client at a real local model
-  is a config change, never a code change, the day that wiring lands.
+* ``model`` (env: ``MU_MODEL__*``) is the client's LLM/SLM profile slot. ``mu_local``'s composition
+  root (``mu_local/composition.py``) closed the ``StorageSettings.llm=None`` seam on 2026-07-27
+  (``mu-core`` commit ``e8fdaeb``): a configured ``mu_local.config.ModelProfileSettings`` now builds
+  a REAL ``ModelRouter``. ``LocalMemoryHost.start()`` (``host.py``) maps THIS profile into that
+  shape, so it defaults at the real mu-dev-slm sidecar (``127.0.0.1:11435/v1``, an OpenAI-compatible
+  Ollama endpoint) and a bare ``ClientSettings()`` wires the daemon straight to the real SLM — no
+  code change needed, only env (or the ``model=None`` opt-out for heuristic mode).
 * ``daemon_socket_path`` / ``outbox_db_path`` are named EXACTLY as the daemon-app-skeleton-spec's
   ``IpcSettings.socket_path`` / ``OutboxSettings.outbox_path`` (same default paths,
   ``~/.memory-universe/*``) so the daemon stage can promote them into nested ``DaemonSettings``
@@ -100,20 +102,30 @@ class DaemonIpcSettings(BaseModel):
 
 
 class ModelProfileSettings(BaseModel):
-    """Where the client's model slot points (reserved seam — mu-local's LLM is PARKED this
-    phase, ``mu_local/config.py`` ``StorageSettings.llm: BackendChoice | None = None``).
+    """Where the client's model slot points. ``mu_local``'s composition root (``mu_local/
+    composition.py:_build_llm_catalog``) closed the ``StorageSettings.llm=None`` seam on
+    2026-07-27 (``mu-core`` commit ``e8fdaeb``) and now builds a REAL ``ModelRouter`` whenever a
+    ``mu_local.config.ModelProfileSettings`` is supplied — ``LocalMemoryHost.start()`` maps THIS
+    profile into that shape (see ``host.py::_local_llm_profile``), so a bare ``ClientSettings()``
+    wires the daemon's ``LocalMemory`` to the REAL SLM with zero required env vars.
 
-    Defaults at the real ``mu-dev-slm`` sidecar container (``qwen2.5:0.5b``, an Ollama-compatible
-    HTTP API on the shared dev box) so a LATER LLM-aware wiring needs only a config read here, never
-    a hardcoded literal in that wiring's construction code (DEV-STANDARDS rule 3).
+    Defaults at the real ``mu-dev-slm`` sidecar container (``qwen2.5:0.5b`` over its OpenAI-
+    compatible ``/v1`` shim on the shared dev box) — the SAME shape the reference integration test
+    proved against the real docker SLM (``mu-core/packages/mu-engine/tests/pipelines/
+    test_distill_llm_slm_int.py::SlmTestSettings`` — ``litellm_provider="openai"``,
+    ``api_base=".../v1"``): ``provider`` is litellm's OpenAI-compatible provider prefix (NOT the
+    raw ``ollama`` client), so ``mu_local``'s catalog builds the litellm model id
+    ``"{provider}/{model}"`` (``openai/qwen2.5:0.5b``) against Ollama's OpenAI-compat endpoint.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    provider: str = "ollama"  # LiteLLM provider key (ProviderRegistry, mu-engine providers)
-    base_url: str = "http://127.0.0.1:11435"  # mu-dev-slm host port -> container 11434
+    provider: str = "openai"  # litellm's OpenAI-compatible provider prefix (catalog.py LOCAL_HTTP)
+    base_url: str = "http://127.0.0.1:11435/v1"  # mu-dev-slm host port, OpenAI-compat /v1 shim
     model_name: str = "qwen2.5:0.5b"
-    api_key: SecretStr | None = None  # local Ollama-compatible sidecar needs none; kept for parity
+    api_key: SecretStr = SecretStr("sk-mu-local-placeholder")  # NOT a secret — Ollama's OpenAI-
+    #   compat shim never validates it (same placeholder mu_local.config.ModelProfileSettings
+    #   defaults to); a real default (never None) so mapping never needs a second fallback literal
 
 
 class ClientSettings(BaseSettings):
@@ -132,8 +144,11 @@ class ClientSettings(BaseSettings):
     # Store ENDPOINTS — mu-core's StorageSettings shape, reused verbatim (see module docstring).
     storage: StorageSettings = Field(default_factory=StorageSettings)
 
-    # Model profile — reserved seam (see ModelProfileSettings docstring); env: MU_MODEL__*.
-    model: ModelProfileSettings = Field(default_factory=ModelProfileSettings)
+    # Model profile (see ModelProfileSettings docstring); env: MU_MODEL__*. Defaults to the real
+    # mu-dev-slm profile (never None) — an explicit ``ClientSettings(model=None)`` is the opt-out
+    # that keeps ``LocalMemoryHost.start()`` in heuristic mode (backward compat; host.py maps
+    # None -> None -> mu_local.config.StorageSettings.llm=None, byte-for-byte the prior behaviour).
+    model: ModelProfileSettings | None = Field(default_factory=ModelProfileSettings)
 
     # Daemon-stage seams (kept flat for backward compat with the foundation stage's tests); env:
     # MU_DAEMON_SOCKET_PATH / MU_OUTBOX_DB_PATH. Same literal defaults as daemon-app-skeleton-

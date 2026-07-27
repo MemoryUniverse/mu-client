@@ -21,9 +21,11 @@ import contextlib
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
+import structlog
 from mu_contracts.config.settings import RuntimeMode, Settings
 from mu_engine.platform.observability import build_metrics, build_tracer
 from mu_engine.storage.domain.memory import MemoryTier
+from mu_local.config import ModelProfileSettings as LocalModelProfileSettings
 from mu_local.config import StorageSettings as LocalBackendSettings
 from mu_local.local_memory import LocalMemory
 from mu_local.views import MemoryListView, MemoryWriteResult
@@ -36,6 +38,8 @@ if TYPE_CHECKING:
     from mu_contracts.ports.observability import MetricSink, Tracer
 
 __all__ = ["LocalMemoryHost", "daemonless_host"]
+
+_log = structlog.get_logger("mu.client.host")
 
 
 class LocalMemoryHost:
@@ -69,13 +73,33 @@ class LocalMemoryHost:
         if self._memory is not None:
             return self._memory
         core_settings = self._core_settings()
+        # Thread the client's model profile (``ClientSettings.model``, ``MU_MODEL__*``) into
+        # mu-local's own ``StorageSettings.llm`` seam (mu_local/composition.py:210-222) — the ONE
+        # place a configured profile turns into a REAL ModelRouter (SLM-backed extraction + ask)
+        # instead of the ``LocalBackendSettings()`` no-args construction this replaced, which always
+        # left ``llm=None`` and silently forced heuristic mode regardless of
+        # ``ClientSettings.model``.
+        backend_settings = LocalBackendSettings(llm=self._local_llm_profile())
+        # Content-free observability of the previously-silent decision (DEV-STANDARDS rule 4): the
+        # defect this fixes was invisible precisely because nothing logged which mode a start()
+        # landed in — operational config only (provider/model/group), never memory content.
+        if backend_settings.llm is not None:
+            _log.info(
+                "host.start.model_router_built",
+                provider=backend_settings.llm.provider,
+                model=backend_settings.llm.model,
+                model_group=backend_settings.llm.model_group,
+                base_url=backend_settings.llm.base_url,
+            )
+        else:
+            _log.info("host.start.heuristic_mode", reason="ClientSettings.model is None")
         with self._tracer.span("host.start"):
             # LocalContainer.__init__ is synchronous and loads the REAL local embedder (a genuine
             # CPU-bound model load, not I/O) — run it off the event loop (DEV-STANDARDS async
             # sharpener: no blocking work in the loop).
             memory = await asyncio.to_thread(
                 LocalMemory,
-                LocalBackendSettings(),
+                backend_settings,
                 workspace=self._settings.default_workspace,
                 namespace=self._settings.default_namespace,
                 settings=core_settings,
@@ -83,6 +107,25 @@ class LocalMemoryHost:
         self._memory = memory
         self._metrics.inc("mu_client_host_starts_total")
         return memory
+
+    def _local_llm_profile(self) -> LocalModelProfileSettings | None:
+        """Map ``ClientSettings.model`` (this client's ``mu_client.config.ModelProfileSettings``,
+        ``MU_MODEL__*`` env) into ``mu_local.config.ModelProfileSettings`` — the shape
+        ``mu_local``'s composition root actually consumes (``composition.py::_build_llm_catalog``).
+
+        ``ClientSettings.model is None`` (an explicit ``ClientSettings(model=None)`` opt-out) maps
+        to ``None`` here too, which keeps ``LocalBackendSettings.llm=None`` — byte-for-byte the
+        heuristic-mode default this client shipped with before this profile carried a real model
+        (backward compatible; mu_local/composition.py:31-33)."""
+        profile = self._settings.model
+        if profile is None:
+            return None
+        return LocalModelProfileSettings(
+            provider=profile.provider,
+            base_url=profile.base_url,
+            model=profile.model_name,
+            api_key=profile.api_key.get_secret_value(),
+        )
 
     async def aclose(self) -> None:
         """Release every store connection the container opened. Cancellation-safe: the owned

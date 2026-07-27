@@ -7,7 +7,9 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from mu_local.config import StorageSettings as LocalBackendSettings
 
+from mu_client.config import ClientSettings, ModelProfileSettings
 from mu_client.errors import ClientNotStartedError
 from mu_client.host import LocalMemoryHost
 
@@ -64,3 +66,58 @@ async def test_context_manager_starts_and_closes(monkeypatch: pytest.MonkeyPatch
     closed: bool = host.is_started
     assert not closed
     fake_memory.aclose.assert_awaited_once()
+
+
+async def test_start_wires_configured_model_profile_into_backend_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defect this locks in: ``start()`` used to construct ``LocalBackendSettings()`` with NO
+    arguments, so ``storage.llm`` was always ``None`` regardless of ``ClientSettings.model`` — the
+    daemon's ``LocalMemory`` silently stayed in heuristic mode even with a real profile configured.
+    A configured (non-``None``) ``ClientSettings.model`` must now reach ``LocalMemory`` as a real
+    ``mu_local.config.ModelProfileSettings`` on ``StorageSettings.llm``."""
+    captured: dict[str, object] = {}
+    fake_memory = AsyncMock()
+
+    def _fake_local_memory(storage: LocalBackendSettings, **_: object) -> AsyncMock:
+        captured["storage"] = storage
+        return fake_memory
+
+    monkeypatch.setattr("mu_client.host.LocalMemory", _fake_local_memory)
+    settings = ClientSettings(
+        model=ModelProfileSettings(
+            provider="openai", base_url="http://127.0.0.1:11435/v1", model_name="qwen2.5:0.5b"
+        )
+    )
+    host = LocalMemoryHost(settings)
+    await host.start()
+
+    storage = captured["storage"]
+    assert isinstance(storage, LocalBackendSettings)
+    assert storage.llm is not None
+    assert storage.llm.provider == "openai"
+    assert storage.llm.base_url == "http://127.0.0.1:11435/v1"
+    assert storage.llm.model == "qwen2.5:0.5b"
+
+
+async def test_start_with_none_model_profile_keeps_heuristic_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward compat: the explicit ``ClientSettings(model=None)`` opt-out must still reach
+    ``LocalMemory`` as ``StorageSettings.llm=None`` — byte-for-byte the prior heuristic-mode
+    behaviour, never silently upgraded to an LLM profile."""
+    captured: dict[str, object] = {}
+    fake_memory = AsyncMock()
+
+    def _fake_local_memory(storage: LocalBackendSettings, **_: object) -> AsyncMock:
+        captured["storage"] = storage
+        return fake_memory
+
+    monkeypatch.setattr("mu_client.host.LocalMemory", _fake_local_memory)
+    settings = ClientSettings(model=None)
+    host = LocalMemoryHost(settings)
+    await host.start()
+
+    storage = captured["storage"]
+    assert isinstance(storage, LocalBackendSettings)
+    assert storage.llm is None
