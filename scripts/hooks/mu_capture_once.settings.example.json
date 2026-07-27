@@ -1,0 +1,29 @@
+{
+  "_comment": "The MANAGED BLOCK a real installer (a LATER stage's install/hooks.py, daemon-app-skeleton-spec.md §7) would idempotently write into ~/.claude/settings.json — never clobbering a user's existing hooks (this host already runs multiple hooks per event, capture-spec.md §5.1). Wire ONE mu-client-owned matcher entry per event onto scripts/hooks/mu_capture_once.sh (absolute path). Every event funnels through the SAME script -> `mu capture-once --host claude_code` (capture-spec.md §3): the hook JSON on stdin carries `hook_event_name` itself, so no per-event CLI flag is needed beyond --host.",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/home/user/D/mu_project/mu-client/scripts/hooks/mu_capture_once.sh" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/home/user/D/mu_project/mu-client/scripts/hooks/mu_capture_once.sh" }] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/home/user/D/mu_project/mu-client/scripts/hooks/mu_capture_once.sh" }] }
+    ],
+    "SubagentStop": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/home/user/D/mu_project/mu-client/scripts/hooks/mu_capture_once.sh" }] }
+    ],
+    "Stop": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/home/user/D/mu_project/mu-client/scripts/hooks/mu_capture_once.sh" }] }
+    ],
+    "SessionStart": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/home/user/D/mu_project/mu-client/scripts/hooks/mu_capture_once.sh" }] }
+    ],
+    "SessionEnd": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/home/user/D/mu_project/mu-client/scripts/hooks/mu_capture_once.sh" }] }
+    ],
+    "PreCompact": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/home/user/D/mu_project/mu-client/scripts/hooks/mu_capture_once.sh" }] }
+    ]
+  }
+}

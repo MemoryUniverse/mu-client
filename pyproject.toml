@@ -1,0 +1,96 @@
+# mu-client — the on-device LOCAL client (daemon-app-skeleton-spec.md; PACKAGING-v2 §1.2, §1.3).
+# Depends on mu-core ONLY (mu-contracts + mu-engine + mu-local). NEVER mu-server
+# (import-linter "client-has-no-server" below + the grep backstop in
+# tests/unit/test_import_boundaries.py — PACKAGING-v2 §5.3).
+#
+# This STAGE (foundation + daemonless): ClientSettings, the LocalMemoryHost lifecycle wrapper
+# around mu-local's LocalMemory, and the daemonless `mu add|recall|search` CLI. The daemon
+# (IpcServer/CaptureService/SqliteOutbox/WorkerPool) is a LATER stage (daemon-app-skeleton-spec.md).
+[project]
+name = "mu-client"
+version = "0.1.0"
+description = "Memory Universe — mu-client: on-device LOCAL client (LocalMemory host + daemonless CLI; daemon is a later stage)."
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+readme = "README.md"
+dependencies = [
+    # mu-core distributions ONLY (never mu-server) — path deps onto the sibling repo, mirroring
+    # mu-sdk-python/pyproject.toml's convention (mu-core is not yet published to a registry).
+    "mu-contracts",
+    "mu-engine",
+    "mu-local",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+]
+
+[project.scripts]
+# The daemonless one-shot muscle-memory binary (daemon-app-skeleton-spec.md §2, §6):
+# `mu add|recall|search` construct the host, do the op, tear down — NO daemon required.
+# `run|install|verify|uninstall|status` (the resident daemon verbs) are a LATER stage.
+mu = "mu_client.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<0.25",
+    "mypy>=1.13,<2",
+    "ruff>=0.8,<0.9",
+    "import-linter>=2.1,<3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mu_client"]
+
+[tool.uv.sources]
+# Directory dependencies onto the sibling mu-core repo's packages (PACKAGING-v2 §5.5: "day one"
+# pin is pending an actual registry push; mu-client and mu-core are sibling repos under
+# mu_project/, not one uv workspace — see mu-sdk-python/pyproject.toml for the identical pattern).
+mu-contracts = { path = "../mu-core/packages/mu-contracts", editable = true }
+mu-engine = { path = "../mu-core/packages/mu-engine", editable = true }
+mu-local = { path = "../mu-core/packages/mu-local", editable = true }
+
+# ------------------------------------------------------------------------------------------------
+# mypy — strict, CI gate (DEV-STANDARDS "strict static typing").
+# ------------------------------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_any_unimported = true
+no_implicit_reexport = true
+show_error_codes = true
+pretty = true
+mypy_path = ["src"]
+namespace_packages = true
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+# Third-party libs without shipped stubs, reached transitively through mu-core (mirrors
+# mu-core/pyproject.toml's override list — same boundary, same reviewer eye).
+module = [
+    "qdrant_client.*",
+    "falkordb.*",
+    "litellm.*",
+    "sentence_transformers.*",
+    "redis.*",
+]
+ignore_missing_imports = true
+
+# ------------------------------------------------------------------------------------------------
+# pytest — asyncio auto mode + the two required markers (DEV-STANDARDS testing).
+# ------------------------------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config --import-mode=importlib"
+markers = [
+    "unit: isolated logic; mocks permitted (DEV-STANDARDS: mocks ONLY in pure unit tests).",
+    "integration: real running mu-dev-* containers, ZERO mocks (DEV-STANDARDS: non-negotiable).",
+]

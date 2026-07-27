@@ -1,0 +1,35 @@
+# Ruff — lint + format, CI gate (DEV-STANDARDS "Ruff (lint) + ruff-format clean").
+# Mirrors mu-core/ruff.toml's rule selection for cross-repo consistency (same reviewer eye).
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "C4",        # comprehensions
+    "ASYNC",     # flake8-async (cancellation/blocking-in-loop discipline)
+    "S",         # bandit (security)
+    "T20",       # flake8-print (DEV-STANDARDS: no print; the CLI uses the print-boundary helper)
+    "RUF",       # ruff-specific
+    "ANN",       # missing annotations (strict typing bar)
+    "TID",       # tidy-imports
+]
+ignore = [
+    "ANN401",    # allow explicit Any where deliberately annotated
+]
+
+[lint.per-file-ignores]
+"tests/**" = ["S101", "ANN"]        # asserts + loose annotations OK in tests
+"src/mu_client/cli.py" = ["T201"]   # the CLI's OWN stdout surface is the product, not debug noise
+
+[lint.isort]
+known-first-party = ["mu_client"]
+
+[format]
+docstring-code-format = true

@@ -1,0 +1,23 @@
+# import-linter — per-repo boundary (PACKAGING-v2 §5.2: "a repo can only lint packages it contains").
+# mu-client contains exactly one first-party package: mu_client.
+[importlinter]
+root_packages =
+    mu_client
+# mu_server (and mu_sdk) are never installed in THIS repo's venv (they live in sibling repos) —
+# they are "external" to import-linter's graph-builder, so the forbidden-modules contract below
+# needs this flag to check for their import statements at all (mirrors mu-sdk-python/.importlinter,
+# same cross-repo-unresolvable situation).
+include_external_packages = True
+
+# The load-bearing gate for THIS repo (owner brief: "add a 'client-has-no-server' contract").
+# mu-client may import mu_contracts / mu_engine / mu_local (mu-core's three distributions) but
+# must NEVER import mu_server (daemon-app-skeleton-spec.md banner: "never imports mu-server").
+# Backstopped by a grep test (tests/unit/test_import_boundaries.py) because import-linter cannot
+# fully resolve an uninstalled cross-repo module (PACKAGING-v2 §5.3).
+[importlinter:contract:client-has-no-server]
+name = client-has-no-server (mu_client must never import mu_server)
+type = forbidden
+source_modules =
+    mu_client
+forbidden_modules =
+    mu_server
