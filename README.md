@@ -117,14 +117,18 @@ data, and billing are involved — is the separate commercial product.
 
 This is independent, early-stage work — the productization of roughly a year of the founder's
 graduation-thesis research on multi-user agentic memory. There's no company, no funding round, no
-customer logos to show — just daily-driven code and an open build-in-public process, with an
-application in for [GitHub Sponsors](https://github.com/sponsors/TRextabat).
+customer logos to show — just daily-driven code and an open build-in-public process.
 
 If the idea of memory that stays on your machine by default, with sharing that's governed rather
 than all-or-nothing, is worth backing before it's a finished product: sponsorship funds the time
 that keeps `mu-client` (and the rest of the open stack) built, tested, and maintained while the
-hosted plane comes together. No perks, no promises beyond that — this is pre-revenue work, and it's
-presented that way deliberately.
+hosted plane comes together. No
+perks, no promises beyond that — this is pre-revenue work, and it's presented that way deliberately.
+
+## Contact
+
+- GitHub: [@TRextabat](https://github.com/TRextabat)
+- Email: amiramiritabat01@gmail.com
 
 ## Links
 
