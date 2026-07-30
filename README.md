@@ -1,71 +1,133 @@
 # mu-client
 
-Part of **Memory Universe**. See `CLAUDE.md` in this repo and `../CLAUDE.md` for the rules.
-Design authority: `../docs/superpowers/design/` (`daemon-app-skeleton-spec.md`, `capture-spec.md`,
-`host-capture-integration-devdoc.md`).
+**The on-device daemon that gives your coding agents persistent memory.** Captures what happens in
+your Claude Code and Codex sessions, keeps it on your own machine by default, and hands relevant
+context back to your agent without you asking for it.
 
-## Status
+> **Status: early, under active development (private beta in progress).** The daemonless CLI,
+> Claude Code hook capture, the durable outbox, the daemon, and recall injection are built and used
+> daily against real sessions. Codex support is landing next — see [Built vs.
+> designed](#built-vs-designed--read-this-before-you-evaluate-it). Live shared rooms and
+> cross-vendor governed sharing are designed, not shipped, and depend on the not-yet-public
+> `mu-server`.
 
-**Foundation + daemonless + capture/outbox/inject/daemon stage built.** Scope note: this stage
-wires Claude Code capture only (Codex/Desktop parsers are a later stage) and the device-sync /
-cross-plane (Centrifugo) parts of `daemon-app-skeleton-spec.md` §8/§9 are SHARED-plane features
-out of scope for a `mu-server`-free repo (`client-has-no-server`).
+## The vision
 
-## Public surface (this stage)
+Memory Universe is a persistent, governed context layer for teams of people *and* their AI agents —
+context that survives the handoff across sessions, teammates, machines, and agent vendors, and
+travels only as far as it was authorized to. `mu-client` is the piece of that vision that runs
+entirely on your machine: it is what actually watches your agent sessions, decides what's worth
+remembering, and feeds it back — with nothing leaving your device unless you explicitly share it.
 
-### Foundation (host + config)
-- `mu_client.config.ClientSettings` — the one env boundary (`MU_` prefix, shared with mu-core's
-  `.env`/`.env.test`); nested `capture`/`outbox`/`inject`/`ipc` subtrees for this stage.
-- `mu_client.host.LocalMemoryHost` / `mu_client.host.daemonless_host()` — hosts mu-local's
-  `LocalMemory` with a clean async lifecycle; `add`/`recall`/`search` verb proxies.
+## What's in this repo
 
-### Capture (`mu_client.capture`)
-- `capture.model` — `RawActivity`/`ActivityKind`/`HostKind` (capture-spec.md §4.1, verbatim shape).
-- `capture.parsers` — `HostSchemaParser`/`ParserRegistry`/`ClaudeCodeParserV1`: the real
-  `hook_event_name` → `RawActivity` mapping (`UserPromptSubmit`, `PostToolUse(Failure)`,
-  `SubagentStop`, `Stop` — F2 KEEPs the final answer, `SessionStart`/`SessionEnd`/`PreCompact`).
-  Fails loud (`CaptureSchemaDriftError`) on an unrecognized event, never guesses.
-- `capture.hook.capture_once()` — the ONE hook entrypoint: daemon fast-path if the IPC socket is
-  reachable, else a DIRECT SQLite-WAL outbox append (daemonless); on outbox-unreachable, spools to
-  `~/.memory-universe/spool/*.json` and always exits 0 (never blocks/fails the host turn).
-- `scripts/hooks/mu_capture_once.sh` + `mu_capture_once.settings.example.json` — the actual
-  script + `~/.claude/settings.json` managed-block wiring a real Claude Code hook invokes.
+`mu-client` is a Python daemon + CLI, depending only on `mu-core` (never on any server code):
 
-### Outbox (`mu_client.outbox`)
-- `outbox.sqlite_outbox.SqliteOutbox` — REAL WAL-mode SQLite (`synchronous=FULL`,
-  `UNIQUE(activity_id)` idempotent redelivery); `append`/`drain`/`ack`/`retry_later`/
-  `dead_letter`/`redrive_dead`/`quarantine_raw`/`undelivered_count`/`outbox_depth`. Recovers any
-  `INFLIGHT` row back to `PENDING` on `open()` (crash between drain and ack never loses/dupes).
+- **Capture** — hook-based auto-capture from Claude Code's hook fleet (`UserPromptSubmit`,
+  `PostToolUse`, `SubagentStop`, `Stop`, `SessionStart`/`SessionEnd`, `PreCompact`), mapped into a
+  normalized activity model. Capture never blocks or fails your agent's turn — on any outage it
+  spools to disk and always exits cleanly.
+- **Durable outbox** — a real WAL-mode SQLite outbox (`synchronous=FULL`, fsync-before-ack,
+  idempotent redelivery) sits between "the hook fired" and "the memory engine ingested it," so a
+  daemon crash mid-flight never silently loses or duplicates an activity.
+- **Injection** — recalled memory is rendered back into the host's context (`additionalContext` on
+  `SessionStart`/`UserPromptSubmit`) with an explicit fresh/stale/cold staleness contract and a
+  budget that degrades to a named file-spill rather than a silent truncation.
+- **The local engine** — `mu-client` runs `mu-engine` (from `mu-core`) directly, so a laptop with no
+  server anywhere is a complete memory system: capture, all three tiers, promotion/demotion,
+  conflict handling, recall.
+- **The `mu` CLI** — `add` / `recall` / `search` (daemonless, one-shot), `capture-once` (the hook
+  entrypoint), `flush` (drain the spool/outbox with no daemon running), and `daemon run` (the
+  resident daemon, graceful shutdown on SIGINT/SIGTERM).
 
-### Workers + inject
-- `workers.ingest_client.InProcessLocalIngest` — outbox record → `LocalMemory.add`; a control kind
-  or a filtered-slice `text=None` raises `ExtractionSkippedError` (ack, never a `MemoryItem`).
-- `workers.pool.OutboxWorker` / `WorkerPool` — drain → ingest → ack, with retry/dead-letter.
-- `inject.recall_bridge.RecallInjectBridge` — recalls from mu-local and renders the
-  `additionalContext` payload (fresh/stale/cold staleness contract; F4 10k-char budget with
-  named file-spill degrade, never a silent truncate).
-
-### Daemon (`mu_client.daemon`)
-- `daemon.ipc.IpcServer` — unix-socket (`SO_PEERCRED`-checked) front door; `capture`/`recall`/
-  `healthz` routes over newline-delimited JSON (an HTTP-route-table-compatible MVP transport, see
-  module docstring for the recorded deviation).
-- `daemon.app.LocalDaemon` — the composition root: hosts the engine, the outbox, the worker pool,
-  and the IPC server under one `asyncio.TaskGroup`; ordered shutdown (stop inbound → drain outbox
-  → release engine).
-
-### CLI (`mu` console script, `mu_client.cli`)
-- `mu add|recall|search` — daemonless one-shot (unchanged from the foundation stage).
-- `mu capture-once --host claude_code` — the hook entrypoint (reads stdin JSON).
-- `mu flush` — drains the spool + outbox into mu-local; no daemon required.
-- `mu daemon run` — the resident daemon (graceful `SIGINT`/`SIGTERM` shutdown).
-
-## Dev
+## Quickstart
 
 ```bash
+git clone https://github.com/MemoryUniverse/mu-client
+cd mu-client
 uv sync --extra dev
-uv run ruff check . && uv run ruff format --check .
-uv run mypy --strict src tests
-uv run lint-imports
-uv run pytest -m unit
-uv run pytest -m integration   # needs the mu-dev-* containers up (mu-core/docker-compose.dev.yml)
 ```
+
+Try it daemonless — no daemon, no socket, just the engine:
+
+```bash
+uv run mu add "We moved the staging DB migration window to Tuesdays 02:00 UTC."
+uv run mu recall "when is the migration window?"
+```
+
+Run the resident daemon (needed for live hook capture + injection):
+
+```bash
+uv run mu daemon run
+```
+
+Wire it into Claude Code by pointing a hook at `scripts/hooks/mu_capture_once.sh` — see
+`scripts/hooks/mu_capture_once.settings.example.json` for the exact managed block to merge into
+`~/.claude/settings.json`. Every event runs through the same script into
+`mu capture-once --host claude_code`; nothing is capture-and-guess — an unrecognized hook shape
+fails loud rather than silently mis-mapping.
+
+Codex support is being built the same way; today Codex sessions can use the daemonless `mu add`/
+`mu recall` commands directly, with hook-based auto-capture for Codex as the next milestone.
+
+## Architecture, in one paragraph
+
+A tiny Go hook-client is registered into the host's lifecycle hooks; on every event it either hits
+a fast local IPC path to a running daemon or falls back to a direct, fsync'd SQLite-WAL append —
+capture is never gated on the daemon being up. The daemon itself is one Python process running an
+`asyncio.TaskGroup` that owns the engine, the outbox worker pool, and a Unix-socket IPC server, with
+ordered shutdown (stop inbound → drain outbox → release the engine, never the reverse). Captured
+activity flows outbox → ingest → `mu-engine`'s STM/MTM/LTM tiers exactly as it would through
+`mu-local` directly; recall runs the same federated read and is rendered back into the host's
+context through the injector. No part of this requires an account, a server, or a network call —
+everything above is local-first by construction.
+
+## Built vs. designed — read this before you evaluate it
+
+- **Built and dogfooded today:** the daemonless CLI, Claude Code hook capture (full hook fleet), the
+  durable outbox, the resident daemon, recall injection, and local small-model (SLM) wiring for
+  extraction and synthesis — exercised against real, live Claude Code sessions, not synthetic
+  fixtures.
+- **In progress:** Codex hook-based auto-capture (Codex sessions work today via the CLI; native hook
+  wiring is the near-term next step), and Claude Desktop support.
+- **Designed, not shipped, depends on `mu-server` (not yet public):** a member binding their own
+  Claude Code or Codex instance into a *shared, multi-human room* as a governed first-class
+  participant under its own identity, and any form of cross-device sync. None of that exists in this
+  repo, and nothing here should be read as claiming it does.
+
+## Where this fits
+
+Part of **Memory Universe**: [github.com/MemoryUniverse](https://github.com/MemoryUniverse).
+
+| Repo | Role |
+|---|---|
+| [`mu-core`](https://github.com/MemoryUniverse/mu-core) | The open engine `mu-client` runs on-device: contracts, engine, local facade |
+| **mu-client** (this repo) | The on-device daemon: hook capture, injection, CLI |
+| [`mu-sdk-python`](https://github.com/MemoryUniverse/mu-sdk-python) | Python developer SDK — for building your own tools on Memory Universe |
+| [`mu-sdk-js`](https://github.com/MemoryUniverse/mu-sdk-js) | JavaScript/TypeScript developer SDK, parity with the Python SDK |
+| `mu-server` (private) | The hosted, governed, multi-tenant plane — the commercial part |
+
+## License
+
+Apache-2.0 (see `LICENSE`). Open-core: `mu-client`, `mu-core`, and both SDKs are fully open and stay
+full-quality on their own. `mu-server` — the hosted plane needed once other tenants, other people's
+data, and billing are involved — is the separate commercial product.
+
+## Support the vision
+
+This is independent, early-stage work — the productization of roughly a year of the founder's
+graduation-thesis research on multi-user agentic memory. There's no company, no funding round, no
+customer logos to show — just daily-driven code and an open build-in-public process, with an
+application in for [GitHub Sponsors](https://github.com/sponsors/TRextabat).
+
+If the idea of memory that stays on your machine by default, with sharing that's governed rather
+than all-or-nothing, is worth backing before it's a finished product: sponsorship funds the time
+that keeps `mu-client` (and the rest of the open stack) built, tested, and maintained while the
+hosted plane comes together. No perks, no promises beyond that — this is pre-revenue work, and it's
+presented that way deliberately.
+
+## Links
+
+- Organization: [github.com/MemoryUniverse](https://github.com/MemoryUniverse)
+- Issues / discussion: use this repo's GitHub Issues
+- License: [Apache-2.0](./LICENSE)
