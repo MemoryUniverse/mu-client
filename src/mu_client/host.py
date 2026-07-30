@@ -40,7 +40,7 @@ from mu_client.errors import ClientNotStartedError
 
 if TYPE_CHECKING:
     from mu_contracts.ports.observability import MetricSink, Tracer
-    from mu_engine.lifecycle.manager import MemoryLifecycleManager
+    from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
 
 __all__ = ["LocalMemoryHost", "daemonless_host"]
 
@@ -164,14 +164,17 @@ class LocalMemoryHost:
         lease: LifecycleLeasePort | None = None,
         runner: LifecycleWorkflowRunnerPort | None = None,
         clock: Clock | None = None,
+        warm_cache: WarmRecallCacheServicePort | None = None,
     ) -> MemoryLifecycleManager:
         """Passthrough to ``LocalMemory.build_lifecycle_manager`` — constructs the real
         :class:`~mu_engine.lifecycle.manager.MemoryLifecycleManager` over THIS host's own
         ``LocalMemory`` (same stores/distill/bus). ``lease``/``runner`` let the daemon thread its
         real ``SqliteWalLeaseAdapter``/``SqliteWalRunner`` (S1-06) through this ONE composition
-        root instead of building a second engine graph."""
+        root instead of building a second engine graph; ``warm_cache`` likewise threads the
+        daemon's real ``RecallInjectBridge`` (S3-02) through instead of building a second
+        warm-cache service."""
         return self._require_memory().build_lifecycle_manager(
-            lease=lease, runner=runner, clock=clock
+            lease=lease, runner=runner, clock=clock, warm_cache=warm_cache
         )
 
     # ------------------------------------------------------------------------------- verb proxies

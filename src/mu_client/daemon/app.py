@@ -137,31 +137,29 @@ class LocalDaemon:
         )
         self._pool = WorkerPool(worker, poll_interval_s=self._settings.outbox.poll_interval_s)
 
-        # 5) INJECTION bridge (capture-spec.md §7.2).
-        bridge = RecallInjectBridge(self._host, settings=self._settings.inject)
+        # 5) INJECTION bridge (capture-spec.md §7.2), NOW wired onto the REAL bus (Stage-3
+        #    integrate — was a bare PULL-only bridge before this pass, so a real MLM tier
+        #    transition never pushed a refresh). ``self._host.bus`` is the SAME ``InprocBus``
+        #    ``IngestService``/``DistillPipeline`` publish onto (module docstring point 1) — the
+        #    bridge subscribes to the identical real event stream ``MaintenanceLoop`` does below,
+        #    never a second, dark bus.
+        bridge = RecallInjectBridge(self._host, settings=self._settings.inject, bus=self._host.bus)
 
-        # 6) FRONT DOOR. Bound HERE (synchronously, awaited) — a caller of start()/lifespan() must
-        #    be able to connect to the real socket the instant start() returns, never race the
-        #    background accept loop's own startup.
-        self._ipc = IpcServer(
-            self._settings.ipc, registry=registry, outbox=self._outbox, bridge=bridge
-        )
-        await self._ipc.bind()
-
-        # 7) MAINTENANCE LOOP — the 3rd supervised task (memory-lifecycle-manager-spec.md §14
-        #    slice 1 / S1-07): event-driven fast-fire + the two decoupled periodic cadences (§7/
-        #    §7b), now over the REAL bus + the REAL MemoryLifecycleManager (see module docstring).
-        #    The durable job log + cross-process lease share ONE sqlite-WAL file (BQ1) next to the
-        #    outbox DB — a sibling file, not the outbox's own (different schema/owner, §5/§4b).
-        #    Named from the outbox file's OWN stem (integrate-phase fix, not a bare "lifecycle.
-        #    sqlite3" literal): two daemons that happen to share a parent directory but point at
-        #    DIFFERENT outbox files (e.g. test_maintenance_int.py's AC-1.2 baseline/loaded daemons,
-        #    both under one pytest tmp_path) must never collide on the identical lifecycle-WAL
-        #    file — that collision reproduced verbatim as a real ``sqlite3.OperationalError:
-        #    database is locked`` (BEGIN IMMEDIATE contention between two independent connections
-        #    to one file) before this fix. A single real daemon's own outbox path is already
-        #    unique per device (daemon-app-skeleton-spec.md §4), so this changes nothing for the
-        #    production one-daemon-per-directory case.
+        # 6) LIFECYCLE MANAGER — the real ``MemoryLifecycleManager`` (S1-03) + real durable
+        #    runner/lease (S1-06), built BEFORE the IPC front door below (Stage-3 integrate
+        #    reorder) so ``/state``/``/ready-context`` (S3-03) can thread it through
+        #    ``IpcServer(lifecycle_manager=...)`` at construction rather than needing a mutable
+        #    setter. The durable job log + cross-process lease share ONE sqlite-WAL file (BQ1)
+        #    next to the outbox DB — a sibling file, not the outbox's own (different schema/owner,
+        #    §5/§4b). Named from the outbox file's OWN stem (integrate-phase fix, not a bare
+        #    "lifecycle.sqlite3" literal): two daemons that happen to share a parent directory but
+        #    point at DIFFERENT outbox files (e.g. test_maintenance_int.py's AC-1.2 baseline/loaded
+        #    daemons, both under one pytest tmp_path) must never collide on the identical
+        #    lifecycle-WAL file — that collision reproduced verbatim as a real
+        #    ``sqlite3.OperationalError: database is locked`` (BEGIN IMMEDIATE contention between
+        #    two independent connections to one file) before this fix. A single real daemon's own
+        #    outbox path is already unique per device (daemon-app-skeleton-spec.md §4), so this
+        #    changes nothing for the production one-daemon-per-directory case.
         outbox_path = self._settings.outbox.outbox_path.expanduser()
         lifecycle_wal_path = outbox_path.parent / f"{outbox_path.stem}-lifecycle.sqlite3"
         self._lifecycle_runner = SqliteWalRunner(lifecycle_wal_path)
@@ -172,17 +170,38 @@ class LocalDaemon:
         )
         await self._lifecycle_lease.open()
 
+        # ``warm_cache=bridge`` (Stage-3 integrate): the SAME ``RecallInjectBridge`` instance is
+        # the ``WarmRecallCacheServicePort`` this manager's ``ready_context`` reads synchronously —
+        # never a second, competing warm-cache service (CANONICAL §7.22 ONE owner).
         self._lifecycle_manager = self._host.build_lifecycle_manager(
-            lease=self._lifecycle_lease, runner=self._lifecycle_runner
-        )
-        self._maintenance = MaintenanceLoop(
-            bus=self._host.bus, lifecycle_manager=self._lifecycle_manager
+            lease=self._lifecycle_lease, runner=self._lifecycle_runner, warm_cache=bridge
         )
         if resumed:
             # Any job resume_pending() reset PENDING -> re-drained by _drain_lifecycle_jobs below;
             # nothing further to do here (fail-loud logging already happened inside SqliteWalRunner
             # if a genuinely crashed row was found — this is just an observability breadcrumb).
             pass
+
+        # 7) FRONT DOOR. Bound HERE (synchronously, awaited) — a caller of start()/lifespan() must
+        #    be able to connect to the real socket the instant start() returns, never race the
+        #    background accept loop's own startup. ``lifecycle_manager=self._lifecycle_manager``
+        #    (S3-03, Stage-3 integrate) wires the real ``/state``/``/ready-context`` routes instead
+        #    of the named-503 unwired degrade.
+        self._ipc = IpcServer(
+            self._settings.ipc,
+            registry=registry,
+            outbox=self._outbox,
+            bridge=bridge,
+            lifecycle_manager=self._lifecycle_manager,
+        )
+        await self._ipc.bind()
+
+        # 8) MAINTENANCE LOOP — the 3rd supervised task (memory-lifecycle-manager-spec.md §14
+        #    slice 1 / S1-07): event-driven fast-fire + the two decoupled periodic cadences (§7/
+        #    §7b), over the REAL bus + the REAL MemoryLifecycleManager built in step 6 above.
+        self._maintenance = MaintenanceLoop(
+            bus=self._host.bus, lifecycle_manager=self._lifecycle_manager
+        )
 
         await self._supervise()
 

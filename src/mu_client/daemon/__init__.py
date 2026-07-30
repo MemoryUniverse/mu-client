@@ -6,3 +6,8 @@ listeners (Centrifugo control frames, §8/§9), and bound-agent supervision are 
 multi-device features out of THIS stage's scope — see ``app.py``'s module docstring."""
 
 from __future__ import annotations
+
+from mu_client.daemon.app import LocalDaemon
+from mu_client.daemon.ipc import IpcServer
+
+__all__ = ["IpcServer", "LocalDaemon"]

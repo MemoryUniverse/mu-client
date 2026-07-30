@@ -7,6 +7,23 @@ stage serves the identical contract over a newline-delimited JSON protocol on th
 socket (no aiohttp/uvicorn dependency for an MVP front door) — one JSON object in, one JSON
 object out, connection closed. Loopback-HTTP is a route-table-compatible follow-up (the handlers
 below are already framework-agnostic), not a rewrite.
+
+**``/state`` + ``/ready-context`` (S3-03, ADR 0033 "always-accessible" leg 2).** memory-lifecycle-
+manager-spec.md §5 (lines 247-252): "the existing loopback IPC socket serves ``/state``,
+``/recall``, ``/ready-context`` as instant warm-cache reads that never touch the runner". Both new
+routes dispatch to the SAME ``_handle``/``_dispatch`` newline-delimited-JSON pipe every other
+route already uses — no second protocol, no new auth surface (the ``SO_PEERCRED`` check in
+``_handle`` runs before ``_dispatch`` is ever reached, identically for every route). Both handlers
+below call ``MemoryLifecycleManager.get_state``/``.ready_context`` directly — spec §5's own words,
+"synchronous warm reads (never enqueue, never await a job)" — so a sweep/promote/demote job
+in flight on the SAME ``LifecycleWorkflowRunnerPort`` never blocks either route: there is no
+``await self._runner...`` anywhere on this call path, structurally (not just empirically) unlike
+``sweep_user``/``promote``/``demote``, which are the ONLY methods on the manager that touch
+``self._runner``. ``lifecycle_manager`` is optional (``None`` when a caller — e.g. today's
+``daemon/app.py``, ahead of its own integrate-phase wiring — has not threaded one through yet);
+both routes then answer a named, content-free 503 rather than raising, matching this file's
+existing "never construct a service IpcServer itself owns" discipline for ``registry``/``outbox``/
+``bridge``.
 """
 
 from __future__ import annotations
@@ -18,9 +35,10 @@ import json
 import os
 import socket
 import struct
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
+from mu_contracts.domain.model.memory import Namespace
 
 from mu_client.capture.model import HostKind
 from mu_client.capture.parsers import ParserRegistry
@@ -29,6 +47,12 @@ from mu_client.errors import CaptureSchemaDriftError
 from mu_client.inject.recall_bridge import RecallInjectBridge
 from mu_client.observability.events import log_activity_captured, log_capture_source_halted
 from mu_client.outbox.sqlite_outbox import SqliteOutbox
+
+if TYPE_CHECKING:
+    # Type-only (mirrors host.py/app.py's identical guard): IpcServer never CONSTRUCTS a
+    # MemoryLifecycleManager, only calls warm-read methods on one handed to it, so no runtime
+    # import is needed on this socket-front-door module's own import surface.
+    from mu_engine.lifecycle.manager import MemoryLifecycleManager
 
 __all__ = ["IpcServer"]
 
@@ -43,11 +67,17 @@ class IpcServer:
         registry: ParserRegistry,
         outbox: SqliteOutbox,
         bridge: RecallInjectBridge,
+        lifecycle_manager: MemoryLifecycleManager | None = None,
     ) -> None:
         self._settings = settings
         self._registry = registry
         self._outbox = outbox
         self._bridge = bridge
+        # Optional (module docstring): None until a composition root (integrate-phase daemon/
+        # app.py wiring — S1-03's real MemoryLifecycleManager already exists there as
+        # LocalDaemon._lifecycle_manager) threads one through. /state and /ready-context answer a
+        # named 503 rather than raising when absent.
+        self._lifecycle_manager = lifecycle_manager
         self._server: asyncio.AbstractServer | None = None
         self._accepting = True
 
@@ -110,6 +140,10 @@ class IpcServer:
             return await self._route_recall(request)
         if route == "healthz":
             return await self._route_healthz()
+        if route == "state":
+            return await self._route_state(request)
+        if route == "ready-context":
+            return await self._route_ready_context(request)
         return {"status": 404, "error": "unknown_route", "route": route}
 
     async def _route_capture(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -146,6 +180,29 @@ class IpcServer:
             "outbox_depth": await self._outbox.outbox_depth(),
             "dead_letter_count": await self._outbox.undelivered_count(),
         }
+
+    async def _route_state(self, request: dict[str, Any]) -> dict[str, Any]:
+        """``/state`` -> ``MemoryLifecycleManager.get_state(ns)`` — instant warm read (spec §5).
+        ``async def`` for dispatch-table uniformity only: the body below contains no ``await`` at
+        all, so a running sweep on ``self._lifecycle_manager``'s own
+        ``LifecycleWorkflowRunnerPort`` structurally cannot block this coroutine — there is nothing
+        here to block ON.
+
+        ``namespace`` on the wire is η's own 5-part codec (``Namespace.parts()``/``.from_parts()``,
+        CANONICAL §7.3): ``[org, workspace, user, session, visibility]``."""
+        if self._lifecycle_manager is None:
+            return {"status": 503, "error": "lifecycle_manager_not_wired"}
+        ns = Namespace.from_parts(tuple(request["namespace"]))
+        view = self._lifecycle_manager.get_state(ns)
+        return {"status": 200, **view.model_dump(mode="json")}
+
+    async def _route_ready_context(self, request: dict[str, Any]) -> dict[str, Any]:
+        """``/ready-context`` -> ``MemoryLifecycleManager.ready_context(session_id)`` — instant
+        warm read (spec §5). Same no-``await``-in-body guarantee as :meth:`_route_state`."""
+        if self._lifecycle_manager is None:
+            return {"status": 503, "error": "lifecycle_manager_not_wired"}
+        rendered = self._lifecycle_manager.ready_context(str(request["session_id"]))
+        return {"status": 200, **rendered.model_dump(mode="json")}
 
 
 def _peer_is_self(writer: asyncio.StreamWriter) -> bool:
