@@ -32,12 +32,20 @@ env-configurable surface: store *endpoints*, the model profile, and the two forw
 
 from __future__ import annotations
 
+import socket
 from functools import lru_cache
 from pathlib import Path
 
 from mu_contracts.config.settings import StorageSettings
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_device_id() -> str:
+    """A stable-enough per-device string for the lease-naming convention (CANONICAL §7.5,
+    ``lifecycle-sweep-lease:local:{device_id}:{...}``) with zero required setup — the local
+    hostname. Override via ``MU_DEVICE_ID`` for a multi-daemon-on-one-host test rig."""
+    return socket.gethostname()
 
 __all__ = [
     "CaptureSettings",
@@ -169,6 +177,11 @@ class ClientSettings(BaseSettings):
     default_workspace: str = "local"
     default_namespace: str = "default"
     default_user: str = "default"
+
+    # This device's identity for the plane-qualified lease-naming convention (CANONICAL §7.5) —
+    # threaded into ``SqliteWalLeaseAdapter`` (S1-06) by the daemon composition root
+    # (``daemon/app.py``). env: ``MU_DEVICE_ID``.
+    device_id: str = Field(default_factory=_default_device_id)
 
 
 @lru_cache

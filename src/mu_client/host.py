@@ -23,6 +23,10 @@ from typing import TYPE_CHECKING
 
 import structlog
 from mu_contracts.config.settings import RuntimeMode, Settings
+from mu_contracts.ports.bus import EventBusPort
+from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
+from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
+from mu_contracts.ports.time import Clock
 from mu_engine.platform.observability import build_metrics, build_tracer
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_local.config import ModelProfileSettings as LocalModelProfileSettings
@@ -36,6 +40,7 @@ from mu_client.errors import ClientNotStartedError
 
 if TYPE_CHECKING:
     from mu_contracts.ports.observability import MetricSink, Tracer
+    from mu_engine.lifecycle.manager import MemoryLifecycleManager
 
 __all__ = ["LocalMemoryHost", "daemonless_host"]
 
@@ -143,6 +148,31 @@ class LocalMemoryHost:
 
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
+
+    # --------------------------------------------------------------- lifecycle (integrate-phase)
+    @property
+    def bus(self) -> EventBusPort:
+        """The REAL ``InprocBus`` the owned ``LocalMemory``'s ingest/distill publish onto
+        (``mu_local.local_memory.LocalMemory.bus`` -> ``LocalContainer.bus``) — the daemon's
+        ``MaintenanceLoop`` (S1-07) subscribes HERE, never to a second, independently-constructed
+        bus that would never see a real ``MemoryCaptured``/``MemoryPromoted`` event."""
+        return self._require_memory().bus
+
+    def build_lifecycle_manager(
+        self,
+        *,
+        lease: LifecycleLeasePort | None = None,
+        runner: LifecycleWorkflowRunnerPort | None = None,
+        clock: Clock | None = None,
+    ) -> MemoryLifecycleManager:
+        """Passthrough to ``LocalMemory.build_lifecycle_manager`` — constructs the real
+        :class:`~mu_engine.lifecycle.manager.MemoryLifecycleManager` over THIS host's own
+        ``LocalMemory`` (same stores/distill/bus). ``lease``/``runner`` let the daemon thread its
+        real ``SqliteWalLeaseAdapter``/``SqliteWalRunner`` (S1-06) through this ONE composition
+        root instead of building a second engine graph."""
+        return self._require_memory().build_lifecycle_manager(
+            lease=lease, runner=runner, clock=clock
+        )
 
     # ------------------------------------------------------------------------------- verb proxies
     # Thin, observed delegations to the owned LocalMemory — the surface both the CLI (cli.py) and a
