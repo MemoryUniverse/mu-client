@@ -74,11 +74,39 @@ Codex support is being built the same way; today Codex sessions can use the daem
 
 ```mermaid
 flowchart LR
-    H["Claude Code / Codex<br/>hooks"] --> Cap["Capture"]
-    Cap --> Ob["Durable outbox<br/>fsync'd SQLite-WAL"]
-    Ob --> D["Daemon"]
-    D --> IR["Inject / recall"]
-    IR --> E["mu-core engine"]
+    classDef host fill:#e5e0f5,color:#241b2f,stroke:#7567c7
+    classDef capture fill:#d6ece8,color:#241b2f,stroke:#2d7c78
+    classDef store fill:#fffdfc,color:#241b2f,stroke:#241b2f
+    classDef daemon fill:#241b2f,color:#fff,stroke:#000
+    classDef engine fill:#d6ece8,color:#241b2f,stroke:#2d7c78
+
+    Host["Claude Code / Codex<br/>lifecycle hooks"]:::host
+    Tail["Transcript / rollout tailing"]:::host
+    Cap["Capture"]:::capture
+    Parse["Parser<br/>(normalized activity model)"]:::capture
+    CLI["Daemonless CLI<br/>(mu add / mu recall)"]:::host
+
+    Ob["Outbox<br/>SQLite-WAL, fsync-before-ack"]:::store
+
+    subgraph Daemon["Daemon"]
+        direction TB
+        Pool["Worker pool"]:::daemon
+        Maint["Maintenance loop"]:::daemon
+    end
+
+    Engine["mu-core engine<br/>(mu-local)"]:::engine
+    Bridge["Recall / inject bridge"]:::capture
+    Ctx["Context injected back<br/>into the host"]:::host
+
+    Host --> Cap
+    Tail --> Cap
+    Cap --> Parse --> Ob
+    CLI --> Ob
+    Ob --> Daemon
+    Pool --> Engine
+    Maint --> Engine
+    Engine --> Bridge --> Ctx
+    Ctx --> Host
 ```
 
 A tiny Go hook-client is registered into the host's lifecycle hooks; on every event it either hits
