@@ -14,25 +14,26 @@ list (``.claude/team_analysis`` plan, task id S3-02):
   RIGHT NOW: the test never calls ``bridge.render()`` again after publishing the event, so the
   courtesy cache stops carrying the fact without a stale hit (acceptance clause 1's invalidate
   half + clause 4's second half).
-- **Cross-session federation (acceptance clause 2 / clause 4 first half) — CONFIRMED BLOCKED
-  upstream, real reproduction, xfail(strict).** ``LocalMemory.recall`` does build its
-  ``RecallQuery`` with the default ``session_scope=None`` (S1-04, ``local_memory.py:181``), and
-  the MTM query layer (``qdrant_mtm.py:_resolve_namespace_match``) really does relax to the
-  truncated user-prefix match for a cross-session hit. But ``RecallService``'s own
-  belt-and-suspenders authz re-check (``recall/service.py:134`` ->
-  ``recall/authz.py:RecallAuthorizationFilter.assert_items`` -> ``platform/tenancy.py:
-  DefaultTenancyGuard.assert_scope`` -> ``mu_contracts/domain/model/scope.py:
-  ClientScope.assert_authorized``) UNCONDITIONALLY rejects any hit whose ``namespace.session``
-  differs from the caller's own ``ClientScope.session_id`` — that assertion's own docstring reads
-  "Reject a cross-org / cross-workspace / cross-session target," with NO carve-out for "same
-  user, different session, PRIVATE" the way the MTM query layer already has. Reproduced directly
-  against the real stack below (a real ``add`` in session "s-a", then a real ``recall`` scoped to
-  session "s-b" for the SAME user, SAME namespace) — raises ``NamespaceIsolationError`` every
-  time, not a flaky race. This is a genuine bug in `mu-contracts`/`mu-engine` shared,
-  cross-cutting code (``scope.py``/``tenancy.py``/``authz.py`` — NOT this task's owned
-  ``recall_bridge.py``, and not specific to this bridge: EVERY recall caller hits the same wall).
-  Kept ``xfail(strict=True)`` (not skipped, not deleted) so this test starts FAILING loudly the
-  moment a future fix lands — the signal a follow-up task needs to remove the marker.
+- **Cross-session federation (acceptance clause 2 / clause 4 first half) — FIXED upstream, real
+  reproduction, no longer xfail.** ``LocalMemory.recall`` does build its ``RecallQuery`` with the
+  default ``session_scope=None`` (S1-04, ``local_memory.py:181``), and the MTM query layer
+  (``qdrant_mtm.py:_resolve_namespace_match``) relaxes to the truncated user-prefix match for a
+  cross-session hit. ``RecallService``'s own belt-and-suspenders authz re-check
+  (``recall/service.py:134`` -> ``recall/authz.py:RecallAuthorizationFilter.assert_items`` ->
+  ``platform/tenancy.py:DefaultTenancyGuard.assert_scope`` -> ``mu_contracts/domain/model/
+  scope.py:ClientScope.assert_authorized``) used to UNCONDITIONALLY reject any hit whose
+  ``namespace.session`` differed from the caller's own ``ClientScope.session_id`` — with NO
+  carve-out for "same user, different session, PRIVATE" the way the MTM query layer already had.
+  Root-caused and fixed at the source: ``ClientScope.assert_authorized`` now only hard-walls
+  ``session`` for a SHARED (room) target; a PRIVATE target's session is a filter/provenance stamp,
+  never an isolation boundary (ADR 0030 "keep-and-scope") — the SAME-user invariant for PRIVATE
+  stays fully enforced by ``DefaultTenancyGuard.assert_scope``'s independent user-slot check, which
+  this fix does not touch. Proved below with a real ``add`` in session "s-a" then a real
+  ``recall`` scoped to session "s-b" for the SAME user (federation — this test) and, in the sibling
+  test right after it, the SAME shape but for a DIFFERENT user (isolation — still fully blocked).
+  Not specific to this bridge: EVERY recall caller shares this fix (``scope.py``/``tenancy.py``/
+  ``authz.py`` are cross-cutting ``mu-contracts``/``mu-engine`` code, not this task's owned
+  ``recall_bridge.py``).
 
 If a required container is unreachable, these tests RAISE (BLOCKED, never faked) via the real
 client's own connection error — no try/except swallows a real dependency being down.
@@ -111,26 +112,15 @@ def _ns(settings: ClientSettings, *, session: str) -> Namespace:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "CONFIRMED upstream bug (real reproduction, not a guess): ClientScope.assert_authorized "
-        "(mu_contracts/domain/model/scope.py) unconditionally rejects a namespace.session that "
-        "differs from the caller's own scope.session_id, with no 'same user, different session' "
-        "carve-out — so a genuinely cross-session, same-user PRIVATE hit that the MTM query layer "
-        "(session_scope=None, S1-04) DOES surface is then thrown away by RecallService's own "
-        "belt-and-suspenders authz re-check (recall/service.py:134) as a NamespaceIsolationError. "
-        "Not this task's (S3-02, recall_bridge.py) bug to fix — a cross-cutting mu-engine/"
-        "mu-contracts gap every recall caller shares. Remove this xfail once that gap is closed."
-    ),
-)
 async def test_cross_session_federation_default_session_scope_none(
     isolated_settings: ClientSettings,
 ) -> None:
     """S1-04's cross-session narrowing (``session_scope=None`` default) — a fact added in session
     "s-a" should surface when rendering a DIFFERENT session ("s-b") of the SAME user, purely
     through the pre-existing PULL path (no bus wired at all here) — acceptance clauses 2 and 4
-    (first half). See module docstring for the confirmed upstream blocker this currently hits."""
+    (first half). See module docstring for the upstream fix (``ClientScope.assert_authorized``)
+    that makes this pass; the sibling test right below proves isolation still holds for a
+    different user."""
     host = LocalMemoryHost(isolated_settings)
     await host.start()
     try:
@@ -149,6 +139,40 @@ async def test_cross_session_federation_default_session_scope_none(
         assert "Paris" in body, (
             "session_scope=None federation did not surface session s-a's fact while "
             "rendering session s-b for the same user"
+        )
+    finally:
+        await host.aclose()
+
+
+async def test_cross_session_federation_does_not_leak_across_users(
+    isolated_settings: ClientSettings,
+) -> None:
+    """The security half of S1-04's cross-session narrowing: fixing federation for the SAME user
+    (the sibling test above) must NOT weaken isolation for a DIFFERENT user. A fact added by a
+    different principal (``mallory``) in session "s-a" of the SAME org/workspace must never surface
+    when rendering session "s-b" for THIS test's own (default) user — proving
+    ``DefaultTenancyGuard.assert_scope``'s user-slot check still fully blocks a cross-user PRIVATE
+    read even though ``ClientScope.assert_authorized`` no longer hard-walls PRIVATE on session. Real
+    reproduction against the live stack, not a unit-level stand-in for it."""
+    host = LocalMemoryHost(isolated_settings)
+    await host.start()
+    try:
+        bridge = RecallInjectBridge(host, settings=InjectSettings())
+        other_user = f"mallory-{isolated_settings.default_workspace}"
+        other_write = await host.add(_FACT, session="s-a", user=other_user)
+        assert other_write.promoted, "STM->MTM deterministic promotion did not fire (other user)"
+
+        # Give the other user's write every chance to have landed and be findable, then confirm
+        # it does NOT leak into THIS test's own (default) user's cross-session federated render.
+        body = ""
+        for _ in range(_POLL_ATTEMPTS):
+            rendered = await bridge.render("s-b", query="Where does Ada live?")
+            body = rendered.body
+            await asyncio.sleep(_POLL_DELAY_S)
+        print(f"CROSS-USER RENDER (added by {other_user}, rendered as default) = {body!r}")  # noqa: T201
+        assert "Paris" not in body, (
+            "cross-user isolation breach: a fact written by a DIFFERENT user leaked into this "
+            "user's cross-session federated recall"
         )
     finally:
         await host.aclose()
