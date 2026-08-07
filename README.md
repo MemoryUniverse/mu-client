@@ -1,4 +1,10 @@
+<img src="assets/logo.svg" alt="mu-client" width="96" height="96">
+
 # mu-client
+
+The local daemon and host integrations: capture, injection, and your local stores.
+
+Part of [Memory Universe](https://github.com/MemoryUniverse).
 
 **The on-device daemon that gives your coding agents persistent memory.** Captures what happens in
 your Claude Code and Codex sessions, keeps it on your own machine by default, and hands relevant
