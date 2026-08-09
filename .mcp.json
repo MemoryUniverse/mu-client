@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "memory-universe": {
+      "type": "stdio",
+      "command": "mu-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
