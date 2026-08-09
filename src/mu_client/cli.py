@@ -18,6 +18,7 @@ import json
 import signal
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_local.views import MemoryListView, MemoryWriteResult
@@ -28,6 +29,7 @@ from mu_client.config import get_client_settings
 from mu_client.daemon.app import LocalDaemon
 from mu_client.errors import cli_error_boundary
 from mu_client.host import daemonless_host
+from mu_client.install import claude_code as install_claude_code
 from mu_client.outbox.sqlite_outbox import SqliteOutbox
 from mu_client.workers.ingest_client import InProcessLocalIngest
 from mu_client.workers.pool import OutboxWorker
@@ -83,6 +85,50 @@ def _build_parser() -> argparse.ArgumentParser:
     daemon_p = sub.add_parser("daemon", help="The resident daemon (capture/recall over IPC).")
     daemon_p.add_argument("daemon_command", choices=["run"], help="Only 'run' this stage.")
 
+    install_p = sub.add_parser(
+        "install",
+        help="Idempotently write a host's managed hook block (Phase 0 installer).",
+    )
+    install_sub = install_p.add_subparsers(dest="install_target", required=True)
+    install_cc_p = install_sub.add_parser(
+        "claude-code",
+        help="Write the mu_capture_once.sh hook block into a Claude Code settings.json.",
+    )
+    install_cc_p.add_argument(
+        "--settings-path",
+        type=Path,
+        default=Path("~/.claude/settings.json").expanduser(),
+        help="Target settings.json (default: ~/.claude/settings.json; pass a test path to avoid "
+        "touching a real one).",
+    )
+    install_cc_p.add_argument(
+        "--hook-script",
+        type=Path,
+        default=install_claude_code.DEFAULT_HOOK_SCRIPT,
+        help="Absolute path to mu_capture_once.sh (default: this checkout's scripts/hooks/).",
+    )
+
+    uninstall_p = sub.add_parser(
+        "uninstall", help="Remove a host's managed hook block (Phase 0 installer)."
+    )
+    uninstall_sub = uninstall_p.add_subparsers(dest="install_target", required=True)
+    uninstall_cc_p = uninstall_sub.add_parser(
+        "claude-code", help="Remove ONLY the managed mu_capture_once.sh entries from settings.json."
+    )
+    uninstall_cc_p.add_argument(
+        "--settings-path",
+        type=Path,
+        default=Path("~/.claude/settings.json").expanduser(),
+        help="Target settings.json (default: ~/.claude/settings.json; pass a test path to avoid "
+        "touching a real one).",
+    )
+    uninstall_cc_p.add_argument(
+        "--hook-script",
+        type=Path,
+        default=install_claude_code.DEFAULT_HOOK_SCRIPT,
+        help="Absolute path to mu_capture_once.sh (must match the one install used).",
+    )
+
     return parser
 
 
@@ -105,6 +151,36 @@ def _render_list(listing: MemoryListView) -> None:
             f"{item.score:.4f}  {item.tier}/{item.channel}{floor}  "
             f"{item.memory_id}  {item.content}"
         )
+
+
+def _run_install(args: argparse.Namespace) -> int:
+    if args.install_target != "claude-code":
+        raise AssertionError(f"unreachable: unknown install target {args.install_target!r}")
+    result = install_claude_code.install(
+        args.settings_path, hook_script_path=args.hook_script
+    )
+    print(
+        f"settings_path={result.settings_path} backup_path={result.backup_path} "
+        f"events_added={list(result.events_added)} "
+        f"events_already_present={list(result.events_already_present)} "
+        f"unrelated_hooks_preserved={result.unrelated_hooks_preserved}"
+    )
+    return 0
+
+
+def _run_uninstall(args: argparse.Namespace) -> int:
+    if args.install_target != "claude-code":
+        raise AssertionError(f"unreachable: unknown install target {args.install_target!r}")
+    result = install_claude_code.uninstall(
+        args.settings_path, hook_script_path=args.hook_script
+    )
+    print(
+        f"settings_path={result.settings_path} backup_path={result.backup_path} "
+        f"events_removed={list(result.events_removed)} "
+        f"events_not_present={list(result.events_not_present)} "
+        f"unrelated_hooks_preserved={result.unrelated_hooks_preserved}"
+    )
+    return 0
 
 
 async def _run_capture_once(args: argparse.Namespace) -> int:
@@ -171,6 +247,10 @@ async def _run(argv: Sequence[str]) -> int:
         return await _run_flush()
     if args.command == "daemon":
         return await _run_daemon(args)
+    if args.command == "install":
+        return _run_install(args)
+    if args.command == "uninstall":
+        return _run_uninstall(args)
     async with daemonless_host() as host:
         if args.command == "add":
             _render_write(await host.add(args.content, user=args.user, session=args.session))

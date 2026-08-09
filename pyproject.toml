@@ -26,7 +26,9 @@ dependencies = [
 [project.scripts]
 # The daemonless one-shot muscle-memory binary (daemon-app-skeleton-spec.md §2, §6):
 # `mu add|recall|search` construct the host, do the op, tear down — NO daemon required.
-# `run|install|verify|uninstall|status` (the resident daemon verbs) are a LATER stage.
+# `mu daemon run` is the resident daemon. `mu install|uninstall claude-code` (Phase 0,
+# AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4) write/remove the managed hook block. `verify|status`
+# remain a LATER stage.
 mu = "mu_client.cli:main"
 
 [project.optional-dependencies]

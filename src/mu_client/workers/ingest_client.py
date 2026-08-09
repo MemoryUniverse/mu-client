@@ -1,13 +1,24 @@
 """``IngestClientPort`` — outbox record -> ``LocalMemory.add`` (capture-spec.md §8.5). Only
 ``InProcessLocalIngest`` this stage (the daemon co-hosts ``LocalMemoryHost``); ``Http``/``Durable``
 variants are a later, multi-process/SHARED-plane stage (out of scope, daemon-app-skeleton-spec.md
-§9's ``ingest_mode`` literal is a forward-declared seam, not read yet)."""
+§9's ``ingest_mode`` literal is a forward-declared seam, not read yet).
+
+**Subagent attribution (Phase 0 cheap wire, AGENT-INTEGRATION-AUDIT-AND-PLAN.md §6A "Concrete
+design, cut 1").** ``ActivityKind.SUBAGENT_RUN`` carries ``payload["agent_type"]`` (which subagent
+produced this turn — capture/parsers.py's ``_map_event``), but until this wire it was read only by
+the outbox row, never by ``ingest()`` — the identity was captured then silently dropped before
+reaching ``.add()``, so a subagent's memory was indistinguishable from a top-level turn once
+stored. This is deliberately the CHEAP cut, not the real one: no new namespace, no new
+``ClientScope``/``agent_principal_id`` partition (that is "Phase 1.5" per §6A/§6D, a genuine new
+identity model) — just free-text provenance, a ``[subagent:{agent_type}]`` prefix on the stored
+text, so "which subagent said this" is queryable in the SAME partition it already lands in today.
+Zero new contracts, zero widened verb surface."""
 
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from mu_client.capture.model import CONTROL_KINDS, RawActivity
+from mu_client.capture.model import CONTROL_KINDS, ActivityKind, RawActivity
 from mu_client.host import LocalMemoryHost
 
 __all__ = ["ExtractionSkippedError", "InProcessLocalIngest", "IngestClientPort"]
@@ -42,4 +53,9 @@ class InProcessLocalIngest:
                 f"activity {activity.activity_id} kind={activity.kind.value} carries no "
                 "memory-worthy text (control kind or filtered slice) — ack without remember()"
             )
-        await self._host.add(activity.text, user=self._user, session=activity.session_id)
+        text = activity.text
+        if activity.kind is ActivityKind.SUBAGENT_RUN:
+            agent_type = activity.payload.get("agent_type")
+            if isinstance(agent_type, str) and agent_type:
+                text = f"[subagent:{agent_type}] {text}"
+        await self._host.add(text, user=self._user, session=activity.session_id)
