@@ -148,7 +148,7 @@ def _render_list(listing: MemoryListView) -> None:
     for item in listing.items:
         floor = " [floor]" if item.is_floor else ""
         print(
-            f"{item.score:.4f}  {item.tier}/{item.channel}{floor}  "
+            f"{item.fused_score:.4f}  {item.tier}/{item.channel}{floor}  "
             f"{item.memory_id}  {item.content}"
         )
 

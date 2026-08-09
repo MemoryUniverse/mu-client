@@ -121,7 +121,7 @@ async def test_daemonless_add_then_recall_and_search_round_trip_real_data(
         print(  # noqa: T201 — required evidence: PRINT the recalled data
             "RECALLED "
             + "; ".join(
-                f"{it.memory_id}|{it.tier}/{it.channel}|score={it.score:.4f}|{it.content}"
+                f"{it.memory_id}|{it.tier}/{it.channel}|score={it.fused_score:.4f}|{it.content}"
                 for it in recalled.items
             )
         )

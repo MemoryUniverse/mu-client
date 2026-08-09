@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from falkordb.asyncio import FalkorDB
-from mu_local.views import MemoryRecordView
+from mu_contracts.contracts.recall import RecallItemView
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
@@ -186,7 +186,7 @@ async def test_daemonless_capture_outbox_durability_and_flush_round_trip(
         assert any("Paris" in it.content for it in recalled), "captured content did not round-trip"
 
 
-async def _eventually_recall(host: LocalMemoryHost, query: str) -> list[MemoryRecordView]:
+async def _eventually_recall(host: LocalMemoryHost, query: str) -> list[RecallItemView]:
     for _ in range(40):
         listing = await host.recall(query, user="default", session=_SESSION)
         if listing.items:

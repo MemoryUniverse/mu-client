@@ -6,8 +6,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from mu_contracts.contracts.recall import RecallItemView
 from mu_contracts.domain.errors import StoreUnavailableError
-from mu_local.views import MemoryListView, MemoryRecordView
+from mu_contracts.domain.model.memory import Tier
+from mu_local.views import MemoryListView
 
 from mu_client.config import InjectSettings
 from mu_client.host import LocalMemoryHost
@@ -19,7 +21,9 @@ pytestmark = pytest.mark.unit
 def _listing(*contents: str) -> MemoryListView:
     return MemoryListView(
         items=[
-            MemoryRecordView(memory_id=f"m{i}", content=c, tier="stm", channel="stm", score=1.0)
+            RecallItemView(
+                memory_id=f"m{i}", content=c, tier=Tier.STM, channel="stm", fused_score=1.0
+            )
             for i, c in enumerate(contents)
         ]
     )

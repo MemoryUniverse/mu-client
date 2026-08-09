@@ -7,7 +7,9 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
-from mu_local.views import MemoryListView, MemoryRecordView, MemoryWriteResult
+from mu_contracts.contracts.recall import RecallItemView
+from mu_contracts.domain.model.memory import Tier
+from mu_local.views import MemoryListView, MemoryWriteResult
 
 from mu_client import cli
 
@@ -63,8 +65,12 @@ async def test_run_recall_calls_host_recall_and_renders_result(
     fake_host = AsyncMock()
     fake_host.recall.return_value = MemoryListView(
         items=[
-            MemoryRecordView(
-                memory_id="m1", content="Ada lives in Paris", tier="mtm", channel="mtm", score=0.9
+            RecallItemView(
+                memory_id="m1",
+                content="Ada lives in Paris",
+                tier=Tier.MTM,
+                channel="mtm",
+                fused_score=0.9,
             )
         ]
     )
