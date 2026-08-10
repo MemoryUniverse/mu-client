@@ -59,6 +59,12 @@ from mu_client.inject.recall_bridge import RecallInjectBridge
 pytestmark = pytest.mark.integration
 
 _FACT = "Ada lives in Paris and works at Acme"
+# ``LocalMemory.add`` correctly NO LONGER hardcodes ``promote=True`` (A6 fix): STM->MTM promotion
+# is GATED on ``importance >= 0.6`` and add()'s default importance is 0.5, so a bare ``add(_FACT)``
+# lands STM-only (``promoted=False``) — the CORRECT gated contract, not a bug. Every test below
+# needs a REAL promotion (they turn on the ``MemoryPromoted`` push-refresh / MTM presence), so each
+# add() supplies a salient importance to earn it, rather than weakening the ``promoted`` assertion.
+_SALIENT_IMPORTANCE = 0.9
 _POLL_ATTEMPTS = 40
 _POLL_DELAY_S = 0.2
 
@@ -125,7 +131,7 @@ async def test_cross_session_federation_default_session_scope_none(
     await host.start()
     try:
         bridge = RecallInjectBridge(host, settings=InjectSettings())
-        write = await host.add(_FACT, session="s-a")
+        write = await host.add(_FACT, session="s-a", importance_score=_SALIENT_IMPORTANCE)
         assert write.promoted, "STM->MTM deterministic promotion did not fire"
 
         body = ""
@@ -159,7 +165,9 @@ async def test_cross_session_federation_does_not_leak_across_users(
     try:
         bridge = RecallInjectBridge(host, settings=InjectSettings())
         other_user = f"mallory-{isolated_settings.default_workspace}"
-        other_write = await host.add(_FACT, session="s-a", user=other_user)
+        other_write = await host.add(
+            _FACT, session="s-a", user=other_user, importance_score=_SALIENT_IMPORTANCE
+        )
         assert other_write.promoted, "STM->MTM deterministic promotion did not fire (other user)"
 
         # Give the other user's write every chance to have landed and be findable, then confirm
@@ -193,7 +201,7 @@ async def test_memory_promoted_bus_event_refreshes_same_tick_no_explicit_pull(
         session = "s-promo"
         assert session not in bridge._last_rendered  # cold baseline: nothing rendered/added yet
 
-        write = await host.add(_FACT, session=session)
+        write = await host.add(_FACT, session=session, importance_score=_SALIENT_IMPORTANCE)
         assert write.promoted
 
         body = ""
@@ -230,7 +238,7 @@ async def test_memory_garbage_collected_bus_event_invalidates_same_tick_no_stale
         session = "s-gc"
         ns = _ns(isolated_settings, session=session)
 
-        write = await host.add(_FACT, session=session)
+        write = await host.add(_FACT, session=session, importance_score=_SALIENT_IMPORTANCE)
         assert write.promoted
 
         # Wait for the real MemoryPromoted push-refresh (proved by the sibling test above) to

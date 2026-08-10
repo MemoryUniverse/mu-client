@@ -49,6 +49,14 @@ def _build_parser() -> argparse.ArgumentParser:
     add_p.add_argument("content", help="The text to remember.")
     add_p.add_argument("--user", default=None, help="Overrides ClientSettings.default_user.")
     add_p.add_argument("--session", default=None, help="Session id (default: 'default').")
+    add_p.add_argument(
+        "--importance",
+        type=float,
+        default=None,
+        help="Importance in [0,1] (canonical AddRequest.importance_score). Drives the ONE "
+        "STM->MTM promotion gate (DeterministicPromoteStage: importance >= importance_promote, "
+        "default 0.6). Omit to leave the engine's own default (0.5, STM-only).",
+    )
 
     for name, help_text in (
         ("recall", "Federated ranked recall (STM floor + MTM dense + LTM graph, fused)."),
@@ -316,7 +324,14 @@ async def _run(argv: Sequence[str]) -> int:
         return _run_uninstall(args)
     async with daemonless_host() as host:
         if args.command == "add":
-            _render_write(await host.add(args.content, user=args.user, session=args.session))
+            _render_write(
+                await host.add(
+                    args.content,
+                    user=args.user,
+                    session=args.session,
+                    importance_score=args.importance,
+                )
+            )
             return 0
         tier = MemoryTier(args.tier) if args.tier is not None else None
         verb = host.recall if args.command == "recall" else host.search

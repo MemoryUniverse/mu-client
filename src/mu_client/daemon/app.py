@@ -49,6 +49,7 @@ from mu_client.daemon.ipc import IpcServer
 from mu_client.daemon.maintenance import MaintenanceLoop
 from mu_client.host import LocalMemoryHost
 from mu_client.inject.recall_bridge import RecallInjectBridge
+from mu_client.lifecycle.precompact import PreCompactPromoter
 from mu_client.outbox.sqlite_outbox import SqliteOutbox
 from mu_client.runners.sqlite_wal import SqliteWalLeaseAdapter, SqliteWalRunner
 from mu_client.workers.ingest_client import InProcessLocalIngest
@@ -125,31 +126,17 @@ class LocalDaemon:
             ClaudeCodeParserV1(tool_outcome_max_chars=self._settings.capture.tool_outcome_max_chars)
         )
 
-        # 4) WORKER POOL — drain -> LocalMemory.add -> ack (capture-spec.md §8.4).
-        ingest = InProcessLocalIngest(
-            self._host,
-            user=self._settings.default_user,
-            subagent_partitions=self._settings.capture.subagent_partition_enabled,
-        )
-        worker = OutboxWorker(
-            self._outbox,
-            ingest,
-            settings=self._settings.outbox,
-            org=self._settings.default_namespace,
-            workspace=self._settings.default_workspace,
-            user=self._settings.default_user,
-        )
-        self._pool = WorkerPool(worker, poll_interval_s=self._settings.outbox.poll_interval_s)
-
-        # 5) INJECTION bridge (capture-spec.md §7.2), NOW wired onto the REAL bus (Stage-3
+        # 4) INJECTION bridge (capture-spec.md §7.2), NOW wired onto the REAL bus (Stage-3
         #    integrate — was a bare PULL-only bridge before this pass, so a real MLM tier
         #    transition never pushed a refresh). ``self._host.bus`` is the SAME ``InprocBus``
         #    ``IngestService``/``DistillPipeline`` publish onto (module docstring point 1) — the
         #    bridge subscribes to the identical real event stream ``MaintenanceLoop`` does below,
-        #    never a second, dark bus.
+        #    never a second, dark bus. Built BEFORE the worker pool (Phase 3 reorder) so the
+        #    lifecycle manager (which the PreCompact promoter drives) exists before the ingest that
+        #    routes PreCompact into it.
         bridge = RecallInjectBridge(self._host, settings=self._settings.inject, bus=self._host.bus)
 
-        # 6) LIFECYCLE MANAGER — the real ``MemoryLifecycleManager`` (S1-03) + real durable
+        # 5) LIFECYCLE MANAGER — the real ``MemoryLifecycleManager`` (S1-03) + real durable
         #    runner/lease (S1-06), built BEFORE the IPC front door below (Stage-3 integrate
         #    reorder) so ``/state``/``/ready-context`` (S3-03) can thread it through
         #    ``IpcServer(lifecycle_manager=...)`` at construction rather than needing a mutable
@@ -186,6 +173,37 @@ class LocalDaemon:
             # if a genuinely crashed row was found — this is just an observability breadcrumb).
             pass
 
+        # 6) WORKER POOL — drain -> LocalMemory.add -> ack (capture-spec.md §8.4). Built AFTER the
+        #    lifecycle manager (Phase 3 reorder) so the ingest can be handed a real
+        #    ``PreCompactPromoter``: on a ``PreCompact`` control event the ingest routes PAST the
+        #    control-kind skip into ``promote_session_now(ns, force=True)`` — promoting the
+        #    session's at-risk STM turns to a durable tier before the host compacts/deletes them,
+        #    instead of the pre-Phase-3 silent swallow. Gated by ``precompact_promote_enabled``
+        #    (default ON); when OFF the promoter is ``None`` and PreCompact reverts to skip-and-ack.
+        precompact_promoter: PreCompactPromoter | None = None
+        if self._settings.capture.precompact_promote_enabled:
+            precompact_promoter = PreCompactPromoter(
+                promoter=self._lifecycle_manager,
+                org=self._settings.default_namespace,
+                workspace=self._settings.default_workspace,
+                user=self._settings.default_user,
+            )
+        ingest = InProcessLocalIngest(
+            self._host,
+            user=self._settings.default_user,
+            subagent_partitions=self._settings.capture.subagent_partition_enabled,
+            precompact_promoter=precompact_promoter,
+        )
+        worker = OutboxWorker(
+            self._outbox,
+            ingest,
+            settings=self._settings.outbox,
+            org=self._settings.default_namespace,
+            workspace=self._settings.default_workspace,
+            user=self._settings.default_user,
+        )
+        self._pool = WorkerPool(worker, poll_interval_s=self._settings.outbox.poll_interval_s)
+
         # 7) FRONT DOOR. Bound HERE (synchronously, awaited) — a caller of start()/lifespan() must
         #    be able to connect to the real socket the instant start() returns, never race the
         #    background accept loop's own startup. ``lifecycle_manager=self._lifecycle_manager``
@@ -202,7 +220,7 @@ class LocalDaemon:
 
         # 8) MAINTENANCE LOOP — the 3rd supervised task (memory-lifecycle-manager-spec.md §14
         #    slice 1 / S1-07): event-driven fast-fire + the two decoupled periodic cadences (§7/
-        #    §7b), over the REAL bus + the REAL MemoryLifecycleManager built in step 6 above.
+        #    §7b), over the REAL bus + the REAL MemoryLifecycleManager built in step 5 above.
         self._maintenance = MaintenanceLoop(
             bus=self._host.bus, lifecycle_manager=self._lifecycle_manager
         )

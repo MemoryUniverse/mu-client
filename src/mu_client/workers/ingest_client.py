@@ -20,11 +20,14 @@ lifecycle events (§6D) — none required for the partition + owner-federation t
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from mu_client.capture.claude_tailer import THINKING_SOURCE as _THINKING_SOURCE
 from mu_client.capture.model import CONTROL_KINDS, ActivityKind, RawActivity
 from mu_client.host import LocalMemoryHost
+
+if TYPE_CHECKING:
+    from mu_client.lifecycle.precompact import PreCompactPromoter
 
 __all__ = ["ExtractionSkippedError", "InProcessLocalIngest", "IngestClientPort"]
 
@@ -49,7 +52,12 @@ class InProcessLocalIngest:
     is durably outboxed + acked, but never becomes a ``MemoryItem``."""
 
     def __init__(
-        self, host: LocalMemoryHost, *, user: str, subagent_partitions: bool = True
+        self,
+        host: LocalMemoryHost,
+        *,
+        user: str,
+        subagent_partitions: bool = True,
+        precompact_promoter: PreCompactPromoter | None = None,
     ) -> None:
         self._host = host
         self._user = user
@@ -59,8 +67,30 @@ class InProcessLocalIngest:
         # backward-compatible escape hatch. Human/top-level captures are byte-for-byte unchanged
         # either way; the flag only affects subagent-attributed activities.
         self._subagent_partitions = subagent_partitions
+        # Phase 3 (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase 3). When wired (the daemon passes a
+        # real one; ``None`` = the daemonless/flush path, unchanged), a ``PreCompact`` control event
+        # is ROUTED PAST the skip below into the real promote-before-delete path instead of being
+        # silently swallowed. Only ``ActivityKind.PRE_COMPACT`` reaches it; every other kind is
+        # byte-for-byte unchanged.
+        self._precompact_promoter = precompact_promoter
 
     async def ingest(self, activity: RawActivity) -> None:
+        # Phase 3: the ONE control event with a real downstream effect. A ``PreCompact`` means the
+        # host is about to compact/delete this session's turns — route it PAST the control-kind
+        # skip into the promote-before-delete path (promote the at-risk STM turns to a durable tier
+        # first), instead of the pre-Phase-3 no-op that dropped it here. The PreCompact event itself
+        # still never becomes a ``MemoryItem`` (it carries no text of its own) — it is a TRIGGER, so
+        # once its promotion side-effect has run it is ack'd via the skip sentinel below. A store
+        # failure inside the promoter PROPAGATES (worker retry/dead-letter), never a fake ack.
+        if (
+            activity.kind is ActivityKind.PRE_COMPACT
+            and self._precompact_promoter is not None
+        ):
+            await self._precompact_promoter.on_precompact(activity)
+            raise ExtractionSkippedError(
+                f"activity {activity.activity_id} PreCompact promote-before-delete ran — the "
+                "control event triggers promotion but never becomes a MemoryItem itself; ack"
+            )
         if activity.kind in CONTROL_KINDS or activity.text is None:
             raise ExtractionSkippedError(
                 f"activity {activity.activity_id} kind={activity.kind.value} carries no "

@@ -181,6 +181,16 @@ class CaptureSettings(BaseModel):
     # partition as a top-level turn). Human/top-level captures are unchanged either way.
     subagent_partition_enabled: bool = True  # env: MU_CAPTURE__SUBAGENT_PARTITION_ENABLED
 
+    # ---- Phase 3: PreCompact promote-before-delete (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase
+    # 3). ON by default — a ``PreCompact`` control event (the host is about to compact/delete the
+    # session's turns) drives ``PreCompactPromoter`` to force-promote the session's at-risk STM
+    # turns into a durable tier (MTM/LTM) BEFORE they are dropped, instead of the pre-Phase-3 no-op
+    # (``PreCompact`` was parsed then silently swallowed via ``ExtractionSkippedError``). This is
+    # the clearly-correct fix — it is the whole point of the PreCompact trigger — so it defaults ON;
+    # OFF is the backward-compatible escape hatch that reverts to the old skip-and-drop behaviour.
+    # Non-PreCompact events are unaffected either way.
+    precompact_promote_enabled: bool = True  # env: MU_CAPTURE__PRECOMPACT_PROMOTE_ENABLED
+
 
 class OutboxSettings(BaseModel):
     """capture-spec.md §10/§8.3, same literal default path as ``ClientSettings.outbox_db_path``
