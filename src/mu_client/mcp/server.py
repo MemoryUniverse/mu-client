@@ -10,6 +10,12 @@ Only real verbs are exposed: ``add``/``recall``/``get``/``consolidate``. ``promo
 honest 501s in the engine and are NOT registered; ``update``/``delete`` have no embedded entry point
 today and are omitted (plan §2A). Shared-plane arguments are refused at the surface by
 :class:`~mu_client.mcp.guard.SharedPrivateGuard` — this is a PRIVATE-plane server (ADR-0003).
+
+Phase 2 (plan §4) adds the SILENT auto-inject RESOURCE ``memory-universe://silent/{session}`` — an
+MCP resource an MCP host can auto-attach WITHOUT the agent calling a tool, rendering the same
+DISTILLED recall/inject context (:class:`~mu_client.inject.recall_bridge.RecallInjectBridge` →
+:func:`~mu_client.inject.distill.distill_items`) the Claude Code hook emits as ``additionalContext``
+(the host auto-attaches the resource; no tool call).
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from mu_contracts.contracts.defaults import DEFAULT_CONSOLIDATE_LIMIT, DEFAULT_R
 
 from mu_client.config import ClientSettings, get_client_settings
 from mu_client.host import LocalMemoryHost
+from mu_client.inject.recall_bridge import RecallInjectBridge
 from mu_client.mcp import tools
 from mu_client.mcp.guard import SharedPrivateGuard
 
@@ -41,23 +48,33 @@ _INSTRUCTIONS = (
 
 
 class _EngineHolder:
-    """Holds the ONE live ``LocalMemory`` the lifespan starts, so every tool closure reads the same
-    engine. Raising (never returning ``None``) if read before startup keeps the failure honest."""
+    """Holds the ONE live ``LocalMemory`` (tool verbs) and the ONE ``RecallInjectBridge`` (silent
+    resource) the lifespan starts, so every tool/resource closure reads the same live engine.
+    Raising (never returning ``None``) if read before startup keeps the failure honest."""
 
     def __init__(self) -> None:
         self._memory: LocalMemory | None = None
+        self._bridge: RecallInjectBridge | None = None
 
-    def set(self, memory: LocalMemory) -> None:
+    def set(self, memory: LocalMemory, bridge: RecallInjectBridge) -> None:
         self._memory = memory
+        self._bridge = bridge
 
     def clear(self) -> None:
         self._memory = None
+        self._bridge = None
 
     @property
     def memory(self) -> LocalMemory:
         if self._memory is None:
             raise RuntimeError("MCP engine is not started (FastMCP lifespan did not run)")
         return self._memory
+
+    @property
+    def bridge(self) -> RecallInjectBridge:
+        if self._bridge is None:
+            raise RuntimeError("MCP inject bridge is not started (FastMCP lifespan did not run)")
+        return self._bridge
 
 
 def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
@@ -73,11 +90,16 @@ def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
     async def lifespan(_server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         host = LocalMemoryHost(resolved)
         memory = await host.start()  # REAL LocalMemory over the caller's real stores
-        holder.set(memory)
+        # The silent-inject resource renders through the SAME real host as the hook path — the
+        # bridge is PULL-only here (no InprocBus wired in the stdio server), which is the honest
+        # degrade the bridge already documents; ``bus=None`` needs no new DegradeReason.
+        bridge = RecallInjectBridge(host, settings=resolved.inject)
+        holder.set(memory, bridge)
         try:
             yield {}
         finally:
             holder.clear()
+            await bridge.aclose()  # no-op when no bus was wired (PULL-only)
             await host.aclose()
 
     server: FastMCP = FastMCP(_SERVER_NAME, instructions=_INSTRUCTIONS, lifespan=lifespan)
@@ -162,5 +184,27 @@ def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
         limit: int = DEFAULT_CONSOLIDATE_LIMIT,
     ) -> dict[str, Any]:
         return await tools.tool_consolidate(holder.memory, user=user, session=session, limit=limit)
+
+    @server.resource(
+        "memory-universe://silent/{session}",
+        name="silent-context",
+        title="Silent auto-inject context",
+        description=(
+            "Relevant DISTILLED memory context for a session, auto-attachable by an MCP host "
+            "(Codex/Desktop) with NO explicit tool call (api-mcp-surface-spec §5.2 silent "
+            "channel; AGENT-INTEGRATION-AUDIT-AND-PLAN §4 Phase 2). Renders through the SAME "
+            "recall/inject bridge as the Claude Code hook additionalContext: tool-capture/output "
+            "noise (Write:/Bash:…) filtered, deduped, salient/promoted facts first."
+        ),
+        mime_type="text/plain",
+    )
+    async def silent_context(  # pyright: ignore[reportUnusedFunction] — registered via decorator
+        session: str,
+    ) -> str:
+        # Delegates to the SAME distilled render the hook path uses (RecallInjectBridge.render →
+        # distill_items). No new memory logic: a read-only, never-mutating projection of the
+        # caller's OWN private stores. An empty string = cold (no memories yet for this session).
+        rendered = await holder.bridge.render(session)
+        return rendered.body
 
     return server

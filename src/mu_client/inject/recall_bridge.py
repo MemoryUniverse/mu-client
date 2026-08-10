@@ -4,9 +4,14 @@ competing service. Renders a :class:`RenderedContext` the hook client reads (``G
 {session}``) and emits verbatim as ``additionalContext`` (host-capture-integration-devdoc.md
 §2.1/§5.3).
 
-**PULL path (unchanged).** Each ``GET /recall/{session}`` call renders directly against
+**PULL path.** Each ``GET /recall/{session}`` call renders directly against
 ``LocalMemoryHost.recall`` (real stores) — the ``staleness``/courtesy-cache contract (fresh/stale/
-cold, F4 budget, never-blank-the-host) is honored in full, exactly as before this task.
+cold, F4 budget, never-blank-the-host) is honored in full. **Gap D (Phase 2):** :meth:`render` no
+longer dumps the raw session STM verbatim; it runs the hits through
+:func:`~mu_client.inject.distill.distill_items` — drop tool-capture/output noise (``Write:``/
+``Bash:``…), dedupe by content, prefer promoted/salient over the query-insensitive STM recency
+floor. The SAME distilled render backs the MCP silent resource (``memory-universe://silent/{…}``),
+so both auto-inject surfaces emit identical distilled context.
 
 **PUSH path (this task, spec §12 lines 397-404).** When a real ``EventBusPort`` (the LOCAL
 ``InprocBus``) is threaded in via the optional ``bus=`` constructor kwarg, this bridge ALSO
@@ -54,6 +59,7 @@ from pydantic import BaseModel, ConfigDict
 
 from mu_client.config import InjectSettings
 from mu_client.host import LocalMemoryHost
+from mu_client.inject.distill import distill_items
 from mu_client.observability.events import log_degraded, log_host_injection_skipped
 
 __all__ = ["RecallInjectBridge", "RenderedContext"]
@@ -176,7 +182,13 @@ class RecallInjectBridge:
             )
         except MemoryUniverseError as exc:
             return self._fallback_or_cold(session_id, reason=str(exc))
-        body = "\n".join(f"- {item.content}" for item in listing.items)
+        # Gap D (AGENT-INTEGRATION-AUDIT-AND-PLAN §4 Phase 2): render DISTILLED context, not the raw
+        # session STM dump — drop tool-capture/output noise (``Write:``/``Bash:``…), dedupe by
+        # content, and sink the query-insensitive STM recency-floor below the ranked hits. One
+        # deterministic pass (:func:`~mu_client.inject.distill.distill_items`) shared by BOTH this
+        # hook-inject path and the MCP silent resource, so both surfaces emit one distilled view.
+        items = distill_items(listing.items)
+        body = "\n".join(f"- {item.content}" for item in items)
         if not body:
             log_host_injection_skipped(session_id=session_id, reason="cold_cache")
             rendered = RenderedContext(

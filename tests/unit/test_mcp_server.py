@@ -199,3 +199,12 @@ async def test_build_server_advertises_exactly_the_real_verbs() -> None:
     assert tool_names == {"add", "recall", "get", "consolidate"}
     # promote/demote (engine 501s) + update/delete (no embedded entry) are deliberately absent.
     assert "promote" not in tool_names and "delete" not in tool_names
+
+
+async def test_build_server_registers_the_silent_inject_resource() -> None:
+    # Phase 2: the silent auto-inject RESOURCE is a parameterised template (per-session), so it is
+    # advertised on the resource-TEMPLATE surface (resources/templates/list), not as a concrete
+    # resource. Registration is store-free (the engine only starts inside the lifespan).
+    server = build_server()
+    templates = {tmpl.uriTemplate for tmpl in await server.list_resource_templates()}
+    assert "memory-universe://silent/{session}" in templates
