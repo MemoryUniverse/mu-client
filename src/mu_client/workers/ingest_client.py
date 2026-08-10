@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from mu_client.capture.claude_tailer import THINKING_SOURCE as _THINKING_SOURCE
 from mu_client.capture.model import CONTROL_KINDS, ActivityKind, RawActivity
 from mu_client.host import LocalMemoryHost
 
@@ -58,4 +59,20 @@ class InProcessLocalIngest:
             agent_type = activity.payload.get("agent_type")
             if isinstance(agent_type, str) and agent_type:
                 text = f"[subagent:{agent_type}] {text}"
-        await self._host.add(text, user=self._user, session=activity.session_id)
+        # Phase 0B background-thinking attribution (capture-spec.md §6): a reasoning-tail memory is
+        # tagged ``payload["source"]=="thinking"`` — prefix the stored text ``[thinking] `` (mirrors
+        # the ``[subagent:...]`` provenance above) so a stored decision/finding is distinguishable
+        # from a top-level turn in the SAME partition it already lands in. No new namespace/verb.
+        if activity.payload.get("source") == _THINKING_SOURCE:
+            text = f"[thinking] {text}"
+        # Thread the tailer's per-candidate importance straight to the engine's promotion gate
+        # (``LocalMemory.add(importance_score=...)`` → ``DeterministicPromoteStage``). ``None``
+        # (every hook-parsed activity) leaves add()'s own default untouched — byte-for-byte the
+        # prior behaviour; a set value (reasoning candidates) drives STM→MTM promotion. We REUSE
+        # this one gate, we do not add a second (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §6).
+        await self._host.add(
+            text,
+            user=self._user,
+            session=activity.session_id,
+            importance_score=activity.importance,
+        )

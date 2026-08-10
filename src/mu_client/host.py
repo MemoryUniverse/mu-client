@@ -188,9 +188,20 @@ class LocalMemoryHost:
         *,
         user: str | None = None,
         session: str | None = None,
+        importance_score: float | None = None,
     ) -> MemoryWriteResult:
+        # ``importance_score`` threads straight to ``LocalMemory.add`` → the engine's ONE promotion
+        # gate (``DeterministicPromoteStage``: ``importance >= IngestSettings.importance_promote``).
+        # ``None`` (every existing caller) leaves add()'s own default untouched — byte-for-byte the
+        # prior behaviour; the Phase 0B reasoning tailer (capture/claude_tailer.py) is the first
+        # caller to set it, so a strong decision promotes STM→MTM while a weaker finding stays STM.
         memory = self._require_memory()
-        return await memory.add(content, user=user or self._settings.default_user, session=session)
+        return await memory.add(
+            content,
+            user=user or self._settings.default_user,
+            session=session,
+            importance_score=importance_score,
+        )
 
     @observed("client.recall")
     async def recall(

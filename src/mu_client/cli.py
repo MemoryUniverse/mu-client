@@ -23,6 +23,7 @@ from pathlib import Path
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_local.views import MemoryListView, MemoryWriteResult
 
+from mu_client.capture.claude_tailer import backfill_thinking
 from mu_client.capture.hook import capture_once, replay_spool
 from mu_client.capture.model import HostKind
 from mu_client.config import get_client_settings
@@ -74,6 +75,25 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[h.value for h in HostKind],
         default=HostKind.CLAUDE_CODE.value,
         help="Which host emitted this hook event.",
+    )
+
+    backfill_p = sub.add_parser(
+        "backfill-thinking",
+        help="Phase 0B: tail a Claude Code session transcript JSONL for REASONING "
+        "(thinking blocks + mid-turn intermediate messages), append the salient decisions/"
+        "findings to the durable outbox (then 'mu flush' to drive them into the stores).",
+    )
+    backfill_p.add_argument(
+        "--transcript",
+        type=Path,
+        required=True,
+        help="Path to the Claude Code session transcript JSONL "
+        "(~/.claude/projects/<slug>/<session>.jsonl, or a hook payload's transcript_path).",
+    )
+    backfill_p.add_argument(
+        "--session",
+        default=None,
+        help="Override the η.session slot (default: the transcript's own sessionId / file stem).",
     )
 
     sub.add_parser(
@@ -156,9 +176,7 @@ def _render_list(listing: MemoryListView) -> None:
 def _run_install(args: argparse.Namespace) -> int:
     if args.install_target != "claude-code":
         raise AssertionError(f"unreachable: unknown install target {args.install_target!r}")
-    result = install_claude_code.install(
-        args.settings_path, hook_script_path=args.hook_script
-    )
+    result = install_claude_code.install(args.settings_path, hook_script_path=args.hook_script)
     print(
         f"settings_path={result.settings_path} backup_path={result.backup_path} "
         f"events_added={list(result.events_added)} "
@@ -171,9 +189,7 @@ def _run_install(args: argparse.Namespace) -> int:
 def _run_uninstall(args: argparse.Namespace) -> int:
     if args.install_target != "claude-code":
         raise AssertionError(f"unreachable: unknown install target {args.install_target!r}")
-    result = install_claude_code.uninstall(
-        args.settings_path, hook_script_path=args.hook_script
-    )
+    result = install_claude_code.uninstall(args.settings_path, hook_script_path=args.hook_script)
     print(
         f"settings_path={result.settings_path} backup_path={result.backup_path} "
         f"events_removed={list(result.events_removed)} "
@@ -189,6 +205,21 @@ async def _run_capture_once(args: argparse.Namespace) -> int:
     response = await capture_once(settings, host=HostKind(args.host), raw=raw)
     print(json.dumps(response))
     return 0  # capture NEVER fails/blocks the host turn (capture-spec.md §3/§13)
+
+
+async def _run_backfill_thinking(args: argparse.Namespace) -> int:
+    settings = get_client_settings()
+    result = await backfill_thinking(
+        settings, transcript_path=args.transcript, session_id=args.session
+    )
+    # Content-free summary (counts only, never reasoning text) — the CLI's own stdout surface.
+    print(
+        f"appended={result.appended} records_scanned={result.records_scanned} "
+        f"thinking_blocks_seen={result.thinking_blocks_seen} "
+        f"thinking_blocks_plaintext={result.thinking_blocks_plaintext} "
+        f"since_byte={result.since_byte} end_offset={result.end_offset} halted={result.halted}"
+    )
+    return 0  # backfill is best-effort enrichment — never a nonzero exit on empty/absent reasoning
 
 
 async def _run_flush() -> int:
@@ -243,6 +274,8 @@ async def _run(argv: Sequence[str]) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "capture-once":
         return await _run_capture_once(args)
+    if args.command == "backfill-thinking":
+        return await _run_backfill_thinking(args)
     if args.command == "flush":
         return await _run_flush()
     if args.command == "daemon":
