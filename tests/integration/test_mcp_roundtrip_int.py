@@ -5,11 +5,14 @@ round-trip: the ``mcp`` Python SDK's stdio CLIENT spawns the ACTUAL ``mu-mcp`` s
 subprocess and speaks the MCP protocol to it; the server delegates to the real embedded
 ``LocalMemory`` over the real mu-dev-* stores (valkey/qdrant/falkordb) + the real MiniLM embedder.
 
-Four proofs, all over the wire:
-1. ``list_tools`` advertises exactly {add, recall, get, consolidate} — the real verb set.
+Proofs, all over the wire:
+1. ``list_tools`` advertises exactly {add, recall, get, consolidate, search, build_context, ask} —
+   the real verb set.
 2. ``add`` over MCP LANDS the fact in the REAL store — asserted by a DIRECT valkey GET of the STM
    key (bypassing all MU code), not by trusting the tool's own receipt.
-3. ``recall`` over MCP returns that fact.
+3. ``recall`` over MCP returns that fact; ``search`` (the mem0 alias) returns it too;
+   ``build_context`` renders a context window containing it; ``ask`` synthesises a real answer over
+   it via the local SLM.
 4. The ``SharedPrivateGuard`` rejects a shared/visibility argument over the wire (isError).
 
 If a container is down the test RAISES (BLOCKED, never faked).
@@ -83,7 +86,15 @@ async def test_mcp_stdio_client_round_trips_real_data(
             listed = await session.list_tools()
             names = {t.name for t in listed.tools}
             print(f"MCP list_tools -> {sorted(names)}")  # noqa: T201 — required evidence
-            assert names == {"add", "recall", "get", "consolidate"}, names
+            assert names == {
+                "add",
+                "recall",
+                "get",
+                "consolidate",
+                "search",
+                "build_context",
+                "ask",
+            }, names
 
             # (2) add over MCP.
             add_res = await session.call_tool(
@@ -118,6 +129,47 @@ async def test_mcp_stdio_client_round_trips_real_data(
                 + "; ".join(f"{it['memory_id']}|{it['channel']}|{it['content']}" for it in items)
             )
             assert any("staging-eu-west" in it["content"] for it in items), items
+
+            # (3b) search over MCP — the mem0 alias returns the same fact as ranked hits.
+            searched = await session.call_tool(
+                "search",
+                {"query": _QUERY, "user": _USER, "session": _SESSION},
+                read_timeout_seconds=timeout,
+            )
+            assert not searched.isError, searched.content
+            search_items = (searched.structuredContent or {}).get("items", [])
+            print(  # noqa: T201 — required evidence
+                "MCP search -> "
+                + "; ".join(f"{it['channel']}|{it['content']}" for it in search_items)
+            )
+            assert any("staging-eu-west" in it["content"] for it in search_items), search_items
+
+            # (3c) build_context over MCP — a rendered context window containing the fact.
+            ctx = await session.call_tool(
+                "build_context",
+                {"query": _QUERY, "user": _USER, "session": _SESSION},
+                read_timeout_seconds=timeout,
+            )
+            assert not ctx.isError, ctx.content
+            ctx_out = ctx.structuredContent or {}
+            print(  # noqa: T201 — required evidence
+                f"MCP build_context -> text={ctx_out.get('text', '')[:160]!r} "
+                f"n_items={len(ctx_out.get('items', []))} degraded={ctx_out.get('degraded')}"
+            )
+            assert "staging-eu-west" in ctx_out.get("text", ""), ctx_out
+
+            # (3d) ask over MCP — a synthesised answer from the local SLM, citing the fact.
+            asked = await session.call_tool(
+                "ask",
+                {"question": _QUERY, "user": _USER, "session": _SESSION},
+                read_timeout_seconds=timeout,
+            )
+            assert not asked.isError, asked.content
+            ask_out = asked.structuredContent or {}
+            answer = str(ask_out.get("answer", ""))
+            print(f"MCP ask -> {answer[:200]!r}")  # noqa: T201 — required evidence
+            assert answer.strip(), "ask returned an empty synthesised answer"
+            assert "staging" in answer.lower() or "ada" in answer.lower(), answer
 
             # (4) guard — a shared/visibility argument is rejected over the wire.
             guarded = await session.call_tool(

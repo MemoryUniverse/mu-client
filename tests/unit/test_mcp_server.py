@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 
 import pytest
 from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallResult
-from mu_contracts.contracts.views import ConsolidateView, MemoryWriteResult
+from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
 from mu_contracts.domain.model.memory import Tier
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -23,9 +23,12 @@ from mu_client.mcp.guard import SharedPlaneRejectedError, SharedPrivateGuard
 from mu_client.mcp.tools import (
     resolve_tier,
     tool_add,
+    tool_ask,
+    tool_build_context,
     tool_consolidate,
     tool_get,
     tool_recall,
+    tool_search,
 )
 
 pytestmark = pytest.mark.unit
@@ -41,7 +44,19 @@ class _StubEngine:
     def __init__(self) -> None:
         self.add_calls: list[dict[str, object]] = []
         self.recall_calls: list[dict[str, object]] = []
+        self.search_calls: list[dict[str, object]] = []
+        self.context_calls: list[dict[str, object]] = []
+        self.ask_calls: list[dict[str, object]] = []
         self.get_return_none = False
+
+    def _hit(self) -> RecallItemView:
+        return RecallItemView(
+            memory_id="mem-123",
+            content="Ada lives in Paris",
+            tier=Tier.STM,
+            channel="stm",
+            fused_score=0.9,
+        )
 
     async def add(
         self,
@@ -99,6 +114,46 @@ class _StubEngine:
         self, *, user: str = "default", session: str | None = None, limit: int = 20
     ) -> ConsolidateView:
         return ConsolidateView(facts_extracted=3, added=2, superseded=1, noop=0)
+
+    async def search(
+        self,
+        query: str,
+        *,
+        user: str = "default",
+        session: str | None = None,
+        tier: MemoryTier | None = None,
+        limit: int = 10,
+    ) -> RecallResult:
+        self.search_calls.append({"query": query, "tier": tier, "limit": limit})
+        return RecallResult(
+            namespace=_NS,
+            items=[self._hit()],
+            channels_run=RecallChannels(),
+            generated_at=datetime.now(UTC),
+        )
+
+    async def context(
+        self,
+        query: str,
+        *,
+        user: str = "default",
+        session: str | None = None,
+        limit: int = 10,
+        max_chars: int | None = None,
+    ) -> ContextView:
+        self.context_calls.append({"query": query, "limit": limit, "max_chars": max_chars})
+        return ContextView(text="- Ada lives in Paris", items=[self._hit()], degraded=None)
+
+    async def ask(
+        self,
+        question: str,
+        *,
+        user: str = "default",
+        session: str | None = None,
+        limit: int = 10,
+    ) -> str:
+        self.ask_calls.append({"question": question, "limit": limit})
+        return "Ada lives in Paris."
 
 
 # --------------------------------------------------------------------------------- guard
@@ -192,11 +247,78 @@ async def test_tool_consolidate_serialises_report() -> None:
     assert out == {"facts_extracted": 3, "added": 2, "superseded": 1, "noop": 0}
 
 
+# --------------------------------------------------------------------------------- search
+async def test_tool_search_resolves_tier_and_serialises() -> None:
+    engine = _StubEngine()
+    out = await tool_search(
+        engine, SharedPrivateGuard(), query="where is Ada?", user="u1", session="s1", tier="mtm"
+    )
+    assert engine.search_calls[0]["tier"] is MemoryTier.MTM
+    assert out["items"][0]["content"] == "Ada lives in Paris"
+
+
+async def test_tool_search_rejects_shared() -> None:
+    engine = _StubEngine()
+    with pytest.raises(SharedPlaneRejectedError):
+        await tool_search(
+            engine, SharedPrivateGuard(), query="q", user="u1", session="s1", visibility="shared"
+        )
+    assert engine.search_calls == []
+
+
+# --------------------------------------------------------------------------------- build_context
+async def test_tool_build_context_serialises_view() -> None:
+    engine = _StubEngine()
+    out = await tool_build_context(
+        engine, SharedPrivateGuard(), query="Ada?", user="u1", session="s1", max_chars=40
+    )
+    assert out["text"] == "- Ada lives in Paris"
+    assert out["items"][0]["content"] == "Ada lives in Paris"
+    assert out["degraded"] is None
+    assert engine.context_calls[0]["max_chars"] == 40
+
+
+async def test_tool_build_context_rejects_shared() -> None:
+    engine = _StubEngine()
+    with pytest.raises(SharedPlaneRejectedError):
+        await tool_build_context(
+            engine, SharedPrivateGuard(), query="q", user="u1", session="s1", subject="Ada"
+        )
+    assert engine.context_calls == []
+
+
+# --------------------------------------------------------------------------------- ask
+async def test_tool_ask_wraps_answer() -> None:
+    engine = _StubEngine()
+    out = await tool_ask(
+        engine, SharedPrivateGuard(), question="Where is Ada?", user="u1", session="s1"
+    )
+    assert out == {"question": "Where is Ada?", "answer": "Ada lives in Paris."}
+    assert engine.ask_calls[0]["question"] == "Where is Ada?"
+
+
+async def test_tool_ask_rejects_shared() -> None:
+    engine = _StubEngine()
+    with pytest.raises(SharedPlaneRejectedError):
+        await tool_ask(
+            engine, SharedPrivateGuard(), question="q", user="u1", session="s1", object="Paris"
+        )
+    assert engine.ask_calls == []
+
+
 # --------------------------------------------------------------------------------- server registry
 async def test_build_server_advertises_exactly_the_real_verbs() -> None:
     server = build_server()
     tool_names = {tool.name for tool in await server.list_tools()}
-    assert tool_names == {"add", "recall", "get", "consolidate"}
+    assert tool_names == {
+        "add",
+        "recall",
+        "get",
+        "consolidate",
+        "search",
+        "build_context",
+        "ask",
+    }
     # promote/demote (engine 501s) + update/delete (no embedded entry) are deliberately absent.
     assert "promote" not in tool_names and "delete" not in tool_names
 

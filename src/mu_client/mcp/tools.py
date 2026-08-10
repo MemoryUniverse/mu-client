@@ -14,7 +14,7 @@ from typing import Any, Protocol
 from mu_contracts.contracts.defaults import DEFAULT_CONSOLIDATE_LIMIT, DEFAULT_RECALL_LIMIT
 from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallResult
-from mu_contracts.contracts.views import ConsolidateView, MemoryWriteResult
+from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
 from mu_engine.storage.domain.memory import MemoryTier
 
 from mu_client.mcp.guard import SharedPrivateGuard
@@ -23,9 +23,12 @@ __all__ = [
     "MemoryVerbs",
     "resolve_tier",
     "tool_add",
+    "tool_ask",
+    "tool_build_context",
     "tool_consolidate",
     "tool_get",
     "tool_recall",
+    "tool_search",
 ]
 
 _TIER_BY_NAME: dict[str, MemoryTier] = {tier.value: tier for tier in MemoryTier}
@@ -70,6 +73,35 @@ class MemoryVerbs(Protocol):
         session: str | None = ...,
         limit: int = ...,
     ) -> ConsolidateView: ...
+
+    async def search(
+        self,
+        query: str,
+        *,
+        user: str = ...,
+        session: str | None = ...,
+        tier: MemoryTier | None = ...,
+        limit: int = ...,
+    ) -> RecallResult: ...
+
+    async def context(
+        self,
+        query: str,
+        *,
+        user: str = ...,
+        session: str | None = ...,
+        limit: int = ...,
+        max_chars: int | None = ...,
+    ) -> ContextView: ...
+
+    async def ask(
+        self,
+        question: str,
+        *,
+        user: str = ...,
+        session: str | None = ...,
+        limit: int = ...,
+    ) -> str: ...
 
 
 def resolve_tier(tier: str | None) -> MemoryTier | None:
@@ -157,3 +189,81 @@ async def tool_consolidate(
     """
     report = await engine.consolidate(user=user, session=session, limit=limit)
     return report.model_dump(mode="json")
+
+
+async def tool_search(
+    engine: MemoryVerbs,
+    guard: SharedPrivateGuard,
+    *,
+    query: str,
+    user: str,
+    session: str | None,
+    tier: str | None = None,
+    limit: int = DEFAULT_RECALL_LIMIT,
+    visibility: str | None = None,
+    subject: str | None = None,
+    predicate: str | None = None,
+    object: str | None = None,
+) -> dict[str, Any]:
+    """``search`` — the mem0 muscle-memory alias for ``recall`` (ONE behaviour, spec §CC-6): the
+    same federate-live ranked recall (STM floor + MTM dense + LTM graph, fused) over the caller's
+    OWN private partition. Returns the canonical ``RecallResult``. Prefer ``recall`` as the
+    canonical verb; ``search`` exists so a mem0-shaped caller finds the same tool by its familiar
+    name."""
+    guard.assert_private(visibility=visibility, subject=subject, predicate=predicate, object=object)
+    result = await engine.search(
+        query, user=user, session=session, tier=resolve_tier(tier), limit=limit
+    )
+    return result.model_dump(mode="json")
+
+
+async def tool_build_context(
+    engine: MemoryVerbs,
+    guard: SharedPrivateGuard,
+    *,
+    query: str,
+    user: str,
+    session: str | None,
+    limit: int = DEFAULT_RECALL_LIMIT,
+    max_chars: int | None = None,
+    visibility: str | None = None,
+    subject: str | None = None,
+    predicate: str | None = None,
+    object: str | None = None,
+) -> dict[str, Any]:
+    """``build_context`` — assemble a ready-to-inject context window for a task/query by
+    DETERMINISTIC concatenation of the ranked recall hits (no LLM synthesis — spec §7 INJECT
+    render). Returns the canonical ``ContextView`` (``text`` = the rendered window, ``items`` = the
+    hits it was built from, ``degraded`` = a named degrade label or ``None``). ``max_chars`` caps
+    the rendered ``text``. Use this when an agent needs relevant background context to work with;
+    use ``recall``/``search`` when you want the raw ranked hits, ``ask`` when you want a synthesised
+    answer to a question."""
+    guard.assert_private(visibility=visibility, subject=subject, predicate=predicate, object=object)
+    view = await engine.context(
+        query, user=user, session=session, limit=limit, max_chars=max_chars
+    )
+    return view.model_dump(mode="json")
+
+
+async def tool_ask(
+    engine: MemoryVerbs,
+    guard: SharedPrivateGuard,
+    *,
+    question: str,
+    user: str,
+    session: str | None,
+    limit: int = DEFAULT_RECALL_LIMIT,
+    visibility: str | None = None,
+    subject: str | None = None,
+    predicate: str | None = None,
+    object: str | None = None,
+) -> dict[str, Any]:
+    """``ask`` — answer a natural-language QUESTION over the caller's OWN recalled context, via the
+    configured LLM's ANSWER task (the local SLM). Returns ``{question, answer}``. Heuristic mode
+    (no LLM configured) refuses loudly (``LlmNotConfiguredError``) rather than fabricating a
+    degraded answer — surfaced to the MCP caller as a tool error, never a silent empty string. Use
+    this when you want a synthesised answer; use ``build_context`` for the raw context window or
+    ``recall``/``search`` for the ranked hits."""
+    guard.assert_private(visibility=visibility, subject=subject, predicate=predicate, object=object)
+    answer = await engine.ask(question, user=user, session=session, limit=limit)
+    return {"question": question, "answer": answer}

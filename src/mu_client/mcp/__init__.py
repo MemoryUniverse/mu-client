@@ -8,7 +8,10 @@ PARKED and never reachable from here (ADR-0003; :class:`~mu_client.mcp.guard.Sha
 Every tool delegates to the REAL embedded engine (`mu_local.LocalMemory`, hosted by
 :class:`~mu_client.host.LocalMemoryHost`) against the caller's OWN real stores — no new memory
 logic, no mock, no fake. Only the verbs the engine actually implements today are exposed:
-``add``/``recall``/``get``/``consolidate``. ``promote``/``demote`` are honest 501s in the engine
+``add``/``recall``/``get``/``consolidate`` plus ``search`` (mem0 alias of ``recall``),
+``build_context`` (the deterministic INJECT context window, ``LocalMemory.context``) and ``ask``
+(SLM-synthesised Q&A, ``LocalMemory.ask``) — every one backed by a genuinely-built engine method,
+verified against real stores + the local SLM. ``promote``/``demote`` are honest 501s in the engine
 (``SurfaceVerbNotImplementedError``) and are DELIBERATELY NOT exposed as working tools; ``update``/
 ``delete`` have no embedded-engine entry point today and are likewise omitted (see the plan §2A).
 """

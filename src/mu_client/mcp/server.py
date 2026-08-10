@@ -6,9 +6,15 @@ REAL embedded engine (:class:`~mu_local.local_memory.LocalMemory`, hosted by
 no in-process substitute. The engine is started once at server startup via the FastMCP ``lifespan``
 and torn down on shutdown; every tool call reuses that ONE live engine.
 
-Only real verbs are exposed: ``add``/``recall``/``get``/``consolidate``. ``promote``/``demote`` are
-honest 501s in the engine and are NOT registered; ``update``/``delete`` have no embedded entry point
-today and are omitted (plan §2A). Shared-plane arguments are refused at the surface by
+Only real verbs are exposed: ``add``/``recall``/``get``/``consolidate``/``search``/
+``build_context``/``ask`` — each backed by a genuinely-built
+:class:`~mu_local.local_memory.LocalMemory` method (no
+stub, no 501). ``search`` is the mem0 alias of ``recall``; ``build_context`` renders the
+deterministic INJECT context window (``LocalMemory.context``); ``ask`` synthesises an answer via the
+configured local SLM (``LocalMemory.ask`` — refuses loudly in heuristic mode, never fabricates).
+``promote``/``demote`` are honest 501s in the engine and are NOT registered; ``update``/``delete``
+have no embedded entry point today and are omitted (plan §2A). Shared-plane arguments are refused at
+the surface by
 :class:`~mu_client.mcp.guard.SharedPrivateGuard` — this is a PRIVATE-plane server (ADR-0003).
 
 Phase 2 (plan §4) adds the SILENT auto-inject RESOURCE ``memory-universe://silent/{session}`` — an
@@ -41,9 +47,12 @@ __all__ = ["build_server"]
 _SERVER_NAME = "memory-universe-local"
 _INSTRUCTIONS = (
     "Memory Universe — local, private memory for this agent. Tools: 'add' remembers a fact, "
-    "'recall' retrieves relevant facts, 'get' fetches one memory by id, 'consolidate' distills "
-    "recent memories into long-term facts. All memory is PRIVATE to this machine; there is no "
-    "shared plane here — do not pass visibility/subject/predicate/object arguments."
+    "'recall' (alias 'search') retrieves relevant facts as ranked hits, 'build_context' assembles "
+    "a ready-to-inject context window for a task, 'ask' answers a question by synthesising over "
+    "recalled context (local SLM), 'get' fetches one memory by id, 'consolidate' distills recent "
+    "memories into long-term facts. Choose 'recall'/'search' for raw hits, 'build_context' for a "
+    "context window, 'ask' for a synthesised answer. All memory is PRIVATE to this machine; there "
+    "is no shared plane here — do not pass visibility/subject/predicate/object arguments."
 )
 
 
@@ -184,6 +193,101 @@ def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
         limit: int = DEFAULT_CONSOLIDATE_LIMIT,
     ) -> dict[str, Any]:
         return await tools.tool_consolidate(holder.memory, user=user, session=session, limit=limit)
+
+    @server.tool(
+        name="search",
+        description="Retrieve relevant memories for a query as ranked hits (mem0-style alias of "
+        "'recall' — same fused STM+MTM+LTM recall). Optional 'tier' narrows to stm|mtm|ltm. Use "
+        "'build_context' instead when you want a ready-to-inject context window, 'ask' for a "
+        "synthesised answer.",
+    )
+    async def search(  # pyright: ignore[reportUnusedFunction]
+        query: str,
+        user: str = default_user,
+        session: str | None = None,
+        tier: str | None = None,
+        limit: int = DEFAULT_RECALL_LIMIT,
+        visibility: str | None = None,
+        subject: str | None = None,
+        predicate: str | None = None,
+        object: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.tool_search(
+            holder.memory,
+            guard,
+            query=query,
+            user=user,
+            session=session,
+            tier=tier,
+            limit=limit,
+            visibility=visibility,
+            subject=subject,
+            predicate=predicate,
+            object=object,
+        )
+
+    @server.tool(
+        name="build_context",
+        description="Assemble a ready-to-inject CONTEXT WINDOW of the memories relevant to a task "
+        "or query (deterministic concatenation of the ranked hits — no LLM). Returns "
+        "{text, items, degraded}: 'text' is the rendered window, 'items' the hits behind it. "
+        "'max_chars' caps the text. Use this to get relevant context for a task; use "
+        "'recall'/'search' for raw ranked hits, 'ask' for a synthesised answer to a question.",
+    )
+    async def build_context(  # pyright: ignore[reportUnusedFunction]
+        query: str,
+        user: str = default_user,
+        session: str | None = None,
+        limit: int = DEFAULT_RECALL_LIMIT,
+        max_chars: int | None = None,
+        visibility: str | None = None,
+        subject: str | None = None,
+        predicate: str | None = None,
+        object: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.tool_build_context(
+            holder.memory,
+            guard,
+            query=query,
+            user=user,
+            session=session,
+            limit=limit,
+            max_chars=max_chars,
+            visibility=visibility,
+            subject=subject,
+            predicate=predicate,
+            object=object,
+        )
+
+    @server.tool(
+        name="ask",
+        description="Answer a natural-language QUESTION over this agent's own recalled memory, "
+        "synthesised by the local SLM. Returns {question, answer}. Refuses loudly if no LLM is "
+        "configured (never fabricates). Use this for a synthesised answer; use 'build_context' for "
+        "the raw context window or 'recall'/'search' for the ranked hits.",
+    )
+    async def ask(  # pyright: ignore[reportUnusedFunction]
+        question: str,
+        user: str = default_user,
+        session: str | None = None,
+        limit: int = DEFAULT_RECALL_LIMIT,
+        visibility: str | None = None,
+        subject: str | None = None,
+        predicate: str | None = None,
+        object: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.tool_ask(
+            holder.memory,
+            guard,
+            question=question,
+            user=user,
+            session=session,
+            limit=limit,
+            visibility=visibility,
+            subject=subject,
+            predicate=predicate,
+            object=object,
+        )
 
     @server.resource(
         "memory-universe://silent/{session}",
