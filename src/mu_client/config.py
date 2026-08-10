@@ -174,6 +174,13 @@ class CaptureSettings(BaseModel):
     thinking_decision_importance: float = 0.7
     thinking_finding_importance: float = 0.55
 
+    # ---- Phase 1.5: subagent agent-scoped memory partitions (AGENT-INTEGRATION-AUDIT-AND-PLAN.md
+    # §6; mu_contracts.domain.model.agent). ON by default — a ``SubagentStop`` capture writes to a
+    # distinct agent-scoped ``η`` partition (deterministic ``agent_principal_id``) instead of the
+    # Phase-0 ``[subagent:...]`` text prefix alone. OFF reverts to Phase-0 (prefix only, same
+    # partition as a top-level turn). Human/top-level captures are unchanged either way.
+    subagent_partition_enabled: bool = True  # env: MU_CAPTURE__SUBAGENT_PARTITION_ENABLED
+
 
 class OutboxSettings(BaseModel):
     """capture-spec.md §10/§8.3, same literal default path as ``ClientSettings.outbox_db_path``

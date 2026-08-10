@@ -73,6 +73,55 @@ async def test_ingest_real_activity_calls_host_add(started_host: LocalMemoryHost
     assert kwargs["session"] == "s1"
 
 
+def _subagent_activity(agent_type: str, *, text: str = "found the answer") -> RawActivity:
+    return RawActivity(
+        activity_id="act-sub",
+        host=HostKind.CLAUDE_CODE,
+        host_version="test",
+        schema_version="claude_code.v1",
+        kind=ActivityKind.SUBAGENT_RUN,
+        session_id="s1",
+        occurred_at=datetime.now(UTC),
+        text=text,
+        content_hash="deadbeef",
+        source_offset="o-sub",
+        provenance_id="prov_sub",
+        payload={"agent_type": agent_type},
+    )
+
+
+async def test_subagent_partition_threads_agent_type_and_keeps_text_prefix(
+    started_host: LocalMemoryHost,
+) -> None:
+    """Phase 1.5 ON (default): a SUBAGENT_RUN threads ``agent_type`` to ``host.add`` (→ the real
+    agent-scoped partition) AND keeps the ``[subagent:...]`` provenance prefix on the text."""
+    ingest = InProcessLocalIngest(started_host, user="u1")  # subagent_partitions defaults True
+    await ingest.ingest(_subagent_activity("researcher"))
+    args, kwargs = started_host._memory.add.await_args  # type: ignore[union-attr]
+    assert kwargs["agent_type"] == "researcher"
+    assert args[0].startswith("[subagent:researcher] ")  # provenance prefix preserved
+
+
+async def test_subagent_partition_off_reverts_to_text_prefix_only(
+    started_host: LocalMemoryHost,
+) -> None:
+    """Phase 0 fallback: with partitions disabled, the prefix stays but NO agent partition (the
+    backward-compatible escape hatch — ``agent_type`` is None into ``host.add``)."""
+    ingest = InProcessLocalIngest(started_host, user="u1", subagent_partitions=False)
+    await ingest.ingest(_subagent_activity("researcher"))
+    args, kwargs = started_host._memory.add.await_args  # type: ignore[union-attr]
+    assert kwargs["agent_type"] is None
+    assert args[0].startswith("[subagent:researcher] ")
+
+
+async def test_non_subagent_activity_never_partitions(started_host: LocalMemoryHost) -> None:
+    """Backward compatibility: a human/top-level turn passes ``agent_type=None`` — unchanged."""
+    ingest = InProcessLocalIngest(started_host, user="u1")
+    await ingest.ingest(_activity(text="Ada lives in Paris"))
+    _, kwargs = started_host._memory.add.await_args  # type: ignore[union-attr]
+    assert kwargs["agent_type"] is None
+
+
 async def test_worker_run_once_acks_control_kind_without_calling_ingest(
     tmp_path: Path, started_host: LocalMemoryHost
 ) -> None:

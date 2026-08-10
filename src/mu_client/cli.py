@@ -20,8 +20,9 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from mu_contracts.contracts.recall import RecallResult
+from mu_contracts.contracts.views import MemoryWriteResult
 from mu_engine.storage.domain.memory import MemoryTier
-from mu_local.views import MemoryListView, MemoryWriteResult
 
 from mu_client.capture.claude_tailer import backfill_thinking
 from mu_client.capture.hook import capture_once, replay_spool
@@ -171,9 +172,9 @@ def _render_write(result: MemoryWriteResult) -> None:
     )
 
 
-def _render_list(listing: MemoryListView) -> None:
+def _render_list(listing: RecallResult) -> None:
     if listing.degraded is not None:
-        print(f"[degraded: {listing.degraded}]", file=sys.stderr)
+        print(f"[degraded: {listing.degraded.value}]", file=sys.stderr)
     if not listing.items:
         print("(no results)")
         return

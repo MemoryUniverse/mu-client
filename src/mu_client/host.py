@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 
 import structlog
 from mu_contracts.config.settings import RuntimeMode, Settings
+from mu_contracts.contracts.recall import RecallResult
+from mu_contracts.contracts.views import MemoryWriteResult
 from mu_contracts.ports.bus import EventBusPort
 from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
 from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
@@ -32,7 +34,6 @@ from mu_engine.storage.domain.memory import MemoryTier
 from mu_local.config import ModelProfileSettings as LocalModelProfileSettings
 from mu_local.config import StorageSettings as LocalBackendSettings
 from mu_local.local_memory import LocalMemory
-from mu_local.views import MemoryListView, MemoryWriteResult
 
 from mu_client.config import ClientSettings, get_client_settings
 from mu_client.decorators import observed
@@ -189,18 +190,24 @@ class LocalMemoryHost:
         user: str | None = None,
         session: str | None = None,
         importance_score: float | None = None,
+        agent_type: str | None = None,
     ) -> MemoryWriteResult:
         # ``importance_score`` threads straight to ``LocalMemory.add`` → the engine's ONE promotion
         # gate (``DeterministicPromoteStage``: ``importance >= IngestSettings.importance_promote``).
         # ``None`` (every existing caller) leaves add()'s own default untouched — byte-for-byte the
         # prior behaviour; the Phase 0B reasoning tailer (capture/claude_tailer.py) is the first
         # caller to set it, so a strong decision promotes STM→MTM while a weaker finding stays STM.
+        #
+        # ``agent_type`` (Phase 1.5, AGENT-INTEGRATION-AUDIT-AND-PLAN.md §6): a SUBAGENT attribution
+        # routed to ``LocalMemory.add`` so the subagent's memory lands in its own agent-scoped
+        # partition (agent.py). ``None`` (every human/top-level caller) ⇒ unchanged partition.
         memory = self._require_memory()
         return await memory.add(
             content,
             user=user or self._settings.default_user,
             session=session,
             importance_score=importance_score,
+            agent_type=agent_type,
         )
 
     @observed("client.recall")
@@ -212,7 +219,7 @@ class LocalMemoryHost:
         session: str | None = None,
         tier: MemoryTier | None = None,
         limit: int = 10,
-    ) -> MemoryListView:
+    ) -> RecallResult:
         memory = self._require_memory()
         return await memory.recall(
             query,
@@ -231,7 +238,7 @@ class LocalMemoryHost:
         session: str | None = None,
         tier: MemoryTier | None = None,
         limit: int = 10,
-    ) -> MemoryListView:
+    ) -> RecallResult:
         """mem0 muscle-memory alias for :meth:`recall` (mirrors ``LocalMemory.search``)."""
         return await self.recall(query, user=user, session=session, tier=tier, limit=limit)
 

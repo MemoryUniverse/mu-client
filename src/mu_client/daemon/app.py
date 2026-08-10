@@ -126,7 +126,11 @@ class LocalDaemon:
         )
 
         # 4) WORKER POOL — drain -> LocalMemory.add -> ack (capture-spec.md §8.4).
-        ingest = InProcessLocalIngest(self._host, user=self._settings.default_user)
+        ingest = InProcessLocalIngest(
+            self._host,
+            user=self._settings.default_user,
+            subagent_partitions=self._settings.capture.subagent_partition_enabled,
+        )
         worker = OutboxWorker(
             self._outbox,
             ingest,
