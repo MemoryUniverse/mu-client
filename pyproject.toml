@@ -25,6 +25,10 @@ dependencies = [
     # Model Context Protocol Python SDK (FastMCP stdio host + client). Local plane ONLY — never
     # mu-server (import-linter "client-has-no-server").
     "mcp>=1.12,<2",
+    # Round-trip TOML editing for `mu install codex` (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase
+    # 4): codex config is TOML, and preserving the owner's existing comments/formatting on a
+    # backup-first, never-clobber merge needs a writer — stdlib `tomllib` is read-only.
+    "tomlkit>=0.13,<1",
 ]
 
 [project.scripts]

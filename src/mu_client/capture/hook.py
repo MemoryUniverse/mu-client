@@ -30,6 +30,7 @@ from typing import Any
 import structlog
 
 from mu_client.capture.claude_tailer import backfill_thinking
+from mu_client.capture.codex import CodexNotifyParserV1
 from mu_client.capture.model import HostKind
 from mu_client.capture.parsers import ClaudeCodeParserV1, ParserRegistry
 from mu_client.config import ClientSettings
@@ -39,6 +40,18 @@ from mu_client.outbox.sqlite_outbox import SqliteOutbox
 __all__ = ["capture_once", "replay_spool"]
 
 _log = structlog.get_logger("mu.client.capture.hook")
+
+def _build_registry(settings: ClientSettings) -> ParserRegistry:
+    """The ONE parser set the daemonless capture/replay paths share: Claude Code hook envelopes +
+    the Codex ``notify`` ``agent-turn-complete`` envelope (Phase 4). The registry keys parsers by
+    host, so ``--host codex`` only ever tries the codex parser and vice-versa."""
+    registry = ParserRegistry()
+    registry.register(
+        ClaudeCodeParserV1(tool_outcome_max_chars=settings.capture.tool_outcome_max_chars)
+    )
+    registry.register(CodexNotifyParserV1())
+    return registry
+
 
 _DUAL_PURPOSE_EVENTS = frozenset({"UserPromptSubmit", "SessionStart"})
 # Hook events on which a completed turn's reasoning is append-stable in the transcript, so the
@@ -151,10 +164,7 @@ async def _rpc(
 async def _direct_append_or_spool(
     settings: ClientSettings, *, host: HostKind, record: dict[str, Any], event_id: str, raw: bytes
 ) -> None:
-    registry = ParserRegistry()
-    registry.register(
-        ClaudeCodeParserV1(tool_outcome_max_chars=settings.capture.tool_outcome_max_chars)
-    )
+    registry = _build_registry(settings)
     try:
         parser = registry.select(host, record)
         activity = parser.parse(record=record, event_id=event_id)
@@ -189,10 +199,7 @@ async def replay_spool(settings: ClientSettings, outbox: SqliteOutbox) -> int:
     spool_dir = settings.capture.spool_dir.expanduser()
     if not spool_dir.is_dir():
         return 0
-    registry = ParserRegistry()
-    registry.register(
-        ClaudeCodeParserV1(tool_outcome_max_chars=settings.capture.tool_outcome_max_chars)
-    )
+    registry = _build_registry(settings)
     replayed = 0
     for path in sorted(spool_dir.glob("*.json")):
         envelope = json.loads(path.read_text(encoding="utf-8"))

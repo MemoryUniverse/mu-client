@@ -1,0 +1,20 @@
+# Example of what `mu install codex` writes into $CODEX_HOME/config.toml (default ~/.codex/config.toml).
+# Verified against codex-cli 0.146.0. `mu install codex` writes these idempotently, backup-first,
+# and never clobbers a foreign `notify` or an unrelated [mcp_servers.*] entry / top-level key.
+
+# 1) The notify program hook — codex spawns it with the turn JSON as argv[1] on agent-turn-complete.
+notify = ["/abs/path/to/mu-client/scripts/hooks/mu_codex_notify.sh"]
+
+# 2) The MU MCP server — self-contained: the resolved store endpoints ride in the env block so a
+#    `mu-mcp` codex spawns from any project directory reaches the real stores.
+[mcp_servers.memory-universe]
+command = "mu-mcp"
+args = []
+
+[mcp_servers.memory-universe.env]
+MU_RUNTIME_MODE = "local"
+MU_STORAGE__CACHE__HOST = "127.0.0.1"
+MU_STORAGE__CACHE__PORT = "16379"
+MU_STORAGE__VECTOR__URL = "http://127.0.0.1:16333"
+MU_STORAGE__GRAPH__HOST = "127.0.0.1"
+MU_STORAGE__GRAPH__PORT = "16380"

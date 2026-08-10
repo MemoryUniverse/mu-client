@@ -42,6 +42,7 @@ import contextlib
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
+from mu_client.capture.codex import CodexNotifyParserV1
 from mu_client.capture.hook import replay_spool
 from mu_client.capture.parsers import ClaudeCodeParserV1, ParserRegistry
 from mu_client.config import ClientSettings, get_client_settings
@@ -125,6 +126,10 @@ class LocalDaemon:
         registry.register(
             ClaudeCodeParserV1(tool_outcome_max_chars=self._settings.capture.tool_outcome_max_chars)
         )
+        # Phase 4: the Codex ``notify`` ``agent-turn-complete`` envelope (mu_codex_notify.sh ->
+        # ``mu capture-once --host codex`` -> daemon IPC capture route). Keyed by host, so it only
+        # ever handles ``--host codex`` records; Claude Code capture is byte-for-byte unchanged.
+        registry.register(CodexNotifyParserV1())
 
         # 4) INJECTION bridge (capture-spec.md §7.2), NOW wired onto the REAL bus (Stage-3
         #    integrate — was a bare PULL-only bridge before this pass, so a real MLM tier

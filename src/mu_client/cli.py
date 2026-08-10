@@ -25,6 +25,7 @@ from mu_contracts.contracts.views import MemoryWriteResult
 from mu_engine.storage.domain.memory import MemoryTier
 
 from mu_client.capture.claude_tailer import backfill_thinking
+from mu_client.capture.codex import backfill_codex
 from mu_client.capture.hook import capture_once, replay_spool
 from mu_client.capture.model import HostKind
 from mu_client.config import get_client_settings, render_endpoint_env
@@ -32,6 +33,7 @@ from mu_client.daemon.app import LocalDaemon
 from mu_client.errors import cli_error_boundary
 from mu_client.host import daemonless_host
 from mu_client.install import claude_code as install_claude_code
+from mu_client.install import codex as install_codex
 from mu_client.outbox.sqlite_outbox import SqliteOutbox
 from mu_client.workers.ingest_client import InProcessLocalIngest
 from mu_client.workers.pool import OutboxWorker
@@ -105,6 +107,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override the η.session slot (default: the transcript's own sessionId / file stem).",
     )
 
+    backfill_codex_p = sub.add_parser(
+        "backfill-codex",
+        help="Phase 4: tail a codex rollout JSONL (~/.codex/sessions/.../rollout-*.jsonl) for the "
+        "session's user prompts, assistant turns and tool calls, append them to the durable outbox "
+        "(then 'mu flush' to drive them into the stores).",
+    )
+    backfill_codex_p.add_argument(
+        "--rollout",
+        type=Path,
+        required=True,
+        help="Path to a codex rollout JSONL "
+        "(~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl).",
+    )
+    backfill_codex_p.add_argument(
+        "--session",
+        default=None,
+        help="Override the η.session slot (default: the rollout's session_meta / filename UUID).",
+    )
+
     sub.add_parser(
         "flush",
         help="Drain the spool + SQLite-WAL outbox into mu-local (PENDING -> remember -> ACKED). "
@@ -149,6 +170,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Only write the capture hooks; skip registering the MCP server in .mcp.json.",
     )
 
+    install_codex_p = install_sub.add_parser(
+        "codex",
+        help="Write the codex notify hook (+ MU MCP server) into a codex config.toml (Phase 4).",
+    )
+    install_codex_p.add_argument(
+        "--config-path",
+        type=Path,
+        default=Path("~/.codex/config.toml").expanduser(),
+        help="Target codex config.toml (default: ~/.codex/config.toml; pass a TEST path or set "
+        "CODEX_HOME to avoid touching a real one).",
+    )
+    install_codex_p.add_argument(
+        "--notify-script",
+        type=Path,
+        default=install_codex.DEFAULT_NOTIFY_SCRIPT,
+        help="Absolute path to mu_codex_notify.sh (default: this checkout's scripts/hooks/).",
+    )
+    install_codex_p.add_argument(
+        "--no-mcp",
+        action="store_true",
+        help="Only write the notify hook; skip registering the memory-universe MCP server.",
+    )
+
     uninstall_p = sub.add_parser(
         "uninstall", help="Remove a host's managed hook block (Phase 0 installer)."
     )
@@ -168,6 +212,22 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=install_claude_code.DEFAULT_HOOK_SCRIPT,
         help="Absolute path to mu_capture_once.sh (must match the one install used).",
+    )
+
+    uninstall_codex_p = uninstall_sub.add_parser(
+        "codex", help="Remove ONLY the managed notify hook + memory-universe MCP server from codex."
+    )
+    uninstall_codex_p.add_argument(
+        "--config-path",
+        type=Path,
+        default=Path("~/.codex/config.toml").expanduser(),
+        help="Target codex config.toml (default: ~/.codex/config.toml; pass a TEST path).",
+    )
+    uninstall_codex_p.add_argument(
+        "--notify-script",
+        type=Path,
+        default=install_codex.DEFAULT_NOTIFY_SCRIPT,
+        help="Absolute path to mu_codex_notify.sh (must match the one install used).",
     )
 
     return parser
@@ -195,6 +255,8 @@ def _render_list(listing: RecallResult) -> None:
 
 
 def _run_install(args: argparse.Namespace) -> int:
+    if args.install_target == "codex":
+        return _run_install_codex(args)
     if args.install_target != "claude-code":
         raise AssertionError(f"unreachable: unknown install target {args.install_target!r}")
     result = install_claude_code.install(args.settings_path, hook_script_path=args.hook_script)
@@ -224,7 +286,43 @@ def _run_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_install_codex(args: argparse.Namespace) -> int:
+    with_mcp = not args.no_mcp
+    mcp_env = render_endpoint_env(get_client_settings()) if with_mcp else None
+    result = install_codex.install(
+        args.config_path,
+        notify_script_path=args.notify_script,
+        with_mcp=with_mcp,
+        mcp_env=mcp_env,
+    )
+    print(
+        f"config_path={result.config_path} backup_path={result.backup_path} "
+        f"notify_written={result.notify_written} "
+        f"notify_already_present={result.notify_already_present} "
+        f"notify_conflict={result.notify_conflict} "
+        f"mcp_server_registered={result.mcp_server_registered} "
+        f"endpoint_vars_written={result.endpoint_vars_written} "
+        f"mcp_servers_preserved={result.mcp_servers_preserved}"
+    )
+    print(
+        install_codex.post_install_guidance(config_path=args.config_path, with_mcp=with_mcp)
+    )
+    return 0
+
+
 def _run_uninstall(args: argparse.Namespace) -> int:
+    if args.install_target == "codex":
+        result_codex = install_codex.uninstall(
+            args.config_path, notify_script_path=args.notify_script
+        )
+        print(
+            f"config_path={result_codex.config_path} backup_path={result_codex.backup_path} "
+            f"notify_removed={result_codex.notify_removed} "
+            f"notify_foreign_left={result_codex.notify_foreign_left} "
+            f"mcp_server_removed={result_codex.mcp_server_removed} "
+            f"mcp_servers_preserved={result_codex.mcp_servers_preserved}"
+        )
+        return 0
     if args.install_target != "claude-code":
         raise AssertionError(f"unreachable: unknown install target {args.install_target!r}")
     result = install_claude_code.uninstall(args.settings_path, hook_script_path=args.hook_script)
@@ -258,6 +356,17 @@ async def _run_backfill_thinking(args: argparse.Namespace) -> int:
         f"since_byte={result.since_byte} end_offset={result.end_offset} halted={result.halted}"
     )
     return 0  # backfill is best-effort enrichment — never a nonzero exit on empty/absent reasoning
+
+
+async def _run_backfill_codex(args: argparse.Namespace) -> int:
+    settings = get_client_settings()
+    result = await backfill_codex(settings, rollout_path=args.rollout, session_id=args.session)
+    print(
+        f"appended={result.appended} records_scanned={result.records_scanned} "
+        f"session_id={result.session_id} since_byte={result.since_byte} "
+        f"end_offset={result.end_offset} halted={result.halted}"
+    )
+    return 0  # a rollout with no capturable turns is a valid no-op, never a nonzero exit
 
 
 async def _run_flush() -> int:
@@ -314,6 +423,8 @@ async def _run(argv: Sequence[str]) -> int:
         return await _run_capture_once(args)
     if args.command == "backfill-thinking":
         return await _run_backfill_thinking(args)
+    if args.command == "backfill-codex":
+        return await _run_backfill_codex(args)
     if args.command == "flush":
         return await _run_flush()
     if args.command == "daemon":

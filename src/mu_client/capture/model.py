@@ -16,9 +16,9 @@ __all__ = ["ActivityKind", "CaptureCheckpoint", "HostKind", "RawActivity"]
 
 
 class HostKind(StrEnum):
-    """capture-spec.md §4.1. Only ``CLAUDE_CODE`` has a live parser this stage (REVIEW-CHECKLIST /
-    MVP-BUILD-PLAN scope); ``CODEX``/``CLAUDE_DESKTOP`` are named so the closed enum does not need
-    a breaking change when their parsers land."""
+    """capture-spec.md §4.1. ``CLAUDE_CODE`` (hook envelope + transcript tailer) and ``CODEX``
+    (rollout tailer + ``notify`` envelope parser, Phase 4) have live parsers; ``CLAUDE_DESKTOP`` is
+    named so the closed enum does not need a breaking change when its parser lands."""
 
     CLAUDE_CODE = "claude_code"
     CODEX = "codex"
