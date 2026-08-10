@@ -26,7 +26,7 @@ from mu_local.views import MemoryListView, MemoryWriteResult
 from mu_client.capture.claude_tailer import backfill_thinking
 from mu_client.capture.hook import capture_once, replay_spool
 from mu_client.capture.model import HostKind
-from mu_client.config import get_client_settings
+from mu_client.config import get_client_settings, render_endpoint_env
 from mu_client.daemon.app import LocalDaemon
 from mu_client.errors import cli_error_boundary
 from mu_client.host import daemonless_host
@@ -127,6 +127,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=install_claude_code.DEFAULT_HOOK_SCRIPT,
         help="Absolute path to mu_capture_once.sh (default: this checkout's scripts/hooks/).",
     )
+    install_cc_p.add_argument(
+        "--mcp-json-path",
+        type=Path,
+        default=Path(".mcp.json").resolve(),
+        help="Target .mcp.json to register the memory-universe MCP server into, with the resolved "
+        "store endpoints baked into its env block (default: ./.mcp.json in the cwd).",
+    )
+    install_cc_p.add_argument(
+        "--no-mcp",
+        action="store_true",
+        help="Only write the capture hooks; skip registering the MCP server in .mcp.json.",
+    )
 
     uninstall_p = sub.add_parser(
         "uninstall", help="Remove a host's managed hook block (Phase 0 installer)."
@@ -182,6 +194,23 @@ def _run_install(args: argparse.Namespace) -> int:
         f"events_added={list(result.events_added)} "
         f"events_already_present={list(result.events_already_present)} "
         f"unrelated_hooks_preserved={result.unrelated_hooks_preserved}"
+    )
+    if not args.no_mcp:
+        # Bake the RESOLVED store endpoints (CWD-independent — resolve_env_files) into the
+        # registered MCP server's env block, so a `mu-mcp` Claude Code spawns from any project dir
+        # reaches the real stores (gap A part 2).
+        endpoint_env = render_endpoint_env(get_client_settings())
+        mcp_result = install_claude_code.register_mcp_server(args.mcp_json_path, env=endpoint_env)
+        print(
+            f"mcp_json_path={mcp_result.mcp_json_path} backup_path={mcp_result.backup_path} "
+            f"server_name={mcp_result.server_name} "
+            f"endpoint_vars_written={mcp_result.endpoint_vars_written}"
+        )
+    # Gap B: the one-time-trust / headless-testing guidance (interactive-vs-headless artifact).
+    print(
+        install_claude_code.post_install_guidance(
+            settings_path=args.settings_path, mcp_json_path=args.mcp_json_path
+        )
     )
     return 0
 
