@@ -94,6 +94,10 @@ async def test_mcp_stdio_client_round_trips_real_data(
                 "search",
                 "build_context",
                 "ask",
+                "promote",
+                "demote",
+                "update",
+                "delete",
             }, names
 
             # (2) add over MCP.
@@ -170,6 +174,53 @@ async def test_mcp_stdio_client_round_trips_real_data(
             print(f"MCP ask -> {answer[:200]!r}")  # noqa: T201 — required evidence
             assert answer.strip(), "ask returned an empty synthesised answer"
             assert "staging" in answer.lower() or "ada" in answer.lower(), answer
+
+            # (3e) update over MCP — SUPERSEDE the fact with new content; the NEW version is
+            #      returned (new memory_id, superseded_id = old), all over the wire against real
+            #      stores. Then recall returns the NEW content.
+            updated = await session.call_tool(
+                "update",
+                {
+                    "memory_id": memory_id,
+                    "new_content": "The production deploy target is now prod-eu-west",
+                    "user": _USER,
+                    "session": _SESSION,
+                },
+                read_timeout_seconds=timeout,
+            )
+            assert not updated.isError, updated.content
+            upd_out = updated.structuredContent or {}
+            print(  # noqa: T201 — required evidence
+                f"MCP update -> new_id={upd_out.get('memory_id')} "
+                f"superseded_id={upd_out.get('superseded_id')} verb={upd_out.get('verb')}"
+            )
+            assert upd_out.get("verb") == "update"
+            assert upd_out.get("superseded_id") == memory_id
+            new_id = str(upd_out["memory_id"])
+            assert new_id != memory_id, "update must mint a NEW memory id"
+            # DIRECT valkey proof: the NEW version landed in STM; the OLD STM row was evicted.
+            new_blob = await _direct_valkey_get(settings, f"mu/{namespace}:stm:mem:{new_id}")
+            assert new_blob is not None and "prod-eu-west" in new_blob, new_blob
+            old_blob = await _direct_valkey_get(settings, f"mu/{namespace}:stm:mem:{memory_id}")
+            assert old_blob is None, "update did not evict the old STM row"
+            print(f"DIRECT valkey GET (new) -> {new_blob[:120]}...")  # noqa: T201
+
+            # (3f) delete over MCP — soft-delete the NEW version; direct valkey proof the STM row is
+            #      evicted (no longer in active recall).
+            deleted = await session.call_tool(
+                "delete",
+                {"memory_id": new_id, "user": _USER, "session": _SESSION},
+                read_timeout_seconds=timeout,
+            )
+            assert not deleted.isError, deleted.content
+            del_out = deleted.structuredContent or {}
+            print(  # noqa: T201 — required evidence
+                f"MCP delete -> verb={del_out.get('verb')} invalidated={del_out.get('invalidated')} "
+                f"tiers={del_out.get('tiers_affected')}"
+            )
+            assert del_out.get("verb") == "delete" and del_out.get("invalidated") is True
+            gone = await _direct_valkey_get(settings, f"mu/{namespace}:stm:mem:{new_id}")
+            assert gone is None, "delete did not remove the STM row from active recall"
 
             # (4) guard — a shared/visibility argument is rejected over the wire.
             guarded = await session.call_tool(

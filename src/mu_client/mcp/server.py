@@ -12,9 +12,11 @@ Only real verbs are exposed: ``add``/``recall``/``get``/``consolidate``/``search
 stub, no 501). ``search`` is the mem0 alias of ``recall``; ``build_context`` renders the
 deterministic INJECT context window (``LocalMemory.context``); ``ask`` synthesises an answer via the
 configured local SLM (``LocalMemory.ask`` — refuses loudly in heuristic mode, never fabricates).
-``promote``/``demote`` are honest 501s in the engine and are NOT registered; ``update``/``delete``
-have no embedded entry point today and are omitted (plan §2A). Shared-plane arguments are refused at
-the surface by
+``promote``/``demote``/``update``/``delete`` are now REAL engine verbs (build-queue §13 item 5) and
+ARE registered — targeted single-memory tier moves / supersede / soft-delete over the real
+lifecycle + bi-temporal invalidation machinery (``LocalMemory.promote``/``.demote``/``.update``/
+``.delete`` -> ``SurfaceFacade``), taking the MCP tool count to 11. Shared-plane arguments are
+refused at the surface by
 :class:`~mu_client.mcp.guard.SharedPrivateGuard` — this is a PRIVATE-plane server (ADR-0003).
 
 Phase 2 (plan §4) adds the SILENT auto-inject RESOURCE ``memory-universe://silent/{session}`` — an
@@ -50,7 +52,9 @@ _INSTRUCTIONS = (
     "'recall' (alias 'search') retrieves relevant facts as ranked hits, 'build_context' assembles "
     "a ready-to-inject context window for a task, 'ask' answers a question by synthesising over "
     "recalled context (local SLM), 'get' fetches one memory by id, 'consolidate' distills recent "
-    "memories into long-term facts. Choose 'recall'/'search' for raw hits, 'build_context' for a "
+    "memories into long-term facts, 'promote'/'demote' move one memory between tiers, 'update' "
+    "supersedes a memory with new content, 'delete' soft-deletes one (kept in history). Choose "
+    "'recall'/'search' for raw hits, 'build_context' for a "
     "context window, 'ask' for a synthesised answer. All memory is PRIVATE to this machine; there "
     "is no shared plane here — do not pass visibility/subject/predicate/object arguments."
 )
@@ -287,6 +291,76 @@ def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
             subject=subject,
             predicate=predicate,
             object=object,
+        )
+
+    @server.tool(
+        name="promote",
+        description="Promote one memory UP a tier: to_tier='mtm' moves STM->MTM, to_tier='ltm' "
+        "moves MTM->LTM (distilled into long-term facts). Runs the real promotion path on that one "
+        "memory. Returns {memory_id, verb, from_tier, to_tier, tiers_affected}. Fails loud on an "
+        "unknown id (not in the source tier) or invalid to_tier.",
+    )
+    async def promote(  # pyright: ignore[reportUnusedFunction]
+        memory_id: str,
+        to_tier: str,
+        user: str = default_user,
+        session: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.tool_promote(
+            holder.memory, memory_id=memory_id, to_tier=to_tier, user=user, session=session
+        )
+
+    @server.tool(
+        name="demote",
+        description="Demote one memory DOWN a tier: MTM->STM (to_tier='stm'). Reuses the real "
+        "forgetting-curve demotion (write STM copy, then remove the MTM point). Returns "
+        "{memory_id, verb, from_tier, to_tier, tiers_affected}. Fails loud on an unknown id.",
+    )
+    async def demote(  # pyright: ignore[reportUnusedFunction]
+        memory_id: str,
+        to_tier: str = "stm",
+        user: str = default_user,
+        session: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.tool_demote(
+            holder.memory, memory_id=memory_id, to_tier=to_tier, user=user, session=session
+        )
+
+    @server.tool(
+        name="update",
+        description="Update a memory by SUPERSEDING it with new content (invalidate-don't-delete): "
+        "the new version becomes active, the old is marked superseded (kept in history). Returns "
+        "the NEW memory {memory_id (new id), verb, superseded_id (old id), tiers_affected}. Fails "
+        "loud if the id is not found.",
+    )
+    async def update(  # pyright: ignore[reportUnusedFunction]
+        memory_id: str,
+        new_content: str,
+        user: str = default_user,
+        session: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.tool_update(
+            holder.memory,
+            memory_id=memory_id,
+            new_content=new_content,
+            user=user,
+            session=session,
+        )
+
+    @server.tool(
+        name="delete",
+        description="Delete a memory by SOFT-DELETE (invalidate-don't-delete): it stops appearing "
+        "in active recall but stays in bi-temporal history (MTM/LTM flipped to expired + "
+        "invalid_at; ephemeral STM evicted). Never a hard delete of active data. Returns "
+        "{memory_id, verb, invalidated, tiers_affected}. Fails loud if the id is not found.",
+    )
+    async def delete(  # pyright: ignore[reportUnusedFunction]
+        memory_id: str,
+        user: str = default_user,
+        session: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.tool_delete(
+            holder.memory, memory_id=memory_id, user=user, session=session
         )
 
     @server.resource(

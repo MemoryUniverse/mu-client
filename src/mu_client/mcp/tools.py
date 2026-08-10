@@ -14,7 +14,12 @@ from typing import Any, Protocol
 from mu_contracts.contracts.defaults import DEFAULT_CONSOLIDATE_LIMIT, DEFAULT_RECALL_LIMIT
 from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallResult
-from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
+from mu_contracts.contracts.views import (
+    ConsolidateView,
+    ContextView,
+    MemoryVerbResult,
+    MemoryWriteResult,
+)
 from mu_engine.storage.domain.memory import MemoryTier
 
 from mu_client.mcp.guard import SharedPrivateGuard
@@ -26,9 +31,13 @@ __all__ = [
     "tool_ask",
     "tool_build_context",
     "tool_consolidate",
+    "tool_delete",
+    "tool_demote",
     "tool_get",
+    "tool_promote",
     "tool_recall",
     "tool_search",
+    "tool_update",
 ]
 
 _TIER_BY_NAME: dict[str, MemoryTier] = {tier.value: tier for tier in MemoryTier}
@@ -102,6 +111,41 @@ class MemoryVerbs(Protocol):
         session: str | None = ...,
         limit: int = ...,
     ) -> str: ...
+
+    async def promote(
+        self,
+        memory_id: str,
+        *,
+        to_tier: str,
+        user: str = ...,
+        session: str | None = ...,
+    ) -> MemoryVerbResult: ...
+
+    async def demote(
+        self,
+        memory_id: str,
+        *,
+        to_tier: str = ...,
+        user: str = ...,
+        session: str | None = ...,
+    ) -> MemoryVerbResult: ...
+
+    async def update(
+        self,
+        memory_id: str,
+        new_content: str,
+        *,
+        user: str = ...,
+        session: str | None = ...,
+    ) -> MemoryVerbResult: ...
+
+    async def delete(
+        self,
+        memory_id: str,
+        *,
+        user: str = ...,
+        session: str | None = ...,
+    ) -> MemoryVerbResult: ...
 
 
 def resolve_tier(tier: str | None) -> MemoryTier | None:
@@ -267,3 +311,63 @@ async def tool_ask(
     guard.assert_private(visibility=visibility, subject=subject, predicate=predicate, object=object)
     answer = await engine.ask(question, user=user, session=session, limit=limit)
     return {"question": question, "answer": answer}
+
+
+async def tool_promote(
+    engine: MemoryVerbs,
+    *,
+    memory_id: str,
+    to_tier: str,
+    user: str,
+    session: str | None,
+) -> dict[str, Any]:
+    """``promote`` — TARGETED single-memory promotion up one tier (``to_tier="mtm"``: STM->MTM, or
+    ``to_tier="ltm"``: MTM->LTM). Runs the REAL promotion path on that one resident item
+    (``PromotionService`` copy-on-write / ``DistillPipeline`` leg) — a nonexistent id or invalid
+    ``to_tier`` fails loud (never a fake success). Returns the canonical ``MemoryVerbResult``."""
+    result = await engine.promote(memory_id, to_tier=to_tier, user=user, session=session)
+    return result.model_dump(mode="json")
+
+
+async def tool_demote(
+    engine: MemoryVerbs,
+    *,
+    memory_id: str,
+    to_tier: str,
+    user: str,
+    session: str | None,
+) -> dict[str, Any]:
+    """``demote`` — TARGETED MTM->STM tier-down (``to_tier="stm"``) of one resident item, reusing
+    the real ``DemotionService`` write-ahead-then-remove sequence. Returns ``MemoryVerbResult``."""
+    result = await engine.demote(memory_id, to_tier=to_tier, user=user, session=session)
+    return result.model_dump(mode="json")
+
+
+async def tool_update(
+    engine: MemoryVerbs,
+    *,
+    memory_id: str,
+    new_content: str,
+    user: str,
+    session: str | None,
+) -> dict[str, Any]:
+    """``update`` — SUPERSEDE the memory with ``new_content`` (invalidate-don't-delete): the old
+    version is marked superseded by the new one via the real ``invalidate`` machinery. Returns the
+    NEW memory (``memory_id`` = new id, ``superseded_id`` = old id) as a ``MemoryVerbResult``."""
+    result = await engine.update(memory_id, new_content, user=user, session=session)
+    return result.model_dump(mode="json")
+
+
+async def tool_delete(
+    engine: MemoryVerbs,
+    *,
+    memory_id: str,
+    user: str,
+    session: str | None,
+) -> dict[str, Any]:
+    """``delete`` — soft-delete (invalidate-don't-delete): MTM/LTM flip to ``state=expired`` +
+    ``invalid_at`` (kept in bi-temporal history, dropped from active recall); STM (ephemeral) is
+    evicted. NEVER a hard delete of active data. Returns a ``MemoryVerbResult`` (``invalidated``,
+    ``tiers_affected``). A nonexistent id fails loud (404-equivalent), never a fake success."""
+    result = await engine.delete(memory_id, user=user, session=session)
+    return result.model_dump(mode="json")

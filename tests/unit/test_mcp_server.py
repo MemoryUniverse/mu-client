@@ -13,7 +13,12 @@ from datetime import UTC, datetime
 
 import pytest
 from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallResult
-from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
+from mu_contracts.contracts.views import (
+    ConsolidateView,
+    ContextView,
+    MemoryVerbResult,
+    MemoryWriteResult,
+)
 from mu_contracts.domain.model.memory import Tier
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -26,9 +31,13 @@ from mu_client.mcp.tools import (
     tool_ask,
     tool_build_context,
     tool_consolidate,
+    tool_delete,
+    tool_demote,
     tool_get,
+    tool_promote,
     tool_recall,
     tool_search,
+    tool_update,
 )
 
 pytestmark = pytest.mark.unit
@@ -47,6 +56,7 @@ class _StubEngine:
         self.search_calls: list[dict[str, object]] = []
         self.context_calls: list[dict[str, object]] = []
         self.ask_calls: list[dict[str, object]] = []
+        self.verb_calls: list[dict[str, object]] = []
         self.get_return_none = False
 
     def _hit(self) -> RecallItemView:
@@ -154,6 +164,59 @@ class _StubEngine:
     ) -> str:
         self.ask_calls.append({"question": question, "limit": limit})
         return "Ada lives in Paris."
+
+    async def promote(
+        self,
+        memory_id: str,
+        *,
+        to_tier: str,
+        user: str = "default",
+        session: str | None = None,
+    ) -> MemoryVerbResult:
+        self.verb_calls.append({"verb": "promote", "memory_id": memory_id, "to_tier": to_tier})
+        return MemoryVerbResult(
+            memory_id=memory_id, verb="promote", from_tier="stm", to_tier=to_tier,
+            tiers_affected=(to_tier,),
+        )
+
+    async def demote(
+        self,
+        memory_id: str,
+        *,
+        to_tier: str = "stm",
+        user: str = "default",
+        session: str | None = None,
+    ) -> MemoryVerbResult:
+        self.verb_calls.append({"verb": "demote", "memory_id": memory_id, "to_tier": to_tier})
+        return MemoryVerbResult(
+            memory_id=memory_id, verb="demote", from_tier="mtm", to_tier=to_tier,
+            tiers_affected=(to_tier, "mtm"),
+        )
+
+    async def update(
+        self,
+        memory_id: str,
+        new_content: str,
+        *,
+        user: str = "default",
+        session: str | None = None,
+    ) -> MemoryVerbResult:
+        self.verb_calls.append(
+            {"verb": "update", "memory_id": memory_id, "new_content": new_content}
+        )
+        return MemoryVerbResult(
+            memory_id="mem-new", verb="update", superseded_id=memory_id,
+            tiers_affected=("stm", "mtm"),
+        )
+
+    async def delete(
+        self, memory_id: str, *, user: str = "default", session: str | None = None
+    ) -> MemoryVerbResult:
+        self.verb_calls.append({"verb": "delete", "memory_id": memory_id})
+        return MemoryVerbResult(
+            memory_id=memory_id, verb="delete", tiers_affected=("stm", "mtm", "ltm"),
+            invalidated=True,
+        )
 
 
 # --------------------------------------------------------------------------------- guard
@@ -307,6 +370,34 @@ async def test_tool_ask_rejects_shared() -> None:
 
 
 # --------------------------------------------------------------------------------- server registry
+async def test_tool_promote_delegates_and_serialises() -> None:
+    engine = _StubEngine()
+    out = await tool_promote(engine, memory_id="mem-123", to_tier="mtm", user="u1", session="s1")
+    assert out["verb"] == "promote" and out["to_tier"] == "mtm"
+    assert engine.verb_calls[-1]["verb"] == "promote"
+
+
+async def test_tool_demote_delegates_and_serialises() -> None:
+    engine = _StubEngine()
+    out = await tool_demote(engine, memory_id="mem-123", to_tier="stm", user="u1", session="s1")
+    assert out["verb"] == "demote" and out["to_tier"] == "stm"
+
+
+async def test_tool_update_returns_new_memory() -> None:
+    engine = _StubEngine()
+    out = await tool_update(
+        engine, memory_id="mem-123", new_content="Ada lives in Berlin", user="u1", session="s1"
+    )
+    assert out["verb"] == "update"
+    assert out["memory_id"] == "mem-new" and out["superseded_id"] == "mem-123"
+
+
+async def test_tool_delete_soft_deletes() -> None:
+    engine = _StubEngine()
+    out = await tool_delete(engine, memory_id="mem-123", user="u1", session="s1")
+    assert out["verb"] == "delete" and out["invalidated"] is True
+
+
 async def test_build_server_advertises_exactly_the_real_verbs() -> None:
     server = build_server()
     tool_names = {tool.name for tool in await server.list_tools()}
@@ -318,9 +409,13 @@ async def test_build_server_advertises_exactly_the_real_verbs() -> None:
         "search",
         "build_context",
         "ask",
+        "promote",
+        "demote",
+        "update",
+        "delete",
     }
-    # promote/demote (engine 501s) + update/delete (no embedded entry) are deliberately absent.
-    assert "promote" not in tool_names and "delete" not in tool_names
+    # promote/demote/update/delete are now REAL engine verbs (build-queue §13 item 5) — 11 tools.
+    assert {"promote", "demote", "update", "delete"} <= tool_names
 
 
 async def test_build_server_registers_the_silent_inject_resource() -> None:
