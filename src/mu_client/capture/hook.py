@@ -24,8 +24,12 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from pathlib import Path
 from typing import Any
 
+import structlog
+
+from mu_client.capture.claude_tailer import backfill_thinking
 from mu_client.capture.model import HostKind
 from mu_client.capture.parsers import ClaudeCodeParserV1, ParserRegistry
 from mu_client.config import ClientSettings
@@ -34,7 +38,12 @@ from mu_client.outbox.sqlite_outbox import SqliteOutbox
 
 __all__ = ["capture_once", "replay_spool"]
 
+_log = structlog.get_logger("mu.client.capture.hook")
+
 _DUAL_PURPOSE_EVENTS = frozenset({"UserPromptSubmit", "SessionStart"})
+# Hook events on which a completed turn's reasoning is append-stable in the transcript, so the
+# Phase 0B tailer can safely backfill it (capture-spec.md §6: "read completed turns only").
+_THINKING_BACKFILL_EVENTS = frozenset({"Stop", "SubagentStop", "PreCompact", "SessionEnd"})
 
 
 async def capture_once(settings: ClientSettings, *, host: HostKind, raw: bytes) -> dict[str, Any]:
@@ -46,9 +55,39 @@ async def capture_once(settings: ClientSettings, *, host: HostKind, raw: bytes) 
 
     daemon_response = await _try_daemon(settings, host=host, record=record, event_id=event_id)
     if daemon_response is not None:
+        await _maybe_backfill_thinking(settings, host=host, event=event, record=record)
         return daemon_response
     await _direct_append_or_spool(settings, host=host, record=record, event_id=event_id, raw=raw)
+    await _maybe_backfill_thinking(settings, host=host, event=event, record=record)
     return _hook_output(event, additional_context=None)
+
+
+async def _maybe_backfill_thinking(
+    settings: ClientSettings, *, host: HostKind, event: str, record: dict[str, Any]
+) -> None:
+    """Phase 0B trigger (capture-spec.md §6): on a turn-completing hook event, backfill the
+    session's REASONING (thinking blocks + mid-turn intermediate messages) from the transcript the
+    hook payload points at (``transcript_path``) into the SAME durable outbox. OFF unless
+    ``MU_CAPTURE__THINKING_BACKFILL_ENABLED`` is set; Claude-Code-only; and — like all capture — it
+    NEVER blocks or fails the host turn: any error is swallowed to a content-free log line, because
+    a reasoning backfill is a best-effort enrichment, never a correctness dependency."""
+    if not settings.capture.thinking_backfill_enabled:
+        return
+    if host is not HostKind.CLAUDE_CODE or event not in _THINKING_BACKFILL_EVENTS:
+        return
+    transcript_path = record.get("transcript_path")
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return
+    session_id = record.get("session_id")
+    try:
+        await backfill_thinking(
+            settings,
+            transcript_path=Path(transcript_path),
+            session_id=str(session_id) if session_id else None,
+        )
+    except (OSError, OutboxCorruptionError, sqlite3.Error) as exc:
+        # Best-effort: a missing/locked transcript or outbox never blocks the host turn.
+        _log.info("thinking_backfill_skipped", event=event, error=type(exc).__name__)
 
 
 # --------------------------------------------------------------------------------- daemon fast path

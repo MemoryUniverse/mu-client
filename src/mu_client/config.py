@@ -47,6 +47,7 @@ def _default_device_id() -> str:
     hostname. Override via ``MU_DEVICE_ID`` for a multi-daemon-on-one-host test rig."""
     return socket.gethostname()
 
+
 __all__ = [
     "CaptureSettings",
     "ClientSettings",
@@ -66,6 +67,19 @@ class CaptureSettings(BaseModel):
 
     tool_outcome_max_chars: int = 500  # salient-slice truncation budget (capture-spec.md §7.1)
     spool_dir: Path = Path("~/.memory-universe/spool")  # on outbox-unreachable (§2.2)
+
+    # ---- Phase 0B: Claude Code background-thinking transcript backfill (capture-spec.md §6,
+    # AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase 0B). OFF unless explicitly enabled — the tailer
+    # reads the session transcript JSONL (reasoning the hook fleet cannot see) and is gated behind
+    # THIS flag so a default install captures via hooks only, exactly as before.
+    thinking_backfill_enabled: bool = False  # env: MU_CAPTURE__THINKING_BACKFILL_ENABLED
+    # Importance bands the tailer stamps on a candidate → the engine's ONE promotion gate
+    # (DeterministicPromoteStage: importance >= IngestSettings.importance_promote, default 0.6).
+    # A DECISION is stamped ≥ 0.6 so it promotes STM→MTM ("worth keeping"); a FINDING is stamped
+    # < 0.6 so it stays STM-only. These are the client's lever on the SAME gate LocalMemory.add
+    # already exposes — never a second, competing threshold.
+    thinking_decision_importance: float = 0.7
+    thinking_finding_importance: float = 0.55
 
 
 class OutboxSettings(BaseModel):
