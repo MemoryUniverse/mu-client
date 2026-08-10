@@ -151,3 +151,71 @@ def test_uninstall_then_reinstall_round_trips_cleanly(tmp_path: Path) -> None:
     written = json.loads(settings_path.read_text())
     for event in claude_code.CLAUDE_CODE_HOOK_EVENTS:
         assert written["hooks"][event] == [_managed_entry()]
+
+
+# ── gap A part 2: self-contained MCP server registration ──────────────────────────────────────
+
+
+def test_register_mcp_server_writes_self_contained_env_block(tmp_path: Path) -> None:
+    mcp_path = tmp_path / ".mcp.json"
+    env = {"MU_STORAGE__CACHE__HOST": "127.0.0.1", "MU_STORAGE__CACHE__PORT": "16379"}
+
+    result = claude_code.register_mcp_server(mcp_path, env=env)
+
+    assert result.backup_path is None  # nothing existed
+    assert result.server_name == claude_code.DEFAULT_MCP_SERVER_NAME
+    assert result.endpoint_vars_written == 2
+    doc = json.loads(mcp_path.read_text())
+    server = doc["mcpServers"][claude_code.DEFAULT_MCP_SERVER_NAME]
+    assert server["type"] == "stdio"
+    assert server["command"] == claude_code.DEFAULT_MCP_COMMAND
+    assert server["env"] == env  # endpoints carried in the env block, not a cwd .env
+
+
+def test_register_mcp_server_preserves_other_servers_and_keys(tmp_path: Path) -> None:
+    mcp_path = tmp_path / ".mcp.json"
+    mcp_path.write_text(
+        json.dumps(
+            {
+                "someTopKey": {"keep": True},
+                "mcpServers": {"other": {"type": "stdio", "command": "other-mcp"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = claude_code.register_mcp_server(mcp_path, env={"MU_X": "1"})
+
+    assert result.backup_path == mcp_path.with_name(".mcp.json.bak")
+    doc = json.loads(mcp_path.read_text())
+    assert doc["someTopKey"] == {"keep": True}  # unrelated top-level key survives
+    assert doc["mcpServers"]["other"] == {"type": "stdio", "command": "other-mcp"}  # other server
+    assert doc["mcpServers"][claude_code.DEFAULT_MCP_SERVER_NAME]["env"] == {"MU_X": "1"}
+
+
+def test_register_mcp_server_is_idempotent_overwrites_own_entry(tmp_path: Path) -> None:
+    mcp_path = tmp_path / ".mcp.json"
+    claude_code.register_mcp_server(mcp_path, env={"MU_X": "1"})
+    claude_code.register_mcp_server(mcp_path, env={"MU_X": "2"})
+
+    doc = json.loads(mcp_path.read_text())
+    servers = doc["mcpServers"]
+    assert servers[claude_code.DEFAULT_MCP_SERVER_NAME]["env"] == {"MU_X": "2"}
+    # exactly one memory-universe entry — no duplication
+    assert list(servers).count(claude_code.DEFAULT_MCP_SERVER_NAME) == 1
+
+
+# ── gap B: post-install trust guidance ────────────────────────────────────────────────────────
+
+
+def test_post_install_guidance_names_trust_and_headless_steps(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    mcp_path = tmp_path / ".mcp.json"
+
+    text = claude_code.post_install_guidance(settings_path=settings_path, mcp_json_path=mcp_path)
+
+    assert str(settings_path) in text
+    assert str(mcp_path) in text
+    assert "/hooks" in text  # how to review trusted hooks interactively
+    assert "--settings" in text  # the headless-testing escape hatch
+    assert "trust" in text.lower() or "approve" in text.lower()

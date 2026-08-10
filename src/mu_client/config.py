@@ -32,13 +32,37 @@ env-configurable surface: store *endpoints*, the model profile, and the two forw
 
 from __future__ import annotations
 
+import os
 import socket
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 
 from mu_contracts.config.settings import StorageSettings
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# ── CWD-INDEPENDENT ENDPOINT RESOLUTION (deployment hardening, gap A) ──────────────────────────
+# ``mu-mcp`` / the daemon are spawned by a Claude Code / Codex client from an ARBITRARY project
+# directory (wherever the user is working), NOT from this repo's checkout. pydantic-settings'
+# ``env_file`` is resolved relative to the process CWD, so a bare ``.env``/``.env.test`` reference
+# finds NOTHING when spawned elsewhere — every store endpoint then silently falls back to its
+# in-container default (redis ``localhost:6379``, qdrant ``localhost:6333`` …) and the engine
+# crashes with a connection error against a port nothing is listening on. The fix is to ALSO read
+# from a FIXED absolute location that does not move with the CWD:
+#
+#   * ``MU_ENV_FILE`` — an explicit absolute env-file path (highest-priority file), and
+#   * ``~/.memory-universe/config.env`` — the default user-config home the installer writes.
+#
+# OS environment variables still beat every file (pydantic default), so the installer-written MCP
+# ``env`` block (real ``MU_STORAGE__*`` vars in ``.mcp.json``) is the top-priority, self-contained
+# path — see :func:`render_endpoint_env` and ``mu_client.install.claude_code``.
+
+#: Env var naming an explicit absolute env file (an operator/installer override).
+MU_ENV_FILE_VAR = "MU_ENV_FILE"
+
+#: The fixed user-config env file the installer writes and a bare ``mu-mcp`` falls back to.
+USER_CONFIG_ENV_FILE = Path("~/.memory-universe/config.env")
 
 
 def _default_device_id() -> str:
@@ -47,7 +71,75 @@ def _default_device_id() -> str:
     hostname. Override via ``MU_DEVICE_ID`` for a multi-daemon-on-one-host test rig."""
     return socket.gethostname()
 
+
+def resolve_env_files(
+    *,
+    cwd: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    user_config: Path | None = None,
+) -> tuple[Path, ...]:
+    """The env files :func:`get_client_settings` feeds pydantic-settings, in ASCENDING precedence
+    (pydantic reads the tuple left-to-right and the LAST-read file wins — verified behaviour).
+
+    Order (lowest → highest priority among *files*; a real OS env var still beats them all):
+
+    1. ``~/.memory-universe/config.env`` — the fixed user-config home (CWD-independent fallback the
+       installer writes; the whole point of gap-A: a bare ``mu-mcp`` from any dir finds it here).
+    2. ``$MU_ENV_FILE`` — an explicit absolute override, if set.
+    3. ``<cwd>/.env`` then ``<cwd>/.env.test`` — the project-local dev files, HIGHEST so a
+       developer working inside the repo keeps the old behaviour (``.env.test`` on top).
+
+    Missing files are harmless — pydantic-settings' dotenv source silently skips any path that does
+    not exist, so all four are always offered and only the present ones contribute.
+    """
+    env = os.environ if environ is None else environ
+    base = Path.cwd() if cwd is None else cwd
+    user_cfg = (USER_CONFIG_ENV_FILE if user_config is None else user_config).expanduser()
+
+    files: list[Path] = [user_cfg]
+    explicit = env.get(MU_ENV_FILE_VAR)
+    if explicit:
+        files.append(Path(explicit).expanduser())
+    files.append(base / ".env")
+    files.append(base / ".env.test")
+    return tuple(files)
+
+
+def _flatten_env(prefix: str, model: BaseModel, out: dict[str, str]) -> None:
+    """Serialise a pydantic model's leaf fields back into flat ``PREFIX__FIELD`` env vars (the
+    nested ``MU_`` convention, uppercased). Recurses into nested models; ``SecretStr`` is
+    unwrapped; ``None`` fields are skipped. Used to materialise the resolved store endpoints into
+    a self-contained MCP ``env`` block."""
+    for name in type(model).model_fields:
+        value = getattr(model, name)
+        key = f"{prefix}__{name.upper()}"
+        if isinstance(value, BaseModel):
+            _flatten_env(key, value, out)
+        elif isinstance(value, SecretStr):
+            out[key] = value.get_secret_value()
+        elif isinstance(value, bool):
+            out[key] = "true" if value else "false"
+        elif value is None:
+            continue
+        else:
+            out[key] = str(value)
+
+
+def render_endpoint_env(settings: ClientSettings) -> dict[str, str]:
+    """Flatten the RESOLVED store endpoints (+ model profile) of ``settings`` into a ``MU_*`` env
+    mapping suitable for an MCP server's ``env`` block. This is what makes a registered
+    ``.mcp.json`` self-contained and CWD-independent: the client inherits the real endpoints from
+    the spawn environment, never from a ``.env`` that may not be next to it (gap A)."""
+    out: dict[str, str] = {"MU_RUNTIME_MODE": "local"}
+    _flatten_env("MU_STORAGE", settings.storage, out)
+    if settings.model is not None:
+        _flatten_env("MU_MODEL", settings.model, out)
+    return out
+
+
 __all__ = [
+    "MU_ENV_FILE_VAR",
+    "USER_CONFIG_ENV_FILE",
     "CaptureSettings",
     "ClientSettings",
     "DaemonIpcSettings",
@@ -55,6 +147,8 @@ __all__ = [
     "ModelProfileSettings",
     "OutboxSettings",
     "get_client_settings",
+    "render_endpoint_env",
+    "resolve_env_files",
 ]
 
 
@@ -190,5 +284,12 @@ def get_client_settings() -> ClientSettings:
     ``mu_contracts.config.settings.get_settings``). Never construct ``ClientSettings()`` bare at a
     production call site — route through here so the boundary is read exactly once per process.
     Callers that need an explicit override (tests, per-run η isolation) still construct
-    ``ClientSettings(...)`` directly; this accessor is only for the "no override, use env" path."""
-    return ClientSettings()
+    ``ClientSettings(...)`` directly; this accessor is only for the "no override, use env" path.
+
+    Reads the CWD-INDEPENDENT env-file set (:func:`resolve_env_files`) rather than the plain CWD
+    ``.env``/``.env.test`` in ``model_config`` — so a ``mu-mcp``/daemon spawned from an arbitrary
+    project directory still finds the real store endpoints (gap A). ``_env_file`` overrides
+    ``model_config.env_file``; OS env vars still win over every file."""
+    # ``_env_file`` is a real pydantic-settings BaseSettings init kwarg, but the pydantic mypy
+    # plugin synthesises ``__init__`` from model FIELDS only and omits it — hence the ignore.
+    return ClientSettings(_env_file=resolve_env_files())  # type: ignore[call-arg]

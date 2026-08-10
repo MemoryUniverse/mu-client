@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -41,9 +42,14 @@ from pydantic import BaseModel, ConfigDict
 __all__ = [
     "CLAUDE_CODE_HOOK_EVENTS",
     "DEFAULT_HOOK_SCRIPT",
+    "DEFAULT_MCP_COMMAND",
+    "DEFAULT_MCP_SERVER_NAME",
     "InstallResult",
+    "McpRegisterResult",
     "UninstallResult",
     "install",
+    "post_install_guidance",
+    "register_mcp_server",
     "uninstall",
 ]
 
@@ -69,6 +75,25 @@ DEFAULT_HOOK_SCRIPT: Path = (
 )
 
 _MATCHER = "*"
+
+# The MCP server registration the installer writes into an ``.mcp.json`` (gap A part 2). The
+# ``env`` block carries the RESOLVED store endpoints so the registered server is self-contained and
+# CWD-independent — Claude Code / Codex spawn ``mu-mcp`` with these ``MU_*`` vars in the process
+# environment, which beat every ``.env`` file, so it reaches the real stores no matter which
+# project directory it is launched from.
+DEFAULT_MCP_SERVER_NAME = "memory-universe"
+DEFAULT_MCP_COMMAND = "mu-mcp"
+
+
+class McpRegisterResult(BaseModel, frozen=True):
+    """What ``register_mcp_server()`` did."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    mcp_json_path: Path
+    backup_path: Path | None
+    server_name: str
+    endpoint_vars_written: int  # count of MU_* env vars baked into the server's env block
 
 
 class InstallResult(BaseModel, frozen=True):
@@ -227,4 +252,78 @@ def uninstall(
         events_removed=tuple(removed),
         events_not_present=tuple(not_present),
         unrelated_hooks_preserved=unrelated,
+    )
+
+
+def register_mcp_server(
+    mcp_json_path: Path,
+    *,
+    env: Mapping[str, str],
+    server_name: str = DEFAULT_MCP_SERVER_NAME,
+    command: str = DEFAULT_MCP_COMMAND,
+    args: tuple[str, ...] = (),
+) -> McpRegisterResult:
+    """Write/merge a self-contained ``memory-universe`` stdio MCP server into ``mcp_json_path``
+    (gap A part 2). The ``env`` mapping (built from the RESOLVED store endpoints — see
+    :func:`mu_client.config.render_endpoint_env`) is baked into the server's ``env`` block so a
+    ``mu-mcp`` spawned from ANY directory inherits the real endpoints and never falls back to the
+    in-container defaults.
+
+    Backup-first (``.bak``, same discipline as :func:`install`) and preserves every other
+    top-level key and every OTHER server under ``mcpServers`` verbatim — only this one named server
+    entry is (re)written.
+    """
+    backup_path = _backup(mcp_json_path)
+    doc = _load_settings(mcp_json_path)
+    servers = doc.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise ValueError(
+            f"{mcp_json_path}: mcpServers is not an object "
+            f"(got {type(servers).__name__}) — refusing to clobber"
+        )
+    servers[server_name] = {
+        "type": "stdio",
+        "command": command,
+        "args": list(args),
+        "env": dict(env),
+    }
+    _write_settings(mcp_json_path, doc)
+    return McpRegisterResult(
+        mcp_json_path=mcp_json_path,
+        backup_path=backup_path,
+        server_name=server_name,
+        endpoint_vars_written=len(env),
+    )
+
+
+def post_install_guidance(
+    *,
+    settings_path: Path,
+    mcp_json_path: Path,
+    server_name: str = DEFAULT_MCP_SERVER_NAME,
+) -> str:
+    """The one-time-trust / headless-testing guidance ``mu install claude-code`` prints after a
+    successful install (gap B). Freshly-written hooks and a freshly-registered project MCP server
+    both need a ONE-TIME trust in a REAL interactive Claude Code session; headless (``-p``) runs do
+    NOT inherit that trust and must pass ``--settings`` explicitly. This is a real
+    interactive-vs-headless artifact of Claude Code's trust model, not something the installer can
+    (or should) forge — so we document the exact steps instead of hacking trust state."""
+    return (
+        "\n"
+        "Memory Universe — installed. ONE more manual step (Claude Code's trust model):\n"
+        "\n"
+        f"  Hooks written to : {settings_path}\n"
+        f"  MCP server '{server_name}' registered in : {mcp_json_path}\n"
+        "\n"
+        "1. INTERACTIVE (normal use): start `claude` in your project once. Claude Code will\n"
+        "   ask you to TRUST the newly-added hooks and the project MCP server — approve them\n"
+        "   (review hooks any time with `/hooks`, MCP servers with `/mcp`). This one-time\n"
+        "   approval is per-machine; after it, capture hooks fire and the memory tools are live.\n"
+        "\n"
+        "2. HEADLESS / CI testing (`claude -p ...`): headless runs do NOT inherit interactive\n"
+        "   trust. Point Claude Code at the settings file so its hooks are CLI-trusted:\n"
+        f'       claude --settings {settings_path} -p "..."\n'
+        "\n"
+        "The MCP server carries the resolved store endpoints in its own `env` block, so `mu-mcp`\n"
+        "connects to the real stores no matter which directory it is launched from.\n"
     )
