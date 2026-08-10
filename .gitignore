@@ -33,3 +33,4 @@ data/
 # tooling + captured run artifacts (never commit — logs hold conversation content)
 .serena/
 logs/
+.mu_data/
