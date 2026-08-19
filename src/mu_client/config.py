@@ -9,7 +9,9 @@ Deliberately reuses mu-core's shapes rather than re-inventing them:
   identical class, not a re-shaped copy. mu-client shares mu-core's ``MU_`` env-var namespace (same
   prefix, same nested delimiter, same ``.env``/``.env.test`` files) so ONE env file configures both
   the engine's connection endpoints *and* mu-client's own subtrees below — no translation layer.
-* ``model`` (env: ``MU_MODEL__*``) is the client's LLM/SLM profile slot. ``mu_local``'s composition
+* ``model`` (env: ``MU_MODEL_PROFILE__*`` — NOT ``MU_MODEL__*``, which the ENGINE owns; see
+  the field's own comment for the two live-reproduced failures that collision caused) is the
+  client's LLM/SLM profile slot. ``mu_local``'s composition
   root (``mu_local/composition.py``) closed the ``StorageSettings.llm=None`` seam on 2026-07-27
   (``mu-core`` commit ``e8fdaeb``): a configured ``mu_local.config.ModelProfileSettings`` now builds
   a REAL ``ModelRouter``. ``LocalMemoryHost.start()`` (``host.py``) maps THIS profile into that
@@ -133,7 +135,10 @@ def render_endpoint_env(settings: ClientSettings) -> dict[str, str]:
     out: dict[str, str] = {"MU_RUNTIME_MODE": "local"}
     _flatten_env("MU_STORAGE", settings.storage, out)
     if settings.model is not None:
-        _flatten_env("MU_MODEL", settings.model, out)
+        # MUST match the field's own env alias (see ClientSettings.model): emitting the old
+        # ``MU_MODEL`` prefix here is precisely what made every generated .mcp.json / codex
+        # config.toml start a server that crashed on EngineSettings construction.
+        _flatten_env("MU_MODEL_PROFILE", settings.model, out)
     return out
 
 
@@ -271,16 +276,46 @@ class ClientSettings(BaseSettings):
         env_file=(".env", ".env.test"),
         env_file_encoding="utf-8",
         extra="ignore",
+        # `model` carries a `validation_alias` (its env name had to move off the engine-owned
+        # `MU_MODEL__` prefix — see that field). A validation_alias otherwise REPLACES the field
+        # name for population, which would silently break every direct construction call such as
+        # the documented heuristic-mode opt-out `ClientSettings(model=None)` (it would fall back
+        # to the default profile instead of disabling the LLM). `populate_by_name` keeps the
+        # Python-level field name working alongside the env alias.
+        populate_by_name=True,
     )
 
     # Store ENDPOINTS — mu-core's StorageSettings shape, reused verbatim (see module docstring).
     storage: StorageSettings = Field(default_factory=StorageSettings)
 
-    # Model profile (see ModelProfileSettings docstring); env: MU_MODEL__*. Defaults to the real
-    # mu-dev-slm profile (never None) — an explicit ``ClientSettings(model=None)`` is the opt-out
-    # that keeps ``LocalMemoryHost.start()`` in heuristic mode (backward compat; host.py maps
-    # None -> None -> mu_local.config.StorageSettings.llm=None, byte-for-byte the prior behaviour).
-    model: ModelProfileSettings | None = Field(default_factory=ModelProfileSettings)
+    # Model profile (see ModelProfileSettings docstring); env: **MU_MODEL_PROFILE__\***.
+    #
+    # ENV-NAMESPACE COLLISION FIX (live-reproduced): this slot used to read ``MU_MODEL__*``, but
+    # that prefix is ALREADY OWNED by the ENGINE's own ``EngineSettings.model``
+    # (``mu_engine.providers.settings.ModelSettings``, ``extra="forbid"``), whose fields are
+    # per-task model-GROUP names (``answer_model``/``adjudicate_model``/``embed_backend``/...) —
+    # a completely different shape from this client-side endpoint profile
+    # (``provider``/``base_url``/``model``/``api_key``). Sharing the prefix produced two real
+    # failures, both observed:
+    #   1. HARD CRASH — ``MU_MODEL__BASE_URL``/``__MODEL_NAME``/``__API_KEY`` are *extra* on
+    #      ``ModelSettings``, so ANY process that constructs ``EngineSettings`` with them set died
+    #      with ``ValidationError: 3 validation errors for EngineSettings ... extra_forbidden``.
+    #      ``mu install claude-code`` BAKES exactly those vars into the generated ``.mcp.json``
+    #      env block, so the shipped MCP server could not start at all in the very configuration
+    #      the installer wrote — the whole agent-plugin surface was dead on arrival.
+    #   2. SILENT OVERRIDE — ``MU_MODEL__PROVIDER`` *is* a valid ``ModelSettings`` field, so it
+    #      quietly repointed the engine's provider-registry key (``azure`` -> ``openai``) instead
+    #      of erroring. Worse than the crash, because nothing surfaced it.
+    # Own prefix, no overlap, both failures structurally impossible.
+    #
+    # Defaults to the real mu-dev-slm profile (never None) — an explicit
+    # ``ClientSettings(model=None)`` is the opt-out that keeps ``LocalMemoryHost.start()`` in
+    # heuristic mode (backward compat; host.py maps None -> None ->
+    # mu_local.config.StorageSettings.llm=None, byte-for-byte the prior behaviour).
+    model: ModelProfileSettings | None = Field(
+        default_factory=ModelProfileSettings,
+        validation_alias="MU_MODEL_PROFILE",
+    )
 
     # Daemon-stage seams (kept flat for backward compat with the foundation stage's tests); env:
     # MU_DAEMON_SOCKET_PATH / MU_OUTBOX_DB_PATH. Same literal defaults as daemon-app-skeleton-

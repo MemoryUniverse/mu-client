@@ -4,7 +4,8 @@ MiniLM embedder, ZERO mocks (DEV-STANDARDS non-negotiable). This is the Phase 3 
 
 The proof, on the real stores, that the PreCompact trigger is no longer a parsed-then-dropped no-op:
 
-  1. A fact is ``add``ed with routine (default) importance, so it stays STM-ONLY — ``promoted=False``,
+  1. A fact is ``add``ed with routine (default) importance, so it stays STM-ONLY —
+     ``promoted=False``,
      ``tiers_written=('stm',)`` — the CORRECT gated contract, and exactly the "at-risk turn the host
      is about to compact away" this feature exists to save. A DIRECT qdrant read confirms the
      durable MTM tier holds NOTHING for it yet.
@@ -48,7 +49,8 @@ pytestmark = pytest.mark.integration
 
 _FACT = "Ada lives in Paris and works at Acme"
 _SESSION = "precompact-session"
-_EMBED_DIM = 384  # MiniLM (mu-local's local embedder) — collection suffix mu_mtm__{ws}__private__384
+# MiniLM (mu-local's local embedder) — collection suffix mu_mtm__{ws}__private__384
+_EMBED_DIM = 384
 _POLL_ATTEMPTS = 40
 _POLL_DELAY_S = 0.2
 
@@ -182,7 +184,9 @@ async def test_precompact_saves_at_risk_stm_turn_into_durable_tier_and_survives_
                 break
             await asyncio.sleep(_POLL_DELAY_S)
         print(f"POST-PRECOMPACT MTM (direct qdrant) present={present_after} content={content!r}")  # noqa: T201
-        assert present_after, "PreCompact did NOT promote the at-risk turn into the durable MTM tier"
+        assert present_after, (
+            "PreCompact did NOT promote the at-risk turn into the durable MTM tier"
+        )
         assert "Paris" in content, "the promoted MTM point does not carry the original fact"
 
         # (4a) Recallable from the durable tier.

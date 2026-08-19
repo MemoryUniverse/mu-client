@@ -46,7 +46,9 @@ _SESSION = "silent_s1"
 _FACT_A = "My production deploy target is staging-eu-west"
 _FACT_B = "The on-call engineer this week is Ada"
 _NOISE_WRITE = 'Write: {"file_path": "/app/main.py", "content": "print(hello)"}'
-_NOISE_BASH = "Bash: total 48\ndrwxr-xr-x 2 user user 4096 Aug 10 main.py\n-rw-r--r-- 1 user user 12"
+_NOISE_BASH = (
+    "Bash: total 48\ndrwxr-xr-x 2 user user 4096 Aug 10 main.py\n-rw-r--r-- 1 user user 12"
+)
 _SILENT_URI = f"memory-universe://silent/{_SESSION}"
 
 
@@ -119,7 +121,10 @@ async def test_silent_resource_returns_distilled_context_no_tool_call(
             assert "Bash:" not in body, f"bash-output noise leaked into inject: {body}"
 
 
-async def _stm_has_all(session: ClientSession, timeout: timedelta) -> None:
+# ASYNC109: `timeout` here is a POLL BUDGET for a bounded readiness loop over a real store, not
+# a per-call cancellation deadline delegated to a callee — the ruff-suggested `asyncio.timeout`
+# rewrite would change this helper's contract (it must report WHICH ids were missing on expiry).
+async def _stm_has_all(session: ClientSession, timeout: timedelta) -> None:  # noqa: ASYNC109
     """Poll STM recall until every seeded item is durably readable back (STM floor is fast)."""
     for _ in range(40):
         res = await session.call_tool(

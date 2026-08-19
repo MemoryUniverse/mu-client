@@ -156,9 +156,30 @@ def test_render_endpoint_env_flattens_resolved_endpoints() -> None:
 def test_render_endpoint_env_includes_model_profile_when_present() -> None:
     settings = ClientSettings()  # default model profile (mu-dev-slm)
     env = render_endpoint_env(settings)
-    assert env["MU_MODEL__PROVIDER"] == "openai"
-    assert env["MU_MODEL__BASE_URL"] == "http://127.0.0.1:11435/v1"
-    assert env["MU_MODEL__MODEL_NAME"] == "qwen2.5:0.5b"
+    assert env["MU_MODEL_PROFILE__PROVIDER"] == "openai"
+    assert env["MU_MODEL_PROFILE__BASE_URL"] == "http://127.0.0.1:11435/v1"
+    assert env["MU_MODEL_PROFILE__MODEL_NAME"] == "qwen2.5:0.5b"
+
+
+def test_render_endpoint_env_never_emits_the_engine_owned_mu_model_prefix() -> None:
+    """REGRESSION (live-reproduced, the whole MCP surface was dead on arrival).
+
+    ``MU_MODEL__*`` belongs to the ENGINE's ``EngineSettings.model``
+    (``mu_engine.providers.settings.ModelSettings``, ``extra="forbid"``), whose fields are per-task
+    model-GROUP names — a different shape entirely from this client-side endpoint profile. When
+    ``render_endpoint_env`` emitted the client profile under ``MU_MODEL__``, every ``.mcp.json`` /
+    codex ``config.toml`` the installer generated started a ``mu-mcp`` process that died at
+    startup with ``ValidationError: 3 validation errors for EngineSettings ... extra_forbidden``
+    on ``base_url``/``model_name``/``api_key`` — and ``MU_MODEL__PROVIDER``, being a REAL
+    ``ModelSettings`` field, silently repointed the engine's provider registry key instead of
+    failing loudly. Nothing this function emits may ever land in that namespace again.
+    """
+    env = render_endpoint_env(ClientSettings())
+    colliding = [k for k in env if k.startswith("MU_MODEL__")]
+    assert colliding == [], (
+        "render_endpoint_env emitted engine-owned MU_MODEL__* keys — a generated MCP config with "
+        f"these will crash mu-mcp at EngineSettings construction: {colliding}"
+    )
 
 
 def test_roundtrip_endpoint_env_reconstructs_settings(

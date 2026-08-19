@@ -215,7 +215,8 @@ async def test_mcp_stdio_client_round_trips_real_data(
             assert not deleted.isError, deleted.content
             del_out = deleted.structuredContent or {}
             print(  # noqa: T201 — required evidence
-                f"MCP delete -> verb={del_out.get('verb')} invalidated={del_out.get('invalidated')} "
+                f"MCP delete -> verb={del_out.get('verb')} "
+                f"invalidated={del_out.get('invalidated')} "
                 f"tiers={del_out.get('tiers_affected')}"
             )
             assert del_out.get("verb") == "delete" and del_out.get("invalidated") is True
