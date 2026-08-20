@@ -55,11 +55,24 @@ _SILENT_URI = f"memory-universe://silent/{_SESSION}"
 @pytest_asyncio.fixture
 async def isolated() -> AsyncIterator[tuple[ClientSettings, str, dict[str, str]]]:
     uid = uuid.uuid4().hex[:12]
-    settings = ClientSettings(default_workspace=f"silws{uid}", default_namespace=f"silorg{uid}")
+    # Seeds through the MCP `add` verb, so it needs the same documented no-hooks configuration the
+    # roundtrip test uses. What this test actually proves is unchanged and unrelated to the surface
+    # policy: that the SILENT context resource returns distilled context with NO tool call.
+    settings = ClientSettings(
+        default_workspace=f"silws{uid}",
+        default_namespace=f"silorg{uid}",
+        mcp={"expose_automatic_tools": True},
+    )
     env = {
         **os.environ,
         "MU_DEFAULT_WORKSPACE": f"silws{uid}",
         "MU_DEFAULT_NAMESPACE": f"silorg{uid}",
+        # The server runs as a SUBPROCESS over stdio, so it reads its OWN env — the in-process
+        # `settings` above never reaches it. This is the env form of the same no-hooks
+        # configuration: without it the subprocess serves the DEFAULT agent-facing surface, where
+        # `add` is withdrawn because the capture hooks own it, and every seed call returns
+        # "Unknown tool: add".
+        "MU_MCP__EXPOSE_AUTOMATIC_TOOLS": "true",
     }
     try:
         yield settings, uid, env

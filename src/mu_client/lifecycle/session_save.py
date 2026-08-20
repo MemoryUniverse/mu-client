@@ -49,6 +49,9 @@ free regardless of how large the drained window is.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import structlog
 from mu_contracts.domain.model.memory import Namespace, Visibility
 
@@ -94,6 +97,25 @@ class SessionSaveTrigger:
         #: every single ingest, which would put a network round-trip on the capture hot path to
         #: answer a question that a local integer answers exactly as well.
         self._counts: dict[str, int] = {}
+        #: Sessions with a consolidation already running. Consolidation is the SLOWEST thing on
+        #: this path (a real extraction, possibly through an SLM), and it runs in the outbox
+        #: WORKER — so a pile-up does not stall the host turn, but it does stall the drain queue
+        #: behind it. Without this guard, a session that keeps capturing while a consolidation is
+        #: in flight can queue a second one for the same window, doing the same work twice.
+        #: `MemoryLifecycleManager.sweep_user` holds its own cross-process lease as well; this is
+        #: the cheap in-process guard, mirroring `MaintenanceLoop._inflight` exactly.
+        self._inflight: set[str] = set()
+        #: Observability for the coalescing, so a test/operator can assert it rather than infer it.
+        self.coalesced_count = 0
+        #: Outstanding BACKGROUND consolidations. Consolidation must never run inline on the
+        #: capture path: it is CPU-bound (SPO extraction + a real MiniLM embedding pass), and the
+        #: daemon serves capture acks from the SAME event loop, so awaiting it here stalls every
+        #: ack queued behind it. Live-measured: with the drain awaited inline, the AC-1.2
+        #: capture-ack p99 delta blew its 50ms budget (`test_maintenance_int.py`); backgrounding it
+        #: is what keeps "capture never blocks" true. Losing a task to a crash is harmless — the
+        #: turns are already durable in STM, consolidation is idempotent, and the next session-end
+        #: or periodic sweep redoes it.
+        self._tasks: set[asyncio.Task[None]] = set()
 
     def _ns(self, session_id: str) -> Namespace:
         return Namespace(
@@ -119,7 +141,7 @@ class SessionSaveTrigger:
             )
         self._counts.pop(activity.session_id, None)  # the session is over; drop its counter
         _log.info("session_save.session_end_consolidate", session=activity.session_id)
-        await self._promoter.promote_session_now(self._ns(activity.session_id), force=True)
+        self._drain(activity.session_id)
 
     async def on_capture(self, session_id: str) -> bool:
         """Count one captured turn; drain the buffer when this session reaches the threshold.
@@ -137,5 +159,47 @@ class SessionSaveTrigger:
             session=session_id,
             captured_turns=count,
         )
-        await self._promoter.promote_session_now(self._ns(session_id), force=True)
+        return self._drain(session_id)
+
+    def _drain(self, session_id: str) -> bool:
+        """SCHEDULE this session's consolidation in the background; never run it inline.
+
+        Returns whether this call scheduled one (``False`` = coalesced into one already running).
+        Deliberately NOT ``async``: the whole point is that the caller — the capture path — does
+        not await the work. A store failure surfaces in the done-callback rather than propagating,
+        because there is no longer a caller to propagate to; the turns stay durable in STM either
+        way and the next trigger or periodic sweep retries.
+        """
+        if session_id in self._inflight:
+            self.coalesced_count += 1
+            _log.info("session_save.coalesced", session=session_id)
+            return False
+        self._inflight.add(session_id)
+        task = asyncio.create_task(self._run_drain(session_id))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return True
+
+    async def _run_drain(self, session_id: str) -> None:
+        try:
+            await self._promoter.promote_session_now(self._ns(session_id), force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.warning(
+                "session_save.consolidate_failed",
+                session=session_id,
+                error_type=type(exc).__name__,
+            )
+        finally:
+            self._inflight.discard(session_id)
+
+    async def aclose(self) -> None:
+        """Await outstanding background consolidations (ordered daemon shutdown).
+
+        Without this, shutdown would cancel a consolidation mid-write and log a spurious error;
+        the work itself is safe to lose, but a clean stop should not manufacture noise.
+        """
+        for task in list(self._tasks):
+            with contextlib.suppress(Exception):
+                await task

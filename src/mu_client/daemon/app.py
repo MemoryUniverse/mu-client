@@ -82,6 +82,9 @@ class LocalDaemon:
         self._pool: WorkerPool | None = None
         self._ipc: IpcServer | None = None
         self._maintenance: MaintenanceLoop | None = None
+        # Declared here (not only assigned in start()) so shutdown() is safe even if the daemon is
+        # torn down before start() ever ran — the same discipline every sibling above follows.
+        self._session_save: SessionSaveTrigger | None = None
         self._lifecycle_runner: SqliteWalRunner | None = None
         self._lifecycle_lease: SqliteWalLeaseAdapter | None = None
         self._lifecycle_manager: MemoryLifecycleManager | None = None
@@ -208,6 +211,7 @@ class LocalDaemon:
                 user=self._settings.default_user,
                 consolidate_every_n=self._settings.capture.consolidate_every_n_captures,
             )
+        self._session_save = session_save
         ingest = InProcessLocalIngest(
             self._host,
             user=self._settings.default_user,
@@ -313,6 +317,13 @@ class LocalDaemon:
         self._drain_stop.set()  # 1c. let the lifecycle job-drain loop finish its current poll+exit
         if self._pool is not None:
             await self._pool.drain_and_stop()  # 2. drain in-flight outbox -> remember -> ack
+        if self._session_save is not None:
+            # 2b. settle BACKGROUND consolidations. They are deliberately not awaited on the
+            # capture path (that stalls capture acks — AC-1.2's p99 budget), so shutdown is where
+            # they are collected. Losing one is harmless (the turns are durable in STM and
+            # consolidation is idempotent), but a clean stop should not cancel a mid-write and
+            # manufacture a spurious error.
+            await self._session_save.aclose()
         if self._run_task is not None:
             self._run_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

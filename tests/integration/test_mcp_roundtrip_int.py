@@ -51,11 +51,27 @@ async def isolated() -> AsyncIterator[tuple[ClientSettings, str, dict[str, str]]
     """A unique η partition (workspace/namespace) + the env a spawned server inherits to bind it.
     Teardown drops every store artifact the run created."""
     uid = uuid.uuid4().hex[:12]
-    settings = ClientSettings(default_workspace=f"mcpws{uid}", default_namespace=f"mcporg{uid}")
+    # `expose_automatic_tools=True` is the DOCUMENTED no-hooks configuration (a host with no
+    # capture hooks installed, or a headless SDK-style caller), and it is what this test needs:
+    # its job is proving the MCP STDIO TRANSPORT carries real data end-to-end against real stores,
+    # which requires writing through that transport. The DEFAULT agent-facing surface deliberately
+    # withdraws `add`/`consolidate`/`promote`/`demote` because the hooks own those — that policy is
+    # asserted separately in tests/unit/test_mcp_surface_policy_unit.py.
+    settings = ClientSettings(
+        default_workspace=f"mcpws{uid}",
+        default_namespace=f"mcporg{uid}",
+        mcp={"expose_automatic_tools": True},
+    )
     env = {
         **os.environ,
         "MU_DEFAULT_WORKSPACE": f"mcpws{uid}",
         "MU_DEFAULT_NAMESPACE": f"mcporg{uid}",
+        # The server runs as a SUBPROCESS over stdio, so it reads its OWN env — the in-process
+        # `settings` above never reaches it. This is the env form of the same no-hooks
+        # configuration: without it the subprocess serves the DEFAULT agent-facing surface, where
+        # `add` is withdrawn because the capture hooks own it, and every seed call returns
+        # "Unknown tool: add".
+        "MU_MCP__EXPOSE_AUTOMATIC_TOOLS": "true",
     }
     try:
         yield settings, uid, env
