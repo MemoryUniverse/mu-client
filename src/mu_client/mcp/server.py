@@ -48,16 +48,31 @@ __all__ = ["build_server"]
 
 _SERVER_NAME = "memory-universe-local"
 _INSTRUCTIONS = (
-    "Memory Universe — local, private memory for this agent. Tools: 'add' remembers a fact, "
-    "'recall' (alias 'search') retrieves relevant facts as ranked hits, 'build_context' assembles "
-    "a ready-to-inject context window for a task, 'ask' answers a question by synthesising over "
-    "recalled context (local SLM), 'get' fetches one memory by id, 'consolidate' distills recent "
-    "memories into long-term facts, 'promote'/'demote' move one memory between tiers, 'update' "
-    "supersedes a memory with new content, 'delete' soft-deletes one (kept in history). Choose "
-    "'recall'/'search' for raw hits, 'build_context' for a "
-    "context window, 'ask' for a synthesised answer. All memory is PRIVATE to this machine; there "
-    "is no shared plane here — do not pass visibility/subject/predicate/object arguments."
+    "Memory Universe — local, private memory for this agent.\n\n"
+    "IMPORTANT — memory is AUTOMATIC here. You do NOT need to call a tool to remember things, to "
+    "save them, or to get your usual context. Host hooks already do all three for you: every turn "
+    "is captured and stored, relevant memory is injected into your context before you answer, and "
+    "the tier lifecycle (promotion/consolidation into long-term memory) runs on its own in the "
+    "background. Calling a tool to do any of that would duplicate work already done.\n\n"
+    "These tools are a DEEP-DIVE ESCAPE HATCH, for the case where the memory already in your "
+    "context is not enough. Reach for them when you need to go deeper or genuinely cannot find a "
+    "fact you believe was said before — not as a routine step, and not 'just to be safe'.\n\n"
+    "  - 'recall' (alias 'search') — search deeper than what was injected; ranked hits.\n"
+    "  - 'build_context' — assemble a larger context window for a specific task.\n"
+    "  - 'ask' — get a synthesised answer over recalled memory (local SLM).\n"
+    "  - 'get' — fetch one memory by id.\n"
+    "  - 'update' / 'delete' — correct or retract a memory the user says is wrong. These are real "
+    "user intent that hooks cannot infer, so they ARE yours to call.\n\n"
+    "All memory is PRIVATE to this machine; there is no shared plane here — do not pass "
+    "visibility/subject/predicate/object arguments."
 )
+
+#: Verbs the HOOKS own. Not registered unless `MU_MCP__EXPOSE_AUTOMATIC_TOOLS=true`: capture is
+#: done by the capture hooks, and promotion/consolidation by the daemon's lifecycle triggers
+#: (`lifecycle/session_save.py`). Offering them to the model invites it to duplicate writes the
+#: hook already made and to second-guess a lifecycle it cannot see. Prose alone does not reliably
+#: stop that; not offering the tool does.
+_AUTOMATIC_TOOL_NAMES = frozenset({"add", "consolidate", "promote", "demote"})
 
 
 class _EngineHolder:
@@ -384,5 +399,18 @@ def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
         # caller's OWN private stores. An empty string = cold (no memories yet for this session).
         rendered = await holder.bridge.render(session)
         return rendered.body
+
+    # ---- HOOKS OWN THE ROUTINE PATH -----------------------------------------------------------
+    # Capture, tier promotion/consolidation and context injection all happen AUTOMATICALLY via the
+    # host hooks + the daemon's lifecycle triggers. The verbs that would duplicate that work are
+    # therefore withdrawn from the agent-facing surface by default: an agent that CAN call `add`
+    # will re-store what the hook already captured, and one that CAN call `promote`/`consolidate`
+    # will second-guess a lifecycle it has no visibility into. Instructions alone do not reliably
+    # prevent that — an unoffered tool does. What remains is the deliberate DEEP-DIVE set
+    # (recall/search/get/build_context/ask) plus the two verbs that encode real user intent hooks
+    # cannot infer (update/delete).
+    if not resolved.mcp.expose_automatic_tools:
+        for tool_name in sorted(_AUTOMATIC_TOOL_NAMES):
+            server.remove_tool(tool_name)
 
     return server

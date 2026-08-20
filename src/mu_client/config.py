@@ -196,6 +196,49 @@ class CaptureSettings(BaseModel):
     # Non-PreCompact events are unaffected either way.
     precompact_promote_enabled: bool = True  # env: MU_CAPTURE__PRECOMPACT_PROMOTE_ENABLED
 
+    # THE EVENT-DRIVEN CONSOLIDATION TRIGGERS (lifecycle/session_save.py). STM is a BUFFER, and a
+    # buffer drains on PRESSURE and on CLOSE — not only on a slow salience-gated timer. Before
+    # these existed the ONLY routine route out of STM was the periodic sweep's
+    # ``S(m) >= promote_stm_mtm`` gate, which an auto-captured turn can NEVER clear: at the default
+    # importance its best possible score is 0.5(1.0)+0.2(0.0)+0.3(0.5) = 0.650 against a 0.700 gate
+    # (recency is already maxed at capture, usage is 0 by definition, and recency only decays from
+    # there). So captured memory never promoted, never distilled, and stayed session-trapped —
+    # live-reproduced end-to-end: a fact stated in one Claude session was UNKNOWN in the next.
+    # Defaults ON because a memory system whose capture path can never become durable is not doing
+    # its job; OFF reverts to the pre-existing periodic-sweep-only behaviour.
+    session_end_consolidate_enabled: bool = True  # env: MU_CAPTURE__SESSION_END_CONSOLIDATE_ENABLED
+    # Captured turns in ONE session before its STM buffer is drained upward (the "STM limit full"
+    # trigger). Counted in-process — the alternative is a store COUNT on every ingest, i.e. a
+    # network round-trip on the capture hot path to answer what a local integer answers exactly as
+    # well. Consolidation is idempotent (distill NOOPs an identical active fact), so an extra drain
+    # costs a bounded extraction; too high a value leaves memory session-trapped for longer.
+    # env: MU_CAPTURE__CONSOLIDATE_EVERY_N_CAPTURES
+    consolidate_every_n_captures: int = Field(default=20, ge=1)
+
+
+class McpSettings(BaseModel):
+    """The AGENT-FACING MCP surface.
+
+    **Division of labour (the product rule this models):** the HOOKS own the routine path —
+    capture/ingest, tier promotion/consolidation, and general context injection all happen
+    AUTOMATICALLY, with no tool call and no tokens spent by the model. MCP is the DELIBERATE
+    ESCAPE HATCH: the agent reaches for it only when it wants to go deeper than the auto-injected
+    context, or genuinely cannot find a fact there.
+
+    Exposing the automatic-duty verbs as tools actively harms that: an agent that CAN call ``add``
+    will re-add what the hook already captured (duplicate writes, wasted tokens, and a second
+    capture policy competing with the real one), and an agent that CAN call ``promote``/
+    ``consolidate`` will second-guess a lifecycle it has no visibility into. Steering with prose
+    alone is unreliable — the tool simply is not offered.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # env: MU_MCP__EXPOSE_AUTOMATIC_TOOLS — default OFF. ON re-exposes `add`/`consolidate`/
+    # `promote`/`demote` for debugging, a headless SDK-style caller, or a host with no hooks
+    # installed (where nothing else would ever capture).
+    expose_automatic_tools: bool = False
+
 
 class OutboxSettings(BaseModel):
     """capture-spec.md §10/§8.3, same literal default path as ``ClientSettings.outbox_db_path``
@@ -327,6 +370,7 @@ class ClientSettings(BaseSettings):
 
     # THIS stage's nested subtrees (daemon-app-skeleton-spec.md §9, capture-spec.md §10).
     capture: CaptureSettings = Field(default_factory=CaptureSettings)
+    mcp: McpSettings = Field(default_factory=McpSettings)
     outbox: OutboxSettings = Field(default_factory=OutboxSettings)
     inject: InjectSettings = Field(default_factory=InjectSettings)
     ipc: DaemonIpcSettings = Field(default_factory=DaemonIpcSettings)

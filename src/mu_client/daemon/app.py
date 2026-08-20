@@ -51,6 +51,7 @@ from mu_client.daemon.maintenance import MaintenanceLoop
 from mu_client.host import LocalMemoryHost
 from mu_client.inject.recall_bridge import RecallInjectBridge
 from mu_client.lifecycle.precompact import PreCompactPromoter
+from mu_client.lifecycle.session_save import SessionSaveTrigger
 from mu_client.outbox.sqlite_outbox import SqliteOutbox
 from mu_client.runners.sqlite_wal import SqliteWalLeaseAdapter, SqliteWalRunner
 from mu_client.workers.ingest_client import InProcessLocalIngest
@@ -193,11 +194,26 @@ class LocalDaemon:
                 workspace=self._settings.default_workspace,
                 user=self._settings.default_user,
             )
+        # 3b. The two EVENT-DRIVEN consolidation triggers (session_save.py) — SESSION_END (the
+        #     buffer is closing) and capture PRESSURE (the buffer is filling). Same η the capture
+        #     path writes under, same `promote_session_now(force=True)` machinery PreCompact drives.
+        #     Without them the only route out of STM is the periodic salience-gated sweep, whose
+        #     gate an auto-captured turn can never clear — so nothing captured ever became durable.
+        session_save: SessionSaveTrigger | None = None
+        if self._settings.capture.session_end_consolidate_enabled:
+            session_save = SessionSaveTrigger(
+                promoter=self._lifecycle_manager,
+                org=self._settings.default_namespace,
+                workspace=self._settings.default_workspace,
+                user=self._settings.default_user,
+                consolidate_every_n=self._settings.capture.consolidate_every_n_captures,
+            )
         ingest = InProcessLocalIngest(
             self._host,
             user=self._settings.default_user,
             subagent_partitions=self._settings.capture.subagent_partition_enabled,
             precompact_promoter=precompact_promoter,
+            session_save=session_save,
         )
         worker = OutboxWorker(
             self._outbox,

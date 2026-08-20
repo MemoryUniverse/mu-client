@@ -398,24 +398,35 @@ async def test_tool_delete_soft_deletes() -> None:
     assert out["verb"] == "delete" and out["invalidated"] is True
 
 
-async def test_build_server_advertises_exactly_the_real_verbs() -> None:
+async def test_build_server_advertises_exactly_the_deep_dive_verbs() -> None:
+    """The agent-facing surface is the DEEP-DIVE set, not every implemented verb.
+
+    CONTRACT CHANGE, deliberate. This used to assert all 11 verbs. Capture, tier promotion/
+    consolidation and context injection are all AUTOMATIC now (capture hooks +
+    ``lifecycle/session_save.py``'s session-end and capture-pressure triggers), so the four verbs
+    the hooks own are withdrawn from the surface the model sees: an agent that CAN call ``add``
+    re-stores what the hook already captured, and one that CAN call ``promote``/``consolidate``
+    second-guesses a lifecycle it has no visibility into.
+
+    They remain REAL engine verbs — still implemented, still tested above, still reachable over the
+    SDK/HTTP surface and via ``MU_MCP__EXPOSE_AUTOMATIC_TOOLS=true``. Only the agent-facing MCP
+    advertisement narrows. Policy detail: ``tests/unit/test_mcp_surface_policy_unit.py``.
+    """
     server = build_server()
     tool_names = {tool.name for tool in await server.list_tools()}
     assert tool_names == {
-        "add",
         "recall",
-        "get",
-        "consolidate",
         "search",
+        "get",
         "build_context",
         "ask",
-        "promote",
-        "demote",
         "update",
         "delete",
     }
-    # promote/demote/update/delete are now REAL engine verbs (build-queue §13 item 5) — 11 tools.
-    assert {"promote", "demote", "update", "delete"} <= tool_names
+    # update/delete stay: correcting or retracting a memory is real user intent a hook cannot infer.
+    assert {"update", "delete"} <= tool_names
+    # the hook-owned verbs must NOT be advertised to the model.
+    assert {"add", "consolidate", "promote", "demote"}.isdisjoint(tool_names)
 
 
 async def test_build_server_registers_the_silent_inject_resource() -> None:

@@ -28,6 +28,7 @@ from mu_client.host import LocalMemoryHost
 
 if TYPE_CHECKING:
     from mu_client.lifecycle.precompact import PreCompactPromoter
+    from mu_client.lifecycle.session_save import SessionSaveTrigger
 
 __all__ = ["ExtractionSkippedError", "InProcessLocalIngest", "IngestClientPort"]
 
@@ -58,6 +59,7 @@ class InProcessLocalIngest:
         user: str,
         subagent_partitions: bool = True,
         precompact_promoter: PreCompactPromoter | None = None,
+        session_save: SessionSaveTrigger | None = None,
     ) -> None:
         self._host = host
         self._user = user
@@ -73,6 +75,12 @@ class InProcessLocalIngest:
         # silently swallowed. Only ``ActivityKind.PRE_COMPACT`` reaches it; every other kind is
         # byte-for-byte unchanged.
         self._precompact_promoter = precompact_promoter
+        # The two event-driven consolidation triggers (session_save.py): SESSION_END (the buffer is
+        # closing) and capture PRESSURE (the buffer is filling). `None` = the daemonless/flush
+        # path, byte-for-byte unchanged. Without these, the ONLY route out of STM is the periodic
+        # salience-gated sweep — a gate an auto-captured turn can never clear (0.650 vs 0.700), so
+        # captured memory stayed session-trapped forever.
+        self._session_save = session_save
 
     async def ingest(self, activity: RawActivity) -> None:
         # Phase 3: the ONE control event with a real downstream effect. A ``PreCompact`` means the
@@ -90,6 +98,18 @@ class InProcessLocalIngest:
             raise ExtractionSkippedError(
                 f"activity {activity.activity_id} PreCompact promote-before-delete ran — the "
                 "control event triggers promotion but never becomes a MemoryItem itself; ack"
+            )
+        # The SECOND control event with a real downstream effect. A ``SessionEnd`` means this
+        # session is closing — there is no "later" for a turn to become salient in, so drain the
+        # session's STM buffer upward now (STM->MTM force-promote + MTM->LTM distill), exactly as
+        # PreCompact does above. Like PreCompact it remains a pure TRIGGER: it carries no text and
+        # never becomes a MemoryItem, so it is ack'd through the skip sentinel once its side-effect
+        # has run. A store failure PROPAGATES to the worker's retry/dead-letter path.
+        if activity.kind is ActivityKind.SESSION_END and self._session_save is not None:
+            await self._session_save.on_session_end(activity)
+            raise ExtractionSkippedError(
+                f"activity {activity.activity_id} SessionEnd consolidation ran — the control "
+                "event triggers consolidation but never becomes a MemoryItem itself; ack"
             )
         if activity.kind in CONTROL_KINDS or activity.text is None:
             raise ExtractionSkippedError(
@@ -128,3 +148,8 @@ class InProcessLocalIngest:
             importance_score=activity.importance,
             agent_type=subagent_type,
         )
+        # Capture PRESSURE trigger, counted only on a turn that actually became a memory (control
+        # kinds and filtered slices never reach here, so they do not inflate the count). Runs AFTER
+        # the add so a consolidation always drains a buffer that includes this turn.
+        if self._session_save is not None:
+            await self._session_save.on_capture(activity.session_id)
