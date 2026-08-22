@@ -90,10 +90,7 @@ class InProcessLocalIngest:
         # still never becomes a ``MemoryItem`` (it carries no text of its own) — it is a TRIGGER, so
         # once its promotion side-effect has run it is ack'd via the skip sentinel below. A store
         # failure inside the promoter PROPAGATES (worker retry/dead-letter), never a fake ack.
-        if (
-            activity.kind is ActivityKind.PRE_COMPACT
-            and self._precompact_promoter is not None
-        ):
+        if activity.kind is ActivityKind.PRE_COMPACT and self._precompact_promoter is not None:
             await self._precompact_promoter.on_precompact(activity)
             raise ExtractionSkippedError(
                 f"activity {activity.activity_id} PreCompact promote-before-delete ran — the "

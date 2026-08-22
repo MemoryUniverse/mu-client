@@ -304,9 +304,7 @@ def _run_install_codex(args: argparse.Namespace) -> int:
         f"endpoint_vars_written={result.endpoint_vars_written} "
         f"mcp_servers_preserved={result.mcp_servers_preserved}"
     )
-    print(
-        install_codex.post_install_guidance(config_path=args.config_path, with_mcp=with_mcp)
-    )
+    print(install_codex.post_install_guidance(config_path=args.config_path, with_mcp=with_mcp))
     return 0
 
 

@@ -76,8 +76,12 @@ def test_user_and_assistant_turns_captured_from_event_msg_stream(tmp_path: Path)
             _event_msg("task_started"),  # skipped
             _response_item({"type": "message", "role": "user", "content": []}),  # role-echo skipped
             _event_msg("user_message", message="deploy target is staging-eu-west", images=[]),
-            _event_msg("agent_message", message="Understood — staging-eu-west it is.",
-                       phase="final_answer", memory_citation=None),
+            _event_msg(
+                "agent_message",
+                message="Understood — staging-eu-west it is.",
+                phase="final_answer",
+                memory_citation=None,
+            ),
             _event_msg("token_count"),  # skipped
         ],
     )
@@ -108,7 +112,7 @@ def test_tool_calls_captured_from_response_item_stream(tmp_path: Path) -> None:
                     "status": "completed",
                     "call_id": "call_1",
                     "name": "exec",
-                    "input": "const r = await tools.exec_command({\"cmd\":\"ls\"});",
+                    "input": 'const r = await tools.exec_command({"cmd":"ls"});',
                 }
             ),
             _response_item(
@@ -117,7 +121,7 @@ def test_tool_calls_captured_from_response_item_stream(tmp_path: Path) -> None:
                     "id": "fc_1",
                     "call_id": "call_2",
                     "name": "apply_patch",
-                    "arguments": "{\"patch\": \"*** Begin Patch\"}",
+                    "arguments": '{"patch": "*** Begin Patch"}',
                 }
             ),
         ],
@@ -137,8 +141,9 @@ def test_encrypted_reasoning_and_control_lines_yield_nothing(tmp_path: Path) -> 
         path,
         [
             _session_meta(),
-            _response_item({"type": "reasoning", "id": "rs_1", "summary": [],
-                            "encrypted_content": "gAAAA…"}),
+            _response_item(
+                {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAA…"}
+            ),
             {"timestamp": "t", "type": "world_state", "payload": {"foo": 1}},
             {"timestamp": "t", "type": "turn_context", "payload": {"bar": 2}},
             _event_msg("token_count"),
@@ -157,8 +162,9 @@ def test_tool_call_truncated_to_budget(tmp_path: Path) -> None:
         path,
         [
             _session_meta(),
-            _response_item({"type": "custom_tool_call", "call_id": "c", "name": "exec",
-                            "input": big}),
+            _response_item(
+                {"type": "custom_tool_call", "call_id": "c", "name": "exec", "input": big}
+            ),
         ],
     )
     act = CodexRolloutTailer(tool_input_max_chars=100).tail(path).activities[0]

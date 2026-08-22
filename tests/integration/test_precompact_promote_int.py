@@ -184,9 +184,9 @@ async def test_precompact_saves_at_risk_stm_turn_into_durable_tier_and_survives_
                 break
             await asyncio.sleep(_POLL_DELAY_S)
         print(f"POST-PRECOMPACT MTM (direct qdrant) present={present_after} content={content!r}")  # noqa: T201
-        assert present_after, (
-            "PreCompact did NOT promote the at-risk turn into the durable MTM tier"
-        )
+        assert (
+            present_after
+        ), "PreCompact did NOT promote the at-risk turn into the durable MTM tier"
         assert "Paris" in content, "the promoted MTM point does not carry the original fact"
 
         # (4a) Recallable from the durable tier.

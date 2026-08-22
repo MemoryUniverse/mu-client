@@ -55,8 +55,11 @@ def _session_meta() -> dict[str, object]:
 
 
 def _event(ptype: str, **fields: object) -> dict[str, object]:
-    return {"timestamp": "2026-08-10T04:40:51.000Z", "type": "event_msg",
-            "payload": {"type": ptype, **fields}}
+    return {
+        "timestamp": "2026-08-10T04:40:51.000Z",
+        "type": "event_msg",
+        "payload": {"type": ptype, **fields},
+    }
 
 
 def _resp(payload: dict[str, object]) -> dict[str, object]:
@@ -70,12 +73,22 @@ def _write_realshape_rollout(path: Path) -> None:
         _event("task_started"),  # control — skipped
         _event("user_message", message="my codex deploy target is staging-eu-west-42", images=[]),
         _resp({"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAA…"}),
-        _resp({"type": "custom_tool_call", "id": "ctc_1", "status": "completed",
-               "call_id": "call_1", "name": "exec",
-               "input": "const r = await tools.exec_command({\"cmd\":\"cat pipeline.yaml\"});"}),
-        _event("agent_message",
-               message="Got it — I'll deploy to staging-eu-west-42 as the codex target.",
-               phase="final_answer", memory_citation=None),
+        _resp(
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_1",
+                "status": "completed",
+                "call_id": "call_1",
+                "name": "exec",
+                "input": 'const r = await tools.exec_command({"cmd":"cat pipeline.yaml"});',
+            }
+        ),
+        _event(
+            "agent_message",
+            message="Got it — I'll deploy to staging-eu-west-42 as the codex target.",
+            phase="final_answer",
+            memory_citation=None,
+        ),
         _event("token_count"),  # control — skipped
         _event("task_complete"),  # control — skipped
     ]
@@ -216,9 +229,9 @@ async def test_realshape_codex_rollout_lands_and_is_recallable(
             await asyncio.sleep(0.2)
     assert recalled is not None
     print("RECALLED " + "; ".join(f"{it.tier}/{it.channel}|{it.content}" for it in recalled.items))  # noqa: T201
-    assert any("staging-eu-west-42" in it.content for it in recalled.items), (
-        "the codex turn's fact did not round-trip through federated recall from real stores"
-    )
+    assert any(
+        "staging-eu-west-42" in it.content for it in recalled.items
+    ), "the codex turn's fact did not round-trip through federated recall from real stores"
 
 
 async def test_genuinely_captured_real_rollout_file_flows_end_to_end(

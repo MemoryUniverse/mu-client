@@ -283,9 +283,7 @@ async def tool_build_context(
     use ``recall``/``search`` when you want the raw ranked hits, ``ask`` when you want a synthesised
     answer to a question."""
     guard.assert_private(visibility=visibility, subject=subject, predicate=predicate, object=object)
-    view = await engine.context(
-        query, user=user, session=session, limit=limit, max_chars=max_chars
-    )
+    view = await engine.context(query, user=user, session=session, limit=limit, max_chars=max_chars)
     return view.model_dump(mode="json")
 
 

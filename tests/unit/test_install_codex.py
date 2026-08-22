@@ -119,9 +119,7 @@ def test_install_no_mcp_writes_only_notify(tmp_path: Path) -> None:
 
 def test_uninstall_removes_only_managed_notify_and_server(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
-    config.write_text(
-        "[mcp_servers.other-tool]\n" 'command = "other-mcp"\n', encoding="utf-8"
-    )
+    config.write_text("[mcp_servers.other-tool]\n" 'command = "other-mcp"\n', encoding="utf-8")
     codex.install(config, notify_script_path=_NOTIFY, mcp_env=_ENV)  # adds ours alongside theirs
 
     result = codex.uninstall(config, notify_script_path=_NOTIFY)

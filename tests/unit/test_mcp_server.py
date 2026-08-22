@@ -175,7 +175,10 @@ class _StubEngine:
     ) -> MemoryVerbResult:
         self.verb_calls.append({"verb": "promote", "memory_id": memory_id, "to_tier": to_tier})
         return MemoryVerbResult(
-            memory_id=memory_id, verb="promote", from_tier="stm", to_tier=to_tier,
+            memory_id=memory_id,
+            verb="promote",
+            from_tier="stm",
+            to_tier=to_tier,
             tiers_affected=(to_tier,),
         )
 
@@ -189,7 +192,10 @@ class _StubEngine:
     ) -> MemoryVerbResult:
         self.verb_calls.append({"verb": "demote", "memory_id": memory_id, "to_tier": to_tier})
         return MemoryVerbResult(
-            memory_id=memory_id, verb="demote", from_tier="mtm", to_tier=to_tier,
+            memory_id=memory_id,
+            verb="demote",
+            from_tier="mtm",
+            to_tier=to_tier,
             tiers_affected=(to_tier, "mtm"),
         )
 
@@ -205,7 +211,9 @@ class _StubEngine:
             {"verb": "update", "memory_id": memory_id, "new_content": new_content}
         )
         return MemoryVerbResult(
-            memory_id="mem-new", verb="update", superseded_id=memory_id,
+            memory_id="mem-new",
+            verb="update",
+            superseded_id=memory_id,
             tiers_affected=("stm", "mtm"),
         )
 
@@ -214,7 +222,9 @@ class _StubEngine:
     ) -> MemoryVerbResult:
         self.verb_calls.append({"verb": "delete", "memory_id": memory_id})
         return MemoryVerbResult(
-            memory_id=memory_id, verb="delete", tiers_affected=("stm", "mtm", "ltm"),
+            memory_id=memory_id,
+            verb="delete",
+            tiers_affected=("stm", "mtm", "ltm"),
             invalidated=True,
         )
 

@@ -146,8 +146,10 @@ async def _stm_has_all(session: ClientSession, timeout: timedelta) -> None:  # n
             read_timeout_seconds=timeout,
         )
         contents = [it["content"] for it in (res.structuredContent or {}).get("items", [])]
-        if _FACT_A in contents and _FACT_B in contents and any(
-            c.startswith("Write:") for c in contents
+        if (
+            _FACT_A in contents
+            and _FACT_B in contents
+            and any(c.startswith("Write:") for c in contents)
         ):
             return
         await asyncio.sleep(0.2)

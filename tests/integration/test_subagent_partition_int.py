@@ -198,8 +198,7 @@ async def test_owner_recalls_subagent_memory_but_other_user_does_not(
             "what is the deploy target?", user=_OTHER_USER, session=owner_session
         )
         print(  # noqa: T201
-            "OTHER-USER RECALL: "
-            + "; ".join(f"{it.content}" for it in other.items)
+            "OTHER-USER RECALL: " + "; ".join(f"{it.content}" for it in other.items)
         )
         assert not any(
             "staging-eu" in it.content for it in other.items

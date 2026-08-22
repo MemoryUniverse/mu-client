@@ -41,6 +41,7 @@ __all__ = ["capture_once", "replay_spool"]
 
 _log = structlog.get_logger("mu.client.capture.hook")
 
+
 def _build_registry(settings: ClientSettings) -> ParserRegistry:
     """The ONE parser set the daemonless capture/replay paths share: Claude Code hook envelopes +
     the Codex ``notify`` ``agent-turn-complete`` envelope (Phase 4). The registry keys parsers by

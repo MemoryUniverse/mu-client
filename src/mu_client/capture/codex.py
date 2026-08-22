@@ -118,9 +118,9 @@ def _activity_id(*, session_id: str, source_offset: str, kind: ActivityKind) -> 
 
 
 def _provenance_id(*, session_id: str, source_offset: str, kind: ActivityKind) -> str:
-    return "prov_" + _activity_id(
-        session_id=session_id, source_offset=source_offset, kind=kind
-    )[:24]
+    return (
+        "prov_" + _activity_id(session_id=session_id, source_offset=source_offset, kind=kind)[:24]
+    )
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -182,8 +182,8 @@ class CodexParserV1:
         elif top == "response_item" and ptype in ("custom_tool_call", "function_call"):
             kind = ActivityKind.TOOL_USE
             name = _opt_str(payload.get("name")) or "unknown_tool"
-            raw_input = payload.get("input") if ptype == "custom_tool_call" else payload.get(
-                "arguments"
+            raw_input = (
+                payload.get("input") if ptype == "custom_tool_call" else payload.get("arguments")
             )
             body = _truncate(str(raw_input), self._tool_input_max_chars) if raw_input else ""
             text = f"{name}: {body}" if body else None
@@ -202,9 +202,7 @@ class CodexParserV1:
             return None  # a captured kind whose text slot was empty/absent — nothing to remember.
 
         return RawActivity(
-            activity_id=_activity_id(
-                session_id=session_id, source_offset=source_offset, kind=kind
-            ),
+            activity_id=_activity_id(session_id=session_id, source_offset=source_offset, kind=kind),
             host=self.host,
             host_version=host_version,
             schema_version=self.schema_version,
@@ -261,9 +259,7 @@ class CodexNotifyParserV1:
         text = _nonempty(record.get("last-assistant-message"))
         kind = ActivityKind.ASSISTANT_MSG
         return RawActivity(
-            activity_id=_activity_id(
-                session_id=session_id, source_offset=event_id, kind=kind
-            ),
+            activity_id=_activity_id(session_id=session_id, source_offset=event_id, kind=kind),
             host=self.host,
             host_version=_HOST_VERSION_FALLBACK,
             schema_version=self.schema_version,
@@ -274,12 +270,11 @@ class CodexNotifyParserV1:
             text=text,
             content_hash=_sha256_text(text) if text is not None else None,
             source_offset=event_id,
-            provenance_id=_provenance_id(
-                session_id=session_id, source_offset=event_id, kind=kind
-            ),
-            payload={"turn_id": _opt_str(record.get("turn-id")), "client": _opt_str(
-                record.get("client")
-            )},
+            provenance_id=_provenance_id(session_id=session_id, source_offset=event_id, kind=kind),
+            payload={
+                "turn_id": _opt_str(record.get("turn-id")),
+                "client": _opt_str(record.get("client")),
+            },
         )
 
 
@@ -341,9 +336,7 @@ class CodexRolloutTailer:
         path = rollout_path.expanduser()
         raw = path.read_bytes()
 
-        resolved_session = (
-            session_id or session_id_from_rollout_name(path) or path.stem
-        )
+        resolved_session = session_id or session_id_from_rollout_name(path) or path.stem
         host_version = _HOST_VERSION_FALLBACK
         cwd: str | None = None
 
@@ -411,9 +404,9 @@ class CodexRolloutTailer:
             raise CaptureSchemaDriftError(
                 host=self.host.value,
                 source_id=f"codex_rollout:{self.schema_version}",
-                detected_keys=sorted(str(k) for k in record) if isinstance(record, dict) else [
-                    type(record).__name__
-                ],
+                detected_keys=sorted(str(k) for k in record)
+                if isinstance(record, dict)
+                else [type(record).__name__],
                 expected_schema=[self.schema_version],
                 raw_sample_sha256=hashlib.sha256(line).hexdigest(),
             )
@@ -456,8 +449,10 @@ async def backfill_codex(
     (``CaptureSourceHalted`` event), reported as ``halted=True`` — a rollout-shape drift never
     blocks the notify hook or another session's tail (mirrors :func:`backfill_thinking`)."""
     tailer = CodexRolloutTailer(tool_input_max_chars=settings.capture.tool_outcome_max_chars)
-    resolved = session_id or session_id_from_rollout_name(rollout_path.expanduser()) or (
-        rollout_path.expanduser().stem
+    resolved = (
+        session_id
+        or session_id_from_rollout_name(rollout_path.expanduser())
+        or (rollout_path.expanduser().stem)
     )
     outbox = SqliteOutbox(settings.outbox.outbox_path)
     await outbox.open()
