@@ -280,6 +280,29 @@ class DaemonIpcSettings(BaseModel):
     socket_peer_check: bool = True
     socket_timeout_s: float = 2.0  # capture-spec.md §3: "Timeout <= 2s on the socket call"
 
+    # ---- FRAMING BUDGET for ONE newline-delimited-JSON request (both ends of the socket).
+    # asyncio's ``StreamReader`` default is 64 KiB; a line longer than the limit makes
+    # ``readline()`` raise, which — before this became a configured, ANSWERED condition — closed
+    # the connection with no reply and silently DROPPED the capture (the hook could not tell the
+    # empty reply apart from a success). A real Claude Code ``PostToolUse`` record carries the
+    # untruncated ``tool_response`` (the ``capture.tool_outcome_max_chars`` slice is taken
+    # daemon-side, AFTER parsing), and a single Read/Grep/MCP tool result in the hundreds of KiB
+    # is routine — 64 KiB is exceeded by ordinary work, not by abuse. 4 MiB is ~10x the largest
+    # record any host tool can plausibly emit, while still BOUNDING the per-connection read
+    # buffer, so one runaway hook cannot grow the daemon's RSS without limit. It is a bound on a
+    # uid-checked local peer (``socket_peer_check``/``SO_PEERCRED``), i.e. on our own runaway
+    # process, never on an attacker. A record past this bound gets an explicit 413 and the client
+    # spools it — refused, never silently lost. env: MU_IPC__MAX_REQUEST_BYTES
+    max_request_bytes: int = Field(default=4 * 1024 * 1024, ge=64 * 1024)
+    # Server-side bound on EACH blocking step of one request/response exchange (reading the
+    # request line; draining the reply). Without it a peer that connects and never sends ``\n`` —
+    # or that hangs up without reading its reply — pins its handler forever, and ordered shutdown
+    # (``stop_accepting()`` -> ``wait_closed()``, which in 3.12 waits for live handlers) then
+    # never returns. Deliberately ABOVE the client's own end-to-end ``socket_timeout_s`` budget so
+    # it never cuts off a peer that is genuinely mid-transfer (that peer would abort its own call
+    # first anyway) — it only reaps one that has gone silent. env: MU_IPC__REQUEST_IO_TIMEOUT_S
+    request_io_timeout_s: float = Field(default=5.0, gt=0)
+
 
 class ModelProfileSettings(BaseModel):
     """Where the client's model slot points. ``mu_local``'s composition root (``mu_local/

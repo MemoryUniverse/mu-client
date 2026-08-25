@@ -1,8 +1,12 @@
 """``mu capture-once`` — the ONE hook entrypoint Claude Code invokes (capture-spec.md §2.2/§3;
 daemon-app-skeleton-spec.md §6). Reads the hook's stdin JSON, tries the resident daemon's IPC
 socket first (fast path — the daemon parses/appends/recalls with an already-warm engine), and
-falls back to a DIRECT SQLite-WAL outbox append when no daemon is listening (or the socket call
-times out) — pure daemonless durability, no live injection this invocation (capture-spec.md §2.3:
+falls back to a DIRECT SQLite-WAL outbox append whenever the daemon does NOT durably take the
+record — no daemon listening, the socket call timing out, or the daemon REFUSING (``503
+shutting_down`` during its ordered shutdown, ``401 foreign_uid``, ``413 request_too_large``, an
+empty reply): a refusal is handled exactly like unreachable, because the durability boundary is
+BEFORE the host is acked (``outbox/sqlite_outbox.py``) — pure daemonless durability, no live
+injection this invocation (capture-spec.md §2.3:
 a documented capability tier, never a silent gap). On outbox-unreachable (locked/corrupt WAL) the
 envelope spools to disk and the process exits 0 regardless — **never blocks/fails the host turn**.
 
@@ -105,36 +109,86 @@ async def _maybe_backfill_thinking(
 
 
 # --------------------------------------------------------------------------------- daemon fast path
+#: Daemon capture replies that mean **the daemon has durably taken ownership of this record**, and
+#: only those. Returning non-``None`` for anything else is what silently DROPPED captures: the
+#: caller reads "not ``None``" as "durably captured" and skips :func:`_direct_append_or_spool`
+#: entirely, so a refusal became a lost activity with no error anywhere.
+#:
+#: * ``200`` — appended to the daemon's outbox (``ipc.py::_route_capture``).
+#: * ``422`` — schema drift: the daemon ``quarantine_raw``'d the RAW envelope into its own
+#:   dead-letter table BEFORE replying, so the record IS retained on disk. Spooling it a second
+#:   time here would duplicate it into a spool file that :func:`replay_spool` can never drain
+#:   (it still fails to parse, by definition) — retention without a leak, so the daemon owns it.
+#:
+#: Everything else is a REFUSAL where the daemon holds nothing — ``401 foreign_uid``,
+#: ``413 request_too_large``, ``503 shutting_down``, ``404 unknown_route``, an empty/unparseable
+#: reply — and the correct response to a refusal is identical to the daemon being unreachable:
+#: fall through and spool. A ``503`` during every shutdown window is the likeliest of these.
+_DAEMON_ACCEPTED_STATUSES = frozenset({200, 422})
+
+
+def _daemon_accepted(response: dict[str, Any]) -> bool:
+    """Did the daemon durably take ownership? See :data:`_DAEMON_ACCEPTED_STATUSES`."""
+    return response.get("status") in _DAEMON_ACCEPTED_STATUSES
+
+
 async def _try_daemon(
     settings: ClientSettings, *, host: HostKind, record: dict[str, Any], event_id: str
 ) -> dict[str, Any] | None:
+    """``None`` means **the daemon did not durably capture this record** — for ANY reason
+    (unreachable, timed out, refused, replied with nothing) — and the caller must fall through to
+    :func:`_direct_append_or_spool`. Non-``None`` is a promise the activity is already durable."""
     socket_path = settings.ipc.socket_path.expanduser()
     timeout_s = settings.ipc.socket_timeout_s
     if not socket_path.exists():
         return None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(path=str(socket_path)), timeout=timeout_s
+            asyncio.open_unix_connection(
+                path=str(socket_path), limit=settings.ipc.max_request_bytes
+            ),
+            timeout=timeout_s,
         )
     except (OSError, TimeoutError):
         return None  # DAEMON_UNREACHABLE_SPOOLED path — caller falls through to direct append
     try:
-        await _rpc(
+        capture_response = await _rpc(
             reader,
             writer,
             {"route": "capture", "host": host.value, "record": record, "event_id": event_id},
             timeout_s=timeout_s,
         )
+    except (OSError, TimeoutError, ValueError) as exc:
+        # OSError: the daemon closed/reset mid-exchange (e.g. it answered 413 and hung up while we
+        # were still writing an oversized record). ValueError: an unparseable reply, or a REPLY
+        # past our own read limit. TimeoutError: no reply inside the socket budget. All three are
+        # "not durably captured" — content-free log line, then spool.
+        _log.info("daemon_capture_rpc_failed", error=type(exc).__name__)
+        return None
     finally:
         writer.close()
+    if not _daemon_accepted(capture_response):
+        _log.info("daemon_capture_refused", status=capture_response.get("status"))
+        return None
 
     event = str(record.get("hook_event_name", ""))
     if event not in _DUAL_PURPOSE_EVENTS:
         return _hook_output(event, additional_context=None)
 
+    # Capture is DURABLE from here on, so every failure below degrades to "no injection this
+    # invocation" (capture-spec.md §2.3) and must NEVER return None — that would re-append the
+    # very record the daemon just accepted.
     session_id = str(record.get("session_id", ""))
     query = record.get("prompt") if event == "UserPromptSubmit" else None
-    reader2, writer2 = await asyncio.open_unix_connection(path=str(socket_path))
+    try:
+        reader2, writer2 = await asyncio.wait_for(
+            asyncio.open_unix_connection(
+                path=str(socket_path), limit=settings.ipc.max_request_bytes
+            ),
+            timeout=timeout_s,
+        )
+    except (OSError, TimeoutError):
+        return _hook_output(event, additional_context=None)
     try:
         recall_resp = await _rpc(
             reader2,
@@ -142,9 +196,13 @@ async def _try_daemon(
             {"route": "recall", "session_id": session_id, "query": query},
             timeout_s=timeout_s,
         )
+    except (OSError, TimeoutError, ValueError) as exc:
+        _log.info("daemon_recall_rpc_failed", error=type(exc).__name__)
+        return _hook_output(event, additional_context=None)
     finally:
         writer2.close()
-    return _hook_output(event, additional_context=recall_resp.get("body") or None)
+    body = recall_resp.get("body") if recall_resp.get("status") == 200 else None
+    return _hook_output(event, additional_context=body or None)
 
 
 async def _rpc(
@@ -154,11 +212,26 @@ async def _rpc(
     *,
     timeout_s: float,
 ) -> dict[str, Any]:
-    writer.write((json.dumps(payload) + "\n").encode("utf-8"))
-    await writer.drain()
-    line = await asyncio.wait_for(reader.readline(), timeout=timeout_s)
-    result: dict[str, Any] = json.loads(line) if line else {}
-    return result
+    """One newline-delimited-JSON round trip. RETURNS the parsed reply body — the caller MUST
+    inspect it (see :func:`_daemon_accepted`); a reply that never came (connection closed with no
+    line) or is not a JSON object yields ``{}``, which carries no ``status`` and therefore fails
+    every acceptance check.
+
+    ``timeout_s`` bounds the WHOLE exchange (write + drain + read), not just the read: draining a
+    multi-hundred-KiB record into a daemon that has stopped reading it (exactly what happens when
+    the daemon answers 413 and hangs up) blocks in ``drain()``, which an unbounded write would
+    never leave — and a hook that never returns blocks the host turn."""
+
+    async def _exchange() -> dict[str, Any]:
+        writer.write((json.dumps(payload) + "\n").encode("utf-8"))
+        await writer.drain()
+        line = await reader.readline()
+        if not line:
+            return {}
+        parsed = json.loads(line)
+        return parsed if isinstance(parsed, dict) else {}
+
+    return await asyncio.wait_for(_exchange(), timeout=timeout_s)
 
 
 # --------------------------------------------------------------------------------- daemonless path

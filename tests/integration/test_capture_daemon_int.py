@@ -245,3 +245,52 @@ async def test_daemon_serves_capture_and_recall_over_real_unix_socket(
         assert (
             rendered is not None
         ), "daemon never served the captured fact back as additionalContext"
+
+
+async def test_real_daemon_captures_a_record_far_past_asyncios_default_stream_limit(
+    isolated_settings: ClientSettings,
+) -> None:
+    """END-TO-END durability of a BIG record against the REAL resident daemon (real unix socket,
+    real SQLite-WAL outbox, real worker pool, real mu-dev-* stores) — the shape that was being
+    silently dropped in production.
+
+    A ``PostToolUse`` carries the UNTRUNCATED ``tool_response`` (the
+    ``capture.tool_outcome_max_chars`` slice is taken daemon-side, after parsing), so an ordinary
+    file-read tool result pushes the JSON line past asyncio's 64 KiB ``StreamReader`` default.
+    The daemon's ``readline()`` then raised, the connection closed with NO response, and
+    ``capture_once`` — which never inspected the reply — reported success and skipped its
+    durability fallback. Nothing was written anywhere, and nothing was logged.
+
+    This asserts only the product-level claim (the activity is durable, retrievable from the real
+    outbox by content); WHICH of the two paths made it durable is pinned by the provenance-split
+    unit tier in ``tests/unit/test_capture_ipc_framing.py``.
+    """
+    daemon = LocalDaemon(isolated_settings)
+    async with daemon.lifespan():
+        assert isolated_settings.ipc.socket_path.exists()
+
+        marker = "oversize-marker-8f2a"
+        raw = _hook_json(
+            event="PostToolUse",
+            session_id=_SESSION,
+            tool_name="Read",
+            tool_use_id="toolu_oversize_1",
+            tool_response=marker + ("x" * 80_000),
+        )
+        assert len(raw) > 64 * 1024, "payload must exceed the asyncio default it is testing"
+
+        response = await capture_once(isolated_settings, host=HostKind.CLAUDE_CODE, raw=raw)
+        print(f"BIG-RECORD CAPTURE response={response!r} raw_bytes={len(raw)}")  # noqa: T201
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and await daemon.outbox.outbox_depth() > 0:  # noqa: ASYNC110
+            await asyncio.sleep(0.2)
+
+        conn = sqlite3.connect(str(isolated_settings.outbox.outbox_path))
+        rows = conn.execute("SELECT kind, state, activity_json FROM outbox").fetchall()
+        conn.close()
+        print(f"BIG-RECORD OUTBOX ROWS = {[(r[0], r[1]) for r in rows]}")  # noqa: T201
+        assert rows, "the big record was silently dropped — nothing reached the outbox at all"
+        assert any(
+            marker in r[2] for r in rows
+        ), "an outbox row exists but it is not the big record we captured"

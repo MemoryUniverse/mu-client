@@ -8,6 +8,13 @@ socket (no aiohttp/uvicorn dependency for an MVP front door) — one JSON object
 object out, connection closed. Loopback-HTTP is a route-table-compatible follow-up (the handlers
 below are already framework-agnostic), not a rewrite.
 
+**Framing is EXPLICIT (``DaemonIpcSettings.max_request_bytes`` / ``request_io_timeout_s``).**
+Every failure mode of reading one request line is ANSWERED rather than closed silently: a record
+past the limit gets ``413``, a peer that goes silent mid-line is reaped instead of pinning its
+handler (and, through it, ``stop_accepting()``'s ``wait_closed()``). A close with no reply is
+indistinguishable from success on the wire, and the client's fallback is the only thing standing
+between a refused capture and a lost one — so this server never answers with silence.
+
 **``/state`` + ``/ready-context`` (S3-03, ADR 0033 "always-accessible" leg 2).** memory-lifecycle-
 manager-spec.md §5 (lines 247-252): "the existing loopback IPC socket serves ``/state``,
 ``/recall``, ``/ready-context`` as instant warm-cache reads that never touch the runner". Both new
@@ -92,7 +99,13 @@ class IpcServer:
         socket_path.parent.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(FileNotFoundError):
             socket_path.unlink()
-        self._server = await asyncio.start_unix_server(self._handle, path=str(socket_path))
+        # ``limit=`` is NOT optional here: asyncio's default ``StreamReader`` limit is 64 KiB, and
+        # an ordinary ``PostToolUse`` record (untruncated ``tool_response``) exceeds it — see
+        # ``DaemonIpcSettings.max_request_bytes`` for the sizing, and ``_handle`` for the 413 a
+        # record past even THIS bound now gets instead of a silent close.
+        self._server = await asyncio.start_unix_server(
+            self._handle, path=str(socket_path), limit=self._settings.max_request_bytes
+        )
         socket_path.chmod(0o600)
         _log.info("ipc.listening", socket_path=str(socket_path))
 
@@ -114,19 +127,40 @@ class IpcServer:
             await self._server.wait_closed()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        timeout_s = self._settings.request_io_timeout_s
         try:
             if self._settings.socket_peer_check and not _peer_is_self(writer):
-                await _respond(writer, {"status": 401, "error": "foreign_uid"})
+                await _respond(writer, {"status": 401, "error": "foreign_uid"}, timeout_s=timeout_s)
                 return
             if not self._accepting:
-                await _respond(writer, {"status": 503, "error": "shutting_down"})
+                await _respond(
+                    writer, {"status": 503, "error": "shutting_down"}, timeout_s=timeout_s
+                )
                 return
-            line = await reader.readline()
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=timeout_s)
+            except ValueError:
+                # ``readline()`` overran ``limit=`` (``max_request_bytes``) — the record is bigger
+                # than this daemon frames. ANSWER it: a silent close is indistinguishable from a
+                # success at the client, and that is exactly how captures were being dropped. A
+                # 413 makes the client spool instead (durability boundary BEFORE the host is
+                # acked). Content-free: only the limit is logged, never the record.
+                _log.info("ipc.request_too_large", limit_bytes=self._settings.max_request_bytes)
+                await _respond(
+                    writer, {"status": 413, "error": "request_too_large"}, timeout_s=timeout_s
+                )
+                return
             if not line:
                 return
             request = json.loads(line)
             response = await self._dispatch(request)
-            await _respond(writer, response)
+            await _respond(writer, response, timeout_s=timeout_s)
+        except (TimeoutError, ConnectionError) as exc:
+            # A peer that went silent mid-line, or hung up before reading its reply. RELEASING the
+            # handler is the point: ``wait_closed()`` (3.12: waits for live handlers) is step 1 of
+            # the ordered shutdown, so one stuck handler otherwise hangs the whole daemon's exit.
+            # Content-free — the exception TYPE only, never the request.
+            _log.info("ipc.request_aborted", error=type(exc).__name__, timeout_s=timeout_s)
         finally:
             writer.close()
             with contextlib.suppress(Exception):
@@ -214,9 +248,13 @@ def _peer_is_self(writer: asyncio.StreamWriter) -> bool:
     return bool(uid == os.getuid())
 
 
-async def _respond(writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
+async def _respond(
+    writer: asyncio.StreamWriter, payload: dict[str, Any], *, timeout_s: float
+) -> None:
+    """Write ONE newline-delimited JSON reply. The drain is bounded (``request_io_timeout_s``):
+    a peer that stops reading must not pin this handler — see :meth:`IpcServer._handle`."""
     writer.write((json.dumps(payload) + "\n").encode("utf-8"))
-    await writer.drain()
+    await asyncio.wait_for(writer.drain(), timeout=timeout_s)
 
 
 def _sha256_of(record: dict[str, Any]) -> str:
