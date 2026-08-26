@@ -35,7 +35,7 @@ import pytest_asyncio
 from falkordb.asyncio import FalkorDB
 from mu_contracts.domain.model.memory import Namespace, Visibility
 from mu_engine.storage.domain.memory import MemoryTier
-from mu_engine.storage.mappers.qdrant_mapper import point_id
+from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
@@ -49,7 +49,7 @@ pytestmark = pytest.mark.integration
 
 _FACT = "Ada lives in Paris and works at Acme"
 _SESSION = "precompact-session"
-# MiniLM (mu-local's local embedder) — collection suffix mu_mtm__{ws}__private__384
+# MiniLM (mu-local's local embedder) — see `_mtm_collection` for the real collection name.
 _EMBED_DIM = 384
 _POLL_ATTEMPTS = 40
 _POLL_DELAY_S = 0.2
@@ -71,10 +71,21 @@ async def isolated_settings(
 async def _teardown(settings: ClientSettings, uid: str) -> None:
     qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
     try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
+        # NOT a `uid in coll.name` substring sweep: `qdrant_mapper.collection_name` HASHES
+        # org+workspace together (the collision-proofing fix — see that function's docstring), so
+        # this test's `uid` no longer appears as a literal substring inside the collection name
+        # the way it did when the name embedded the workspace raw. Compute the exact name(s)
+        # instead, through the real mapper, so a future rename of the naming scheme cannot
+        # silently break this teardown again either.
+        org, workspace = settings.default_namespace, settings.default_workspace
+        private_ns = Namespace(
+            org=org, workspace=workspace, user="u1", session="s1", visibility=Visibility.PRIVATE
+        )
+        shared_ns = Namespace.shared(org=org, workspace=workspace, session="s1")
+        for ns in (private_ns, shared_ns):
+            name = collection_name(ns, _EMBED_DIM)
+            with contextlib.suppress(Exception):
+                await qdrant.delete_collection(name)
     finally:
         await qdrant.close()
 
@@ -109,7 +120,24 @@ def _ns(settings: ClientSettings, *, session: str, user: str) -> Namespace:
 
 
 def _mtm_collection(settings: ClientSettings) -> str:
-    return f"mu_mtm__{settings.default_workspace}__{Visibility.PRIVATE.value}__{_EMBED_DIM}"
+    """The exact physical Qdrant collection this test's default org+workspace resolves to —
+    computed through the REAL mapper (``qdrant_mapper.collection_name``) rather than re-hardcoding
+    its shape here. A previous version of this helper hand-built the name as
+    ``f"mu_mtm__{workspace}__{visibility}__{dim}"`` — missing ``org`` entirely, AND fixed to
+    exactly that literal string, so any rename of `collection_name` (including the
+    collision-proofing fix that now HASHES ``org``+``workspace`` together instead of embedding
+    them raw) silently broke this test. `user`/`session` don't affect the collection name at all
+    (only `org`/`workspace`/`visibility`/`dim` do — see `collection_name`'s docstring), so any
+    valid placeholder values are fine here.
+    """
+    ns = Namespace(
+        org=settings.default_namespace,
+        workspace=settings.default_workspace,
+        user=settings.default_user,
+        session="_mtm_collection_probe",
+        visibility=Visibility.PRIVATE,
+    )
+    return collection_name(ns, _EMBED_DIM)
 
 
 async def _mtm_point_present(settings: ClientSettings, memory_id: str) -> tuple[bool, str]:
