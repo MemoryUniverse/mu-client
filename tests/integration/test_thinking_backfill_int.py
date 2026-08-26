@@ -208,17 +208,40 @@ async def _stm_contents(settings: ClientSettings) -> list[str]:
     return contents
 
 
+#: The local embedder's dimension (`all-MiniLM-L6-v2`), part of the physical collection
+#: name. Same constant `test_precompact_promote_int.py` uses for the same reason.
+_EMBED_DIM = 384
+
+
 async def _mtm_point_count(settings: ClientSettings, uid: str) -> int:
-    """DIRECT qdrant (MTM) read: count points across this run's promoted collections."""
+    """DIRECT qdrant (MTM) read: count this run's points via the REAL mapper.
+
+    This used to sweep every collection and match ``uid in coll.name``. That heuristic died with
+    the collision-resistant naming (mu-core `6679390`): the physical name is now
+    ``mu_mtm__{sha256(org:workspace)[:16]}__{visibility}__{dim}``, so no η component appears in it
+    and the sweep matched nothing — the test then failed as *"the decision did not promote
+    STM->MTM"*, blaming the importance gate for a naming change. Calling `collection_name` means
+    the next rename cannot silently turn this into a false negative.
+    """
+    from mu_contracts.domain.model.memory import Namespace, Visibility
+    from mu_engine.storage.mappers.qdrant_mapper import collection_name
+
+    ns = Namespace(
+        org=settings.default_namespace,
+        workspace=settings.default_workspace,
+        user=settings.default_user,
+        session=_SESSION,
+        visibility=Visibility.PRIVATE,
+    )
+    name = collection_name(ns, _EMBED_DIM)
     qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    total = 0
     try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name:
-                total += (await qdrant.count(coll.name, exact=True)).count
+        existing = {c.name for c in (await qdrant.get_collections()).collections}
+        if name not in existing:
+            return 0
+        return (await qdrant.count(name, exact=True)).count
     finally:
         await qdrant.close()
-    return total
 
 
 async def test_thinking_decision_lands_attributed_and_noise_filtered(
