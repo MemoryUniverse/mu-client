@@ -10,29 +10,33 @@ Part of [Memory Universe](https://github.com/MemoryUniverse).
 your Claude Code and Codex sessions, keeps it on your own machine by default, and hands relevant
 context back to your agent without you asking for it.
 
-> **Status: early, under active development (private beta in progress).** The daemonless CLI,
-> Claude Code hook capture, the durable outbox, the daemon, and recall injection are built and used
-> daily against real sessions. Codex support is landing next; see [Built vs.
-> designed](#built-vs-designed-read-this-before-you-evaluate-it). Live shared rooms and
-> cross-vendor governed sharing are designed, not shipped, and depend on the not-yet-public
-> `mu-server`.
+> **Status: early, under active development.** The daemonless CLI, Claude Code hook capture, Codex
+> capture (both channels), the durable outbox, the daemon, recall injection, and the MCP tool
+> surface are built and used daily against real sessions. See [Built vs.
+> designed](#built-vs-designed-read-this-before-you-evaluate-it). Live shared rooms and cross-vendor
+> governed sharing are designed, not shipped, and depend on the not-yet-public `mu-server`. A
+> private beta has **not started** — design partners are being recruited for one.
 
 ## The vision
 
-Memory Universe is a persistent, governed context layer for teams of people *and* their AI agents.
-Context survives the handoff across sessions, teammates, machines, and agent vendors, and
-travels only as far as it was authorized to. `mu-client` is the piece of that vision that runs
-entirely on your machine: it is what actually watches your agent sessions, decides what's worth
-remembering, and feeds it back, with nothing leaving your device unless you explicitly share it.
+Memory Universe is the persistent collaborative session and memory layer for teams of people *and*
+their AI agents — across users, devices, agents, and vendors. Context survives the handoff between
+sessions, teammates, machines and vendors, and travels only as far as it was authorized to.
+`mu-client` is the piece of that vision that runs entirely on your machine: it is what actually
+watches your agent sessions, decides what's worth remembering, and feeds it back, with nothing
+leaving your device unless you explicitly share it.
 
 ## What's in this repo
 
 `mu-client` is a Python daemon + CLI, depending only on `mu-core` (never on any server code):
 
-- **Capture**: hook-based auto-capture from Claude Code's hook fleet (`UserPromptSubmit`,
-  `PostToolUse`, `SubagentStop`, `Stop`, `SessionStart`/`SessionEnd`, `PreCompact`), mapped into a
-  normalized activity model. Capture never blocks or fails your agent's turn; on any outage it
-  spools to disk and always exits cleanly.
+- **Capture, two hosts**: hook-based auto-capture from Claude Code's hook fleet
+  (`UserPromptSubmit`, `PostToolUse`, `SubagentStop`, `Stop`, `SessionStart`/`SessionEnd`,
+  `PreCompact`), plus Codex on both of *its* real channels — a tailer over
+  `~/.codex/sessions/**/rollout-*.jsonl` and a parser for the `agent-turn-complete` notify envelope
+  (both verified empirically against codex-cli 0.146.0) — all mapped into one normalized activity
+  model. Capture never blocks or fails your agent's turn; on any outage it spools to disk and always
+  exits cleanly.
 - **Durable outbox**: a real WAL-mode SQLite outbox (`synchronous=FULL`, fsync-before-ack,
   idempotent redelivery) sits between "the hook fired" and "the memory engine ingested it," so a
   daemon crash mid-flight never silently loses or duplicates an activity.
@@ -42,9 +46,14 @@ remembering, and feeds it back, with nothing leaving your device unless you expl
 - **The local engine**: `mu-client` runs `mu-engine` (from `mu-core`) directly, so a laptop with no
   server anywhere is a complete memory system: capture, all three tiers, promotion/demotion,
   conflict handling, recall.
-- **The `mu` CLI**: `add` / `recall` / `search` (daemonless, one-shot), `capture-once` (the hook
-  entrypoint), `flush` (drain the spool/outbox with no daemon running), and `daemon run` (the
-  resident daemon, graceful shutdown on SIGINT/SIGTERM).
+- **The `mu` CLI**: `add` / `recall` / `search` (daemonless, one-shot), `health`, `pin` / `unpin`,
+  `capture-once` (the hook entrypoint), `backfill-thinking` / `backfill-codex`, `flush` (drain the
+  spool/outbox with no daemon running), `daemon run` (the resident daemon, graceful shutdown on
+  SIGINT/SIGTERM), and `install` / `uninstall` for `claude-code` and `codex` — the installers write
+  their host config non-clobberingly.
+- **An MCP server**: 14 tools over the same engine — `add`, `recall`, `get`, `consolidate`,
+  `search`, `build_context`, `ask`, `promote`, `demote`, `update`, `delete`, `health`, `pin`,
+  `unpin` — so any MCP-speaking host can drive the memory directly.
 
 ## Quickstart
 
@@ -53,6 +62,18 @@ git clone https://github.com/MemoryUniverse/mu-client
 cd mu-client
 uv sync --extra dev
 ```
+
+**One prerequisite, stated up front:** the engine binds real stores — a Redis/Valkey-compatible KV
+floor for STM, Qdrant for MTM, FalkorDB for LTM. `mu-client` ships no compose file of its own, so
+either point it at stores you already run (`MU_STORAGE__*` env vars, or
+`~/.memory-universe/config.env`, which the installers write) or borrow `mu-core`'s dev stack:
+
+```bash
+docker compose -f ../mu-core/docker-compose.dev.yml up -d
+```
+
+Without them the first command below fails with a connection error rather than a helpful one — no
+account or network call is involved, but the three containers are not optional.
 
 Try it daemonless: no daemon, no socket, just the engine:
 
@@ -73,8 +94,10 @@ Wire it into Claude Code by pointing a hook at `scripts/hooks/mu_capture_once.sh
 `mu capture-once --host claude_code`; nothing is capture-and-guess, and an unrecognized hook shape
 fails loud rather than silently mis-mapping.
 
-Codex support is being built the same way; today Codex sessions can use the daemonless `mu add`/
-`mu recall` commands directly, with hook-based auto-capture for Codex as the next milestone.
+Codex is wired the same way: `uv run mu install codex` writes the `notify` program and the
+`[mcp_servers.memory-universe]` block into `~/.codex/config.toml` without clobbering what is already
+there, and `mu backfill-codex` replays existing rollout files. Codex sessions can also use the
+daemonless `mu add` / `mu recall` commands directly.
 
 ## Architecture, in one paragraph
 
@@ -115,9 +138,10 @@ flowchart LR
     Ctx --> Host
 ```
 
-A tiny Go hook-client is registered into the host's lifecycle hooks; on every event it either hits
-a fast local IPC path to a running daemon or falls back to a direct, fsync'd SQLite-WAL append.
-Capture is never gated on the daemon being up. The daemon itself is one Python process running an
+A tiny shell shim (`scripts/hooks/mu_capture_once.sh`) is registered into the host's lifecycle
+hooks; it resolves `mu`, pipes the event on stdin into `mu capture-once`, and always exits 0. From
+there the event either takes a fast local IPC path to a running daemon or falls back to a direct,
+fsync'd SQLite-WAL append. Capture is never gated on the daemon being up. The daemon itself is one Python process running an
 `asyncio.TaskGroup` that owns the engine, the outbox worker pool, and a Unix-socket IPC server, with
 ordered shutdown (stop inbound → drain outbox → release the engine, never the reverse). Captured
 activity flows outbox → ingest → `mu-engine`'s STM/MTM/LTM tiers exactly as it would through
@@ -127,12 +151,12 @@ Everything above is local-first by construction.
 
 ## Built vs. designed: read this before you evaluate it
 
-- **Built and dogfooded today:** the daemonless CLI, Claude Code hook capture (full hook fleet), the
-  durable outbox, the resident daemon, recall injection, and local small-model (SLM) wiring for
-  extraction and synthesis, exercised against real, live Claude Code sessions, not synthetic
-  fixtures.
-- **In progress:** Codex hook-based auto-capture (Codex sessions work today via the CLI; native hook
-  wiring is the near-term next step), and Claude Desktop support.
+- **Built and dogfooded today:** the daemonless CLI, Claude Code hook capture (full hook fleet),
+  Codex capture on both channels plus its installer, the durable outbox, the resident daemon, recall
+  injection, memory health, pin/unpin, the 14-tool MCP surface, and local small-model (SLM) wiring
+  for extraction and synthesis — exercised against real, live Claude Code and Codex sessions, not
+  synthetic fixtures.
+- **In progress:** Claude Desktop support, and broadening the set of hosts beyond the two above.
 - **Designed, not shipped, depends on `mu-server` (not yet public):** a member binding their own
   Claude Code or Codex instance into a *shared, multi-human room* as a governed first-class
   participant under its own identity, and any form of cross-device sync. None of that exists in this
@@ -144,10 +168,10 @@ Part of **Memory Universe**: [github.com/MemoryUniverse](https://github.com/Memo
 
 | Repo | Role |
 |---|---|
-| [`mu-core`](https://github.com/MemoryUniverse/mu-core) | The open engine `mu-client` runs on-device: contracts, engine, local facade |
+| [`mu-core`](https://github.com/MemoryUniverse/mu-core) | The open engine `mu-client` runs on-device: contracts, engine, local facade, reference HTTP server |
 | **mu-client** (this repo) | The on-device daemon: hook capture, injection, CLI |
-| [`mu-sdk-python`](https://github.com/MemoryUniverse/mu-sdk-python) | Python developer SDK: for building your own tools on Memory Universe |
-| [`mu-sdk-js`](https://github.com/MemoryUniverse/mu-sdk-js) | JavaScript/TypeScript developer SDK, parity with the Python SDK |
+| [`mu-sdk-python`](https://github.com/MemoryUniverse/mu-sdk-python) | Python developer SDK: typed wire client, plus an in-process embedded mode |
+| [`mu-sdk-js`](https://github.com/MemoryUniverse/mu-sdk-js) | JavaScript/TypeScript developer SDK, wire-parity with the Python SDK |
 | `mu-server` (private) | The hosted, governed, multi-tenant plane: the commercial part |
 
 ## License
@@ -170,5 +194,6 @@ show, just daily-driven code and an open build-in-public process.
 ## Links
 
 - Organization: [github.com/MemoryUniverse](https://github.com/MemoryUniverse)
+- How it works, in six diagrams: [Memory Universe Mechanics](https://claude.ai/code/artifact/4127edfb-bd56-462b-9cb5-2f5d3ea4e3c4)
 - Issues / discussion: use this repo's GitHub Issues
 - License: [Apache-2.0](./LICENSE)
