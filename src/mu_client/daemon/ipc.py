@@ -40,10 +40,12 @@ SAME ``SO_PEERCRED`` check as every other route — no second protocol, no new a
 spec's "per-daemon token" belongs to the loopback-HTTP variant this daemon does not implement;
 peer-uid is the stronger check on a unix socket).
 
-``health``/``pin`` are optional exactly as ``lifecycle_manager`` is, and for a harder reason: both
-``mu_engine`` services require a ``MemoryRepository`` façade **mu-core does not yet implement**
-(see :mod:`mu_client.memory_health` for the citation). Until a composition root can hand one in,
-these routes answer a named, content-free 503 — never a raise, never a fabricated view.
+``health``/``pin`` are optional exactly as ``lifecycle_manager`` is. mu-core now implements the
+``MemoryRepository`` façade and ``LocalContainer`` builds both services, so the daemon hands them
+in (``daemon/app.py``) and these routes serve real answers. They stay optional because a vector
+backend with no partition-walk primitive (pgvector/chroma/faiss) makes the container build
+NEITHER service — on such a binding the routes answer a named, content-free 503, never a raise and
+never a fabricated view (see :mod:`mu_client.memory_health`).
 
 ⚠ ``health`` is NOT ``healthz``. ``healthz`` is daemon liveness (outbox depth / dead letters);
 ``health`` is the user's memory-health lens. Exact-match dispatch keeps them apart functionally;
@@ -71,12 +73,14 @@ from mu_client.errors import CaptureSchemaDriftError
 from mu_client.inject.recall_bridge import RecallInjectBridge
 from mu_client.memory_health import (
     HEALTH_ROUTE,
+    HEALTH_SURFACE_ERRORS,
     HEALTH_UNWIRED,
     PIN_ROUTE,
     PIN_SURFACE_ERRORS,
     PIN_UNWIRED,
     UNKNOWN_HEALTH_FLAG,
     UNPIN_ROUTE,
+    health_failure_response,
     local_scope,
     malformed_request_response,
     namespace_on_the_wire,
@@ -318,12 +322,22 @@ class IpcServer:
         except (TypeError, ValueError):
             return {"status": 422, "error": UNKNOWN_HEALTH_FLAG}
         cursor = request.get("cursor")
-        view = await self._health.assess(
-            local_scope(ns),
-            ns,
-            filter_flags=flags,
-            cursor=str(cursor) if cursor is not None else None,
-        )
+        try:
+            view = await self._health.assess(
+                local_scope(ns),
+                ns,
+                filter_flags=flags,
+                cursor=str(cursor) if cursor is not None else None,
+            )
+        except HEALTH_SURFACE_ERRORS as exc:
+            # NOT a bare catch (DEV-STANDARDS rule 8): three NAMED conditions this read can
+            # genuinely reach and which were previously uncaught here — a tier store down past
+            # the service's one modelled degrade (503), a bound backend that can never walk a
+            # partition (501), and a replayed/malformed ``cursor`` (404-shaped, non-enumerating).
+            # Uncaught, each of them closed the connection with NO reply, which this module's own
+            # docstring calls indistinguishable from success on the wire. Anything outside the
+            # tuple is a real bug and still propagates loud.
+            return health_failure_response(exc)
         return {"status": 200, **view.model_dump(mode="json")}
 
     async def _route_pin(self, request: dict[str, Any]) -> dict[str, Any]:
