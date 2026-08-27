@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 from mu_contracts.config.settings import StorageSettings as CoreStorageSettings
 
-from mu_client.config import ClientSettings, ModelProfileSettings
+from mu_client.config import (
+    MU_ENV_FILE_VAR,
+    ClientSettings,
+    ModelProfileSettings,
+    render_endpoint_env,
+    resolve_env_files,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -72,3 +78,125 @@ def test_nested_subtree_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = ClientSettings()
     assert settings.outbox.batch_size == 128
     assert settings.inject.top_k == 3
+
+
+# ── gap A: CWD-independent env-file resolution ────────────────────────────────────────────────
+
+
+def test_resolve_env_files_order_is_ascending_precedence(tmp_path: Path) -> None:
+    """The fixed user-config comes FIRST (lowest priority among files) and the cwd's ``.env``/
+    ``.env.test`` LAST (highest), matching pydantic-settings' last-file-wins tuple semantics."""
+    user_cfg = tmp_path / "config.env"
+    cwd = tmp_path / "proj"
+    files = resolve_env_files(cwd=cwd, environ={}, user_config=user_cfg)
+    assert files == (user_cfg, cwd / ".env", cwd / ".env.test")
+
+
+def test_resolve_env_files_inserts_explicit_mu_env_file(tmp_path: Path) -> None:
+    explicit = tmp_path / "abs" / "endpoints.env"
+    cwd = tmp_path / "proj"
+    files = resolve_env_files(
+        cwd=cwd, environ={MU_ENV_FILE_VAR: str(explicit)}, user_config=tmp_path / "config.env"
+    )
+    # explicit override sits between the fixed user-config and the cwd dev files
+    assert files == (tmp_path / "config.env", explicit, cwd / ".env", cwd / ".env.test")
+
+
+def test_fixed_path_endpoints_reach_storage_regardless_of_cwd(tmp_path: Path) -> None:
+    """The core gap-A proof, at unit scope: with NO cwd ``.env`` at all, an absolute fixed-path
+    config file still populates the store endpoints — so a ``mu-mcp`` spawned from an arbitrary
+    directory does NOT fall back to the in-container defaults (:6379/:6333)."""
+    fixed = tmp_path / "config.env"
+    fixed.write_text(
+        "MU_STORAGE__CACHE__HOST=127.0.0.1\n"
+        "MU_STORAGE__CACHE__PORT=16379\n"
+        "MU_STORAGE__VECTOR__HOST=127.0.0.1\n"
+        "MU_STORAGE__VECTOR__HTTP_PORT=16333\n"
+        "MU_STORAGE__GRAPH__PORT=16380\n",
+        encoding="utf-8",
+    )
+    empty_cwd = tmp_path / "arbitrary_project"  # no .env / .env.test here
+    files = resolve_env_files(cwd=empty_cwd, environ={}, user_config=fixed)
+
+    settings = ClientSettings(_env_file=files)  # type: ignore[call-arg]
+
+    assert settings.storage.cache.port == 16379  # NOT the 6379 in-container default
+    assert settings.storage.vector.http_port == 16333  # NOT 6333
+    assert settings.storage.graph.port == 16380
+    assert settings.storage.cache.host == "127.0.0.1"
+
+
+def test_os_env_var_beats_the_fixed_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The installer-written MCP ``env`` block is a real OS env var — it must win over any file, so
+    the registered server's endpoints are authoritative."""
+    fixed = tmp_path / "config.env"
+    fixed.write_text("MU_STORAGE__CACHE__PORT=16379\n", encoding="utf-8")
+    monkeypatch.setenv("MU_STORAGE__CACHE__PORT", "26379")
+    files = resolve_env_files(cwd=tmp_path / "x", environ={}, user_config=fixed)
+
+    settings = ClientSettings(_env_file=files)  # type: ignore[call-arg]
+
+    assert settings.storage.cache.port == 26379  # OS env wins over the fixed file
+
+
+def test_render_endpoint_env_flattens_resolved_endpoints() -> None:
+    """The self-contained MCP ``env`` block: resolved endpoints flattened back to MU_* vars."""
+    settings = ClientSettings(model=None)
+    env = render_endpoint_env(settings)
+
+    assert env["MU_RUNTIME_MODE"] == "local"
+    # a representative endpoint from each private-plane store role is present + stringified
+    assert env["MU_STORAGE__CACHE__HOST"] == settings.storage.cache.host
+    assert env["MU_STORAGE__CACHE__PORT"] == str(settings.storage.cache.port)
+    assert env["MU_STORAGE__VECTOR__HTTP_PORT"] == str(settings.storage.vector.http_port)
+    assert env["MU_STORAGE__GRAPH__PORT"] == str(settings.storage.graph.port)
+    assert all(isinstance(v, str) for v in env.values())  # a valid env block is all-strings
+
+
+def test_render_endpoint_env_includes_model_profile_when_present() -> None:
+    settings = ClientSettings()  # default model profile (mu-dev-slm)
+    env = render_endpoint_env(settings)
+    assert env["MU_MODEL_PROFILE__PROVIDER"] == "openai"
+    assert env["MU_MODEL_PROFILE__BASE_URL"] == "http://127.0.0.1:11435/v1"
+    assert env["MU_MODEL_PROFILE__MODEL_NAME"] == "qwen2.5:0.5b"
+
+
+def test_render_endpoint_env_never_emits_the_engine_owned_mu_model_prefix() -> None:
+    """REGRESSION (live-reproduced, the whole MCP surface was dead on arrival).
+
+    ``MU_MODEL__*`` belongs to the ENGINE's ``EngineSettings.model``
+    (``mu_engine.providers.settings.ModelSettings``, ``extra="forbid"``), whose fields are per-task
+    model-GROUP names — a different shape entirely from this client-side endpoint profile. When
+    ``render_endpoint_env`` emitted the client profile under ``MU_MODEL__``, every ``.mcp.json`` /
+    codex ``config.toml`` the installer generated started a ``mu-mcp`` process that died at
+    startup with ``ValidationError: 3 validation errors for EngineSettings ... extra_forbidden``
+    on ``base_url``/``model_name``/``api_key`` — and ``MU_MODEL__PROVIDER``, being a REAL
+    ``ModelSettings`` field, silently repointed the engine's provider registry key instead of
+    failing loudly. Nothing this function emits may ever land in that namespace again.
+    """
+    env = render_endpoint_env(ClientSettings())
+    colliding = [k for k in env if k.startswith("MU_MODEL__")]
+    assert colliding == [], (
+        "render_endpoint_env emitted engine-owned MU_MODEL__* keys — a generated MCP config with "
+        f"these will crash mu-mcp at EngineSettings construction: {colliding}"
+    )
+
+
+def test_roundtrip_endpoint_env_reconstructs_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full loop: custom endpoints -> render_endpoint_env -> feed back as OS env -> identical
+    resolved endpoints. Proves the MCP ``env`` block is a faithful, self-contained carrier."""
+    monkeypatch.setenv("MU_STORAGE__CACHE__PORT", "17000")
+    monkeypatch.setenv("MU_STORAGE__VECTOR__HTTP_PORT", "17001")
+    source = ClientSettings(model=None)
+    env = render_endpoint_env(source)
+
+    monkeypatch.delenv("MU_STORAGE__CACHE__PORT")
+    monkeypatch.delenv("MU_STORAGE__VECTOR__HTTP_PORT")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    rebuilt = ClientSettings(_env_file=(tmp_path / "none.env",), model=None)  # type: ignore[call-arg]
+
+    assert rebuilt.storage.cache.port == 17000
+    assert rebuilt.storage.vector.http_port == 17001

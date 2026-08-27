@@ -16,9 +16,9 @@ __all__ = ["ActivityKind", "CaptureCheckpoint", "HostKind", "RawActivity"]
 
 
 class HostKind(StrEnum):
-    """capture-spec.md §4.1. Only ``CLAUDE_CODE`` has a live parser this stage (REVIEW-CHECKLIST /
-    MVP-BUILD-PLAN scope); ``CODEX``/``CLAUDE_DESKTOP`` are named so the closed enum does not need
-    a breaking change when their parsers land."""
+    """capture-spec.md §4.1. ``CLAUDE_CODE`` (hook envelope + transcript tailer) and ``CODEX``
+    (rollout tailer + ``notify`` envelope parser, Phase 4) have live parsers; ``CLAUDE_DESKTOP`` is
+    named so the closed enum does not need a breaking change when its parser lands."""
 
     CLAUDE_CODE = "claude_code"
     CODEX = "codex"
@@ -70,6 +70,15 @@ class RawActivity(BaseModel, frozen=True):
     content_hash: str | None = None  # sha256(text); None when text is None
     source_offset: str | None = None  # hook event_id / tailer byte offset (resume + dedupe)
     provenance_id: str = Field(min_length=1)  # "prov_"+sha256(host|session|source_offset|kind)[:24]
+    # Per-candidate importance in [0,1], threaded straight to the engine's ONE promotion gate
+    # (``DeterministicPromoteStage``: ``importance >= IngestSettings.importance_promote`` — default
+    # 0.6). ``None`` = "capture expressed no opinion" → ``LocalMemory.add`` falls back to
+    # ``IngestActivity.importance``'s own field default. The hook parser leaves this None (a hook
+    # event carries no salience signal); the reasoning tailers (§6) SET it so a strong decision
+    # promotes to MTM while a weaker finding stays STM-only — reusing the engine's gate, NOT a
+    # second one (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §6 "reuse the importance gate"). Additive,
+    # optional, default-None: pre-existing outbox rows deserialize unchanged.
+    importance: float | None = Field(default=None, ge=0.0, le=1.0)
     payload: dict[str, str | int | bool | None] = Field(default_factory=dict)
 
 

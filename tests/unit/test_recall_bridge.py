@@ -6,8 +6,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from mu_contracts.contracts.recall import RecallItemView
 from mu_contracts.domain.errors import StoreUnavailableError
-from mu_local.views import MemoryListView, MemoryRecordView
+from mu_contracts.domain.model.memory import Tier
+from mu_local.views import MemoryListView
 
 from mu_client.config import InjectSettings
 from mu_client.host import LocalMemoryHost
@@ -19,7 +21,9 @@ pytestmark = pytest.mark.unit
 def _listing(*contents: str) -> MemoryListView:
     return MemoryListView(
         items=[
-            MemoryRecordView(memory_id=f"m{i}", content=c, tier="stm", channel="stm", score=1.0)
+            RecallItemView(
+                memory_id=f"m{i}", content=c, tier=Tier.STM, channel="stm", fused_score=1.0
+            )
             for i, c in enumerate(contents)
         ]
     )
@@ -75,11 +79,39 @@ async def test_cold_when_engine_down_and_never_rendered_before(
     assert rendered.body == ""
 
 
+async def test_render_drops_tool_noise_keeps_facts(started_host: LocalMemoryHost) -> None:
+    # Gap D: a mixed listing — 2 human facts + a Write tool-capture + a Bash-output line. The
+    # rendered inject body KEEPS the facts and DROPS the tool noise.
+    started_host._memory.recall.return_value = _listing(  # type: ignore[union-attr]
+        "My deploy target is staging-eu",
+        'Write: {"file_path": "/app/main.py", "content": "print(1)"}',
+        "The on-call engineer is Ada",
+        "Bash: total 48\ndrwxr-xr-x 2 user user 4096 main.py",
+    )
+    bridge = RecallInjectBridge(started_host, settings=InjectSettings())
+    rendered = await bridge.render("s1")
+    assert "My deploy target is staging-eu" in rendered.body
+    assert "The on-call engineer is Ada" in rendered.body
+    assert "Write:" not in rendered.body and "Bash:" not in rendered.body
+
+
+async def test_render_dedupes_repeated_content(started_host: LocalMemoryHost) -> None:
+    started_host._memory.recall.return_value = _listing(  # type: ignore[union-attr]
+        "Ada lives in Paris", "Ada lives in Paris", "Ada lives in Paris"
+    )
+    bridge = RecallInjectBridge(started_host, settings=InjectSettings())
+    rendered = await bridge.render("s1")
+    assert rendered.body.count("Ada lives in Paris") == 1
+
+
 async def test_over_budget_spills_to_file_never_silently_truncated(
     started_host: LocalMemoryHost, tmp_path: Path
 ) -> None:
-    huge = "x" * 200
-    started_host._memory.recall.return_value = _listing(*(huge for _ in range(100)))  # type: ignore[union-attr]
+    # Distinct facts (dedup would otherwise collapse identical lines) — each a genuine,
+    # non-noise memory, so the budget spill path is what is exercised, not the distiller.
+    started_host._memory.recall.return_value = _listing(  # type: ignore[union-attr]
+        *(f"distinct salient fact number {i} " + "x" * 200 for i in range(100))
+    )
     settings = InjectSettings(body_budget_chars=500)
     bridge = RecallInjectBridge(started_host, settings=settings, recall_dir=tmp_path / "recall")
     rendered = await bridge.render("s1")

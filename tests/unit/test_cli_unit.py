@@ -7,7 +7,9 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
-from mu_local.views import MemoryListView, MemoryRecordView, MemoryWriteResult
+from mu_contracts.contracts.recall import RecallItemView
+from mu_contracts.domain.model.memory import Tier
+from mu_local.views import MemoryListView, MemoryWriteResult
 
 from mu_client import cli
 
@@ -54,7 +56,32 @@ async def test_run_add_calls_host_add_and_renders_result(monkeypatch: pytest.Mon
     monkeypatch.setattr(cli, "daemonless_host", lambda *a, **kw: _FakeCtx())
     code = await cli._run(["add", "Ada lives in Paris"])
     assert code == 0
-    fake_host.add.assert_awaited_once_with("Ada lives in Paris", user=None, session=None)
+    # ``importance_score`` is the new ``--importance`` lever (Phase 3): omitting the flag threads
+    # ``None`` (engine default applies), so the default add is byte-for-byte its prior behaviour.
+    fake_host.add.assert_awaited_once_with(
+        "Ada lives in Paris", user=None, session=None, importance_score=None
+    )
+
+
+async def test_run_add_threads_importance_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_host = AsyncMock()
+    fake_host.add.return_value = MemoryWriteResult(
+        memory_id="m1", content_hash="deadbeef", promoted=True, tiers_written=("stm", "mtm")
+    )
+
+    class _FakeCtx:
+        async def __aenter__(self) -> AsyncMock:
+            return fake_host
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "daemonless_host", lambda *a, **kw: _FakeCtx())
+    code = await cli._run(["add", "Ada lives in Paris", "--importance", "0.9"])
+    assert code == 0
+    fake_host.add.assert_awaited_once_with(
+        "Ada lives in Paris", user=None, session=None, importance_score=0.9
+    )
 
 
 async def test_run_recall_calls_host_recall_and_renders_result(
@@ -63,8 +90,12 @@ async def test_run_recall_calls_host_recall_and_renders_result(
     fake_host = AsyncMock()
     fake_host.recall.return_value = MemoryListView(
         items=[
-            MemoryRecordView(
-                memory_id="m1", content="Ada lives in Paris", tier="mtm", channel="mtm", score=0.9
+            RecallItemView(
+                memory_id="m1",
+                content="Ada lives in Paris",
+                tier=Tier.MTM,
+                channel="mtm",
+                fused_score=0.9,
             )
         ]
     )

@@ -23,12 +23,17 @@ from typing import TYPE_CHECKING
 
 import structlog
 from mu_contracts.config.settings import RuntimeMode, Settings
+from mu_contracts.contracts.recall import RecallResult
+from mu_contracts.contracts.views import MemoryWriteResult
+from mu_contracts.ports.bus import EventBusPort
+from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
+from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
+from mu_contracts.ports.time import Clock
 from mu_engine.platform.observability import build_metrics, build_tracer
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_local.config import ModelProfileSettings as LocalModelProfileSettings
 from mu_local.config import StorageSettings as LocalBackendSettings
 from mu_local.local_memory import LocalMemory
-from mu_local.views import MemoryListView, MemoryWriteResult
 
 from mu_client.config import ClientSettings, get_client_settings
 from mu_client.decorators import observed
@@ -36,6 +41,9 @@ from mu_client.errors import ClientNotStartedError
 
 if TYPE_CHECKING:
     from mu_contracts.ports.observability import MetricSink, Tracer
+    from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
+    from mu_engine.services.health.service import MemoryHealthService
+    from mu_engine.services.pin.service import PinService
 
 __all__ = ["LocalMemoryHost", "daemonless_host"]
 
@@ -144,6 +152,50 @@ class LocalMemoryHost:
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
+    # --------------------------------------------------------------- lifecycle (integrate-phase)
+    @property
+    def bus(self) -> EventBusPort:
+        """The REAL ``InprocBus`` the owned ``LocalMemory``'s ingest/distill publish onto
+        (``mu_local.local_memory.LocalMemory.bus`` -> ``LocalContainer.bus``) — the daemon's
+        ``MaintenanceLoop`` (S1-07) subscribes HERE, never to a second, independently-constructed
+        bus that would never see a real ``MemoryCaptured``/``MemoryPromoted`` event."""
+        return self._require_memory().bus
+
+    @property
+    def health(self) -> MemoryHealthService | None:
+        """The owned ``LocalMemory``'s memory-health lens (``LocalMemory.health`` ->
+        ``LocalContainer.health``), or ``None`` when the bound vector backend cannot walk a
+        partition. Passed straight into ``IpcServer(health=...)`` and the MCP engine holder —
+        this host NEVER constructs one, exactly as it never constructs a bus."""
+        return self._require_memory().health
+
+    @property
+    def pin(self) -> PinService | None:
+        """The owned ``LocalMemory``'s pin service (``LocalMemory.pin`` ->
+        ``LocalContainer.pin``), or ``None`` when the binding cannot apply an id-stable pin
+        upsert or cannot count the partition's pin bound. Same passthrough discipline as
+        :attr:`health`."""
+        return self._require_memory().pin
+
+    def build_lifecycle_manager(
+        self,
+        *,
+        lease: LifecycleLeasePort | None = None,
+        runner: LifecycleWorkflowRunnerPort | None = None,
+        clock: Clock | None = None,
+        warm_cache: WarmRecallCacheServicePort | None = None,
+    ) -> MemoryLifecycleManager:
+        """Passthrough to ``LocalMemory.build_lifecycle_manager`` — constructs the real
+        :class:`~mu_engine.lifecycle.manager.MemoryLifecycleManager` over THIS host's own
+        ``LocalMemory`` (same stores/distill/bus). ``lease``/``runner`` let the daemon thread its
+        real ``SqliteWalLeaseAdapter``/``SqliteWalRunner`` (S1-06) through this ONE composition
+        root instead of building a second engine graph; ``warm_cache`` likewise threads the
+        daemon's real ``RecallInjectBridge`` (S3-02) through instead of building a second
+        warm-cache service."""
+        return self._require_memory().build_lifecycle_manager(
+            lease=lease, runner=runner, clock=clock, warm_cache=warm_cache
+        )
+
     # ------------------------------------------------------------------------------- verb proxies
     # Thin, observed delegations to the owned LocalMemory — the surface both the CLI (cli.py) and a
     # programmatic caller drive. Kept explicit (not a dynamic __getattr__ proxy) so mypy --strict
@@ -155,9 +207,26 @@ class LocalMemoryHost:
         *,
         user: str | None = None,
         session: str | None = None,
+        importance_score: float | None = None,
+        agent_type: str | None = None,
     ) -> MemoryWriteResult:
+        # ``importance_score`` threads straight to ``LocalMemory.add`` → the engine's ONE promotion
+        # gate (``DeterministicPromoteStage``: ``importance >= IngestSettings.importance_promote``).
+        # ``None`` (every existing caller) leaves add()'s own default untouched — byte-for-byte the
+        # prior behaviour; the Phase 0B reasoning tailer (capture/claude_tailer.py) is the first
+        # caller to set it, so a strong decision promotes STM→MTM while a weaker finding stays STM.
+        #
+        # ``agent_type`` (Phase 1.5, AGENT-INTEGRATION-AUDIT-AND-PLAN.md §6): a SUBAGENT attribution
+        # routed to ``LocalMemory.add`` so the subagent's memory lands in its own agent-scoped
+        # partition (agent.py). ``None`` (every human/top-level caller) ⇒ unchanged partition.
         memory = self._require_memory()
-        return await memory.add(content, user=user or self._settings.default_user, session=session)
+        return await memory.add(
+            content,
+            user=user or self._settings.default_user,
+            session=session,
+            importance_score=importance_score,
+            agent_type=agent_type,
+        )
 
     @observed("client.recall")
     async def recall(
@@ -168,7 +237,7 @@ class LocalMemoryHost:
         session: str | None = None,
         tier: MemoryTier | None = None,
         limit: int = 10,
-    ) -> MemoryListView:
+    ) -> RecallResult:
         memory = self._require_memory()
         return await memory.recall(
             query,
@@ -187,7 +256,7 @@ class LocalMemoryHost:
         session: str | None = None,
         tier: MemoryTier | None = None,
         limit: int = 10,
-    ) -> MemoryListView:
+    ) -> RecallResult:
         """mem0 muscle-memory alias for :meth:`recall` (mirrors ``LocalMemory.search``)."""
         return await self.recall(query, user=user, session=session, tier=tier, limit=limit)
 

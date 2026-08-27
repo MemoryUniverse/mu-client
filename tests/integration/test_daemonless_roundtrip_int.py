@@ -39,6 +39,14 @@ pytestmark = pytest.mark.integration
 _USER = "u1"
 _SESSION = "s1"
 _FACT = "Ada lives in Paris and works at Acme"
+# ``LocalMemory.add`` correctly NO LONGER hardcodes ``promote=True`` (the A6 fix): STM->MTM
+# promotion is now GATED on ``importance >= IngestSettings.importance_promote`` (0.6), and add()'s
+# own default importance is 0.5 — so a bare ``add(_FACT)`` lands STM-only (``promoted=False``),
+# which is the CORRECT gated contract, not a bug (the fact is still durably in STM). This test
+# exercises the MTM round-trip (it asserts ``promoted`` and ``"mtm" in tiers_written``), so it
+# must supply a SALIENT importance to earn the promotion — driving the real gate above threshold
+# rather than weakening the (still load-bearing) ``promoted`` assertion.
+_SALIENT_IMPORTANCE = 0.9
 
 
 @pytest_asyncio.fixture
@@ -101,9 +109,13 @@ async def _eventually(read: Callable[[], Awaitable[MemoryListView]]) -> MemoryLi
 async def test_daemonless_add_then_recall_and_search_round_trip_real_data(
     isolated_settings: ClientSettings,
 ) -> None:
-    # (1) WRITE — the daemonless one-shot path: construct, add, tear down.
+    # (1) WRITE — the daemonless one-shot path: construct, add, tear down. Supply a salient
+    #     importance so the real DeterministicPromoteStage gate promotes STM->MTM (see
+    #     _SALIENT_IMPORTANCE rationale) — the assertion below still fully checks that it did.
     async with daemonless_host(isolated_settings) as host:
-        write = await host.add(_FACT, user=_USER, session=_SESSION)
+        write = await host.add(
+            _FACT, user=_USER, session=_SESSION, importance_score=_SALIENT_IMPORTANCE
+        )
     print(  # noqa: T201 — required evidence: PRINT the stored data
         f"STORED  memory_id={write.memory_id} content_hash={write.content_hash} "
         f"promoted={write.promoted} tiers_written={write.tiers_written}"
@@ -121,7 +133,7 @@ async def test_daemonless_add_then_recall_and_search_round_trip_real_data(
         print(  # noqa: T201 — required evidence: PRINT the recalled data
             "RECALLED "
             + "; ".join(
-                f"{it.memory_id}|{it.tier}/{it.channel}|score={it.score:.4f}|{it.content}"
+                f"{it.memory_id}|{it.tier}/{it.channel}|score={it.fused_score:.4f}|{it.content}"
                 for it in recalled.items
             )
         )
@@ -148,7 +160,21 @@ def test_mu_console_script_round_trips_real_data_with_no_daemon(uid: str) -> Non
     }
 
     add_proc = subprocess.run(  # noqa: S603 — fixed argv, test-only, no shell
-        [sys.executable, "-m", "mu_client", "add", _FACT, "--user", _USER, "--session", _SESSION],
+        # --importance drives the real STM->MTM gate above threshold (add() no longer force-promotes
+        # — see _SALIENT_IMPORTANCE); the promoted=True assertion below still fully verifies it.
+        [
+            sys.executable,
+            "-m",
+            "mu_client",
+            "add",
+            _FACT,
+            "--user",
+            _USER,
+            "--session",
+            _SESSION,
+            "--importance",
+            str(_SALIENT_IMPORTANCE),
+        ],
         capture_output=True,
         text=True,
         env=env,

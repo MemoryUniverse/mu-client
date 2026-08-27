@@ -21,13 +21,26 @@ dependencies = [
     "mu-local",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3",
+    # Local-plane MCP server surface (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase 1): the official
+    # Model Context Protocol Python SDK (FastMCP stdio host + client). Local plane ONLY — never
+    # mu-server (import-linter "client-has-no-server").
+    "mcp>=1.12,<2",
+    # Round-trip TOML editing for `mu install codex` (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase
+    # 4): codex config is TOML, and preserving the owner's existing comments/formatting on a
+    # backup-first, never-clobber merge needs a writer — stdlib `tomllib` is read-only.
+    "tomlkit>=0.13,<1",
 ]
 
 [project.scripts]
 # The daemonless one-shot muscle-memory binary (daemon-app-skeleton-spec.md §2, §6):
 # `mu add|recall|search` construct the host, do the op, tear down — NO daemon required.
-# `run|install|verify|uninstall|status` (the resident daemon verbs) are a LATER stage.
+# `mu daemon run` is the resident daemon. `mu install|uninstall claude-code` (Phase 0,
+# AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4) write/remove the managed hook block. `verify|status`
+# remain a LATER stage.
 mu = "mu_client.cli:main"
+# The local-plane MCP server (stdio). A Claude Code / Codex / generic MCP client spawns this via
+# `.mcp.json` and speaks JSON-RPC over stdio (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase 1).
+mu-mcp = "mu_client.mcp.__main__:main"
 
 [project.optional-dependencies]
 dev = [
