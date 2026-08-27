@@ -280,3 +280,60 @@ async def test_memory_garbage_collected_bus_event_invalidates_same_tick_no_stale
     finally:
         await bridge.aclose()
         await host.aclose()
+
+
+async def test_a_sibling_session_stops_serving_a_gc_d_fact_real_stores(
+    isolated_settings: ClientSettings,
+) -> None:
+    """The S3-02 review's headline blocker, against the REAL stores that make it real.
+
+    The two properties already proved separately in this file collide: the ``recalled`` zone is
+    SOURCED across every session of the user (``test_cross_session_federation_default_session_
+    scope_none`` above — real Qdrant, real ``session_scope=None`` user-prefix match), while the
+    push invalidation was keyed on the single ``Namespace`` the event carries. So a fact written
+    in "s-a" was federated into "s-b"'s rendered body, and a ``MemoryGarbageCollected`` naming
+    "s-a" dropped only "s-a" — leaving "s-b" serving a fact that no longer exists in ANY tier,
+    with nothing that would ever remove it.
+
+    Here the fact is genuinely deleted from both real tiers it lives in (the SAME
+    ``StmTierRepository.evict``/``MtmTierRepository.remove`` ports ``LocalMemory`` itself uses) and
+    the assertion is on the SIBLING session's warm body."""
+    host = LocalMemoryHost(isolated_settings)
+    await host.start()
+    bridge = RecallInjectBridge(host, settings=InjectSettings(), bus=host.bus)
+    try:
+        origin, sibling = "s-fed-a", "s-fed-b"
+        ns_origin = _ns(isolated_settings, session=origin)
+
+        write = await host.add(_FACT, session=origin, importance_score=_SALIENT_IMPORTANCE)
+        assert write.promoted
+
+        # Warm BOTH sessions through the real PULL path. The sibling's body carries the fact only
+        # because federation genuinely returns it — that is the precondition, asserted not assumed.
+        await bridge.render(origin, query="Where does Ada live?")
+        await bridge.render(sibling, query="Where does Ada live?")
+        sibling_body = bridge.last_rendered_for(_ns(isolated_settings, session=sibling)) or ""
+        assert "Paris" in sibling_body, (
+            "precondition failed: the sibling session never federated the fact in, so this test "
+            "would prove nothing"
+        )
+
+        container = host._require_memory()._container
+        await container.stm.evict(ns_origin, write.memory_id)
+        await container.mtm.remove(ns_origin, write.memory_id)
+        await host.bus.publish(
+            MemoryGarbageCollected(
+                namespace=ns_origin, id=write.memory_id, prior_state=State.ACTIVE
+            )
+        )
+        await bridge.drain_refreshes()
+
+        body = bridge.last_rendered_for(_ns(isolated_settings, session=sibling))
+        print(f"POST-GC SIBLING CACHE (session={sibling}) = {body!r}")  # noqa: T201
+        assert "Paris" not in (body or ""), (
+            "the SIBLING session still serves the GC'd fact — the warm cache is sourced federated "
+            "but was invalidated per-session"
+        )
+    finally:
+        await bridge.aclose()
+        await host.aclose()

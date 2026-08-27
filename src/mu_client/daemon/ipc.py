@@ -254,7 +254,10 @@ class IpcServer:
 
     async def _route_recall(self, request: dict[str, Any]) -> dict[str, Any]:
         rendered = await self._bridge.render(str(request["session_id"]), query=request.get("query"))
-        return {"status": 200, **rendered.model_dump()}
+        # ``mode="json"``: ``RenderedContext`` carries a real ``datetime`` (``computed_at``, the
+        # canonical §2.2 shape) and this dict is handed straight to ``json.dumps`` at
+        # ``_write_line`` — which has no ``default=`` and would raise on a datetime.
+        return {"status": 200, **rendered.model_dump(mode="json")}
 
     async def _route_healthz(self) -> dict[str, Any]:
         return {

@@ -85,6 +85,9 @@ class LocalDaemon:
         # Declared here (not only assigned in start()) so shutdown() is safe even if the daemon is
         # torn down before start() ever ran — the same discipline every sibling above follows.
         self._session_save: SessionSaveTrigger | None = None
+        # Held (not a bare local) so ordered shutdown can release its four bus subscriptions and
+        # collect any in-flight push refresh BEFORE the engine host tears its adapters down.
+        self._bridge: RecallInjectBridge | None = None
         self._lifecycle_runner: SqliteWalRunner | None = None
         self._lifecycle_lease: SqliteWalLeaseAdapter | None = None
         self._lifecycle_manager: MemoryLifecycleManager | None = None
@@ -144,6 +147,7 @@ class LocalDaemon:
         #    lifecycle manager (which the PreCompact promoter drives) exists before the ingest that
         #    routes PreCompact into it.
         bridge = RecallInjectBridge(self._host, settings=self._settings.inject, bus=self._host.bus)
+        self._bridge = bridge
 
         # 5) LIFECYCLE MANAGER — the real ``MemoryLifecycleManager`` (S1-03) + real durable
         #    runner/lease (S1-06), built BEFORE the IPC front door below (Stage-3 integrate
@@ -234,18 +238,23 @@ class LocalDaemon:
         #    background accept loop's own startup. ``lifecycle_manager=self._lifecycle_manager``
         #    (S3-03, Stage-3 integrate) wires the real ``/state``/``/ready-context`` routes instead
         #    of the named-503 unwired degrade.
-        #    ``health=``/``pin=`` (memory-health-pinning-spec.md §7) are NOT passed: both
-        #    ``mu_engine`` services require a ``MemoryRepository`` façade mu-core has not
-        #    implemented (see ``mu_client/memory_health.py`` for the file:line citation), so there
-        #    is nothing to construct here yet and ``/health`` ``/pin`` ``/unpin`` answer the named
-        #    503 the routes already define. THIS is the seam that changes when the façade lands —
-        #    two constructions and two keyword arguments, no route or handler change.
+        #    ``health=``/``pin=`` (memory-health-pinning-spec.md §7) come from the SAME
+        #    ``LocalMemory`` this daemon already owns (``LocalMemoryHost.health``/``.pin`` ->
+        #    ``LocalMemory`` -> ``LocalContainer``), never from a second composition root — the
+        #    identical passthrough discipline as ``self._host.bus`` above. mu-core now implements
+        #    the ``MemoryRepository`` façade (``mu_engine.services.memory.repository``), so
+        #    ``/health`` ``/pin`` ``/unpin`` answer for real on a binding that can serve them.
+        #    They are still ``| None``: on a vector backend with no partition-walk primitive
+        #    (pgvector/chroma/faiss) the container builds NEITHER service, and the routes fall
+        #    back to the named 503 rather than throwing on every call.
         self._ipc = IpcServer(
             self._settings.ipc,
             registry=registry,
             outbox=self._outbox,
             bridge=bridge,
             lifecycle_manager=self._lifecycle_manager,
+            health=self._host.health,
+            pin=self._host.pin,
         )
         await self._ipc.bind()
 
@@ -334,6 +343,11 @@ class LocalDaemon:
             self._run_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._run_task
+        if self._bridge is not None:
+            # 2c. Unsubscribe the warm cache from the bus and cancel/collect any in-flight push
+            # refresh. MUST precede ``self._host.aclose()`` below: a refresh still in flight is
+            # holding a real recall against store adapters the host is about to close.
+            await self._bridge.aclose()
         if self._outbox is not None:
             await self._outbox.aclose()
         if self._lifecycle_lease is not None:

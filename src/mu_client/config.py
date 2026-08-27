@@ -314,6 +314,38 @@ class InjectSettings(BaseModel):
     body_budget_chars: int = 10_000  # Claude Code additionalContext cap (F4)
     recall_dir: Path = Path("~/.memory-universe/recall")  # F4 over-budget spill dir
 
+    # ---- WARM-CACHE BOUND (S3-02). ``RecallInjectBridge`` is the ``WarmRecallCacheService`` and
+    # lives for the whole daemon process, holding one rendered body (up to ``body_budget_chars``)
+    # per DISTINCT namespace it has rendered. Unbounded, that is a genuine leak: a host hands out a
+    # fresh session id per session, so the dict only ever grows for the daemon's lifetime. The
+    # cache is a CQRS read model holding nothing that is not recoverable from the tiers
+    # (live-session-context-design.md §0), so LRU-dropping the least-recently-read namespace is
+    # always safe — it renders fresh on its next pull. 64 keeps every plausibly-live session of a
+    # single developer's machine warm (a busy day is a handful of concurrent agent sessions) while
+    # capping the worst case at 64 * body_budget_chars ~= 640 KB of bodies. The design set states a
+    # refresh/eviction CADENCE (§5.5) but no capacity number and flags the sibling
+    # ``injected_digest`` bound as open (G-LSC2), so this is a stated, configurable default rather
+    # than a transcribed one — env: MU_INJECT__WARM_CACHE_MAX_ENTRIES.
+    warm_cache_max_entries: int = Field(default=64, ge=1)
+
+    # ---- WARM-CACHE REFRESH FAN-OUT BOUND (S3-02 review). Every lifecycle publisher fires PER
+    # ITEM inside a sweep loop (``promotion.py:428``, ``demotion.py:302``, ``retention.py:346``,
+    # ``distill.py:993``), so an uncoalesced push refresh turns one sweep into N simultaneous
+    # three-arm recalls. The bridge coalesces per namespace first (one in-flight + one pending);
+    # this caps how many DISTINCT namespaces may hold a real recall open at once. It matters
+    # because those recalls embed via ``asyncio.to_thread`` on the SAME default ThreadPoolExecutor
+    # the capture path's own embedder uses — an uncapped burst is measured directly as capture-ack
+    # latency (the regression commit 0f5de74 already fixed once for consolidation).
+    warm_cache_refresh_concurrency: int = Field(default=2, ge=1)
+
+    # ---- WARM-CACHE NOTICE THROTTLE (S3-02 review). ``last_rendered`` is the SYNCHRONOUS warm
+    # read ``MemoryLifecycleManager.ready_context`` calls on the ``/ready-context`` request path,
+    # and every notice it emits costs a pydantic construct + ``model_dump(mode="json")`` + a
+    # structlog write (``observability/events.py:56-57``) — on a real file/stdout sink, a blocking
+    # ``write()`` on the event loop thread, at IPC rate, caller-triggerable. One notice per key per
+    # interval keeps the operator signal and removes the unbounded per-read cost.
+    warm_cache_notice_interval_s: float = Field(default=60.0, ge=0)
+
 
 class DaemonIpcSettings(BaseModel):
     """daemon-app-skeleton-spec.md §9 ``IpcSettings``, same literal default path as

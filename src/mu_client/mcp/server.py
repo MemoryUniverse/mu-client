@@ -199,20 +199,29 @@ def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
     async def lifespan(_server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         host = LocalMemoryHost(resolved)
         memory = await host.start()  # REAL LocalMemory over the caller's real stores
-        # The silent-inject resource renders through the SAME real host as the hook path — the
-        # bridge is PULL-only here (no InprocBus wired in the stdio server), which is the honest
-        # degrade the bridge already documents; ``bus=None`` needs no new DegradeReason.
-        bridge = RecallInjectBridge(host, settings=resolved.inject)
-        # memory-health + pinning (spec §7): ``MemoryHealthService``/``PinService`` both require a
-        # ``MemoryRepository`` façade mu-core has not implemented (mu_client/memory_health.py
-        # carries the file:line citation), so there is genuinely nothing to construct here yet.
-        # Passed explicitly rather than defaulted, so the seam is VISIBLE: this is the one line
-        # that changes when the façade lands, and until then the tools refuse loudly instead of
-        # fabricating a health view or acking a pin that no store would persist.
-        # CONSEQUENCE, stated so no decision rests on the opposite: even with
-        # MU_MCP__EXPOSE_HEALTH_TOOL / MU_MCP__EXPOSE_PIN_TOOLS on, these three tools raise
-        # ServiceNotWiredError. There is no configuration of this build in which they answer.
-        holder.set(memory, bridge, health=None, pin=None)
+        # The silent-inject resource renders through the SAME real host as the hook path, and the
+        # bridge is wired to THIS process's own real ``InprocBus`` (``host.bus`` ->
+        # ``LocalMemory.bus`` -> ``LocalContainer.bus``) — so a mutation made through THIS server's
+        # own tools (``update``/``delete``/``pin``/``promote``…) invalidates the warm body this
+        # server is about to serve, instead of the pre-review shape where its own writes were
+        # invisible to its own cache.
+        #
+        # STATED, not implied: an ``InprocBus`` is in-process only. A write made HERE still does
+        # not reach the DAEMON's bridge in the daemon process, and vice versa — cross-process
+        # invalidation needs a real cross-process bus (reported as a design delta). Until then the
+        # bound on that window is time, not events: the warm entry carries ``computed_at`` and is
+        # marked stale past ``stale_after_s`` and evicted past ``hot_session_ttl_s``.
+        bridge = RecallInjectBridge(host, settings=resolved.inject, bus=host.bus)
+        # memory-health + pinning (spec §7): taken from the SAME real ``LocalMemory`` this
+        # lifespan just started (``LocalMemory.health``/``.pin`` -> ``LocalContainer``), never a
+        # second composition root — the same passthrough discipline as ``host.bus`` above.
+        # mu-core now implements the ``MemoryRepository`` façade
+        # (``mu_engine.services.memory.repository.TieredMemoryRepository``), so with
+        # MU_MCP__EXPOSE_HEALTH_TOOL / MU_MCP__EXPOSE_PIN_TOOLS on these three tools ANSWER.
+        # Still ``| None``-shaped: on a vector backend with no partition-walk primitive the
+        # container builds neither service and the tools keep refusing loudly (ServiceNotWiredError)
+        # instead of fabricating a health view or acking a pin no store would persist.
+        holder.set(memory, bridge, health=memory.health, pin=memory.pin)
         try:
             yield {}
         finally:

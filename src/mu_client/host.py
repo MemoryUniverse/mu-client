@@ -42,6 +42,8 @@ from mu_client.errors import ClientNotStartedError
 if TYPE_CHECKING:
     from mu_contracts.ports.observability import MetricSink, Tracer
     from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
+    from mu_engine.services.health.service import MemoryHealthService
+    from mu_engine.services.pin.service import PinService
 
 __all__ = ["LocalMemoryHost", "daemonless_host"]
 
@@ -158,6 +160,22 @@ class LocalMemoryHost:
         ``MaintenanceLoop`` (S1-07) subscribes HERE, never to a second, independently-constructed
         bus that would never see a real ``MemoryCaptured``/``MemoryPromoted`` event."""
         return self._require_memory().bus
+
+    @property
+    def health(self) -> MemoryHealthService | None:
+        """The owned ``LocalMemory``'s memory-health lens (``LocalMemory.health`` ->
+        ``LocalContainer.health``), or ``None`` when the bound vector backend cannot walk a
+        partition. Passed straight into ``IpcServer(health=...)`` and the MCP engine holder —
+        this host NEVER constructs one, exactly as it never constructs a bus."""
+        return self._require_memory().health
+
+    @property
+    def pin(self) -> PinService | None:
+        """The owned ``LocalMemory``'s pin service (``LocalMemory.pin`` ->
+        ``LocalContainer.pin``), or ``None`` when the binding cannot apply an id-stable pin
+        upsert or cannot count the partition's pin bound. Same passthrough discipline as
+        :attr:`health`."""
+        return self._require_memory().pin
 
     def build_lifecycle_manager(
         self,
