@@ -19,10 +19,14 @@ import signal
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, TypeVar
 
 from mu_contracts.contracts.recall import RecallResult
 from mu_contracts.contracts.views import MemoryWriteResult
+from mu_contracts.domain.model.health import MemoryHealthView
+from mu_contracts.domain.model.pin import PinResult
 from mu_engine.storage.domain.memory import MemoryTier
+from pydantic import BaseModel, ValidationError
 
 from mu_client.capture.claude_tailer import backfill_thinking
 from mu_client.capture.codex import backfill_codex
@@ -30,10 +34,17 @@ from mu_client.capture.hook import capture_once, replay_spool
 from mu_client.capture.model import HostKind
 from mu_client.config import get_client_settings, render_endpoint_env
 from mu_client.daemon.app import LocalDaemon
-from mu_client.errors import cli_error_boundary
+from mu_client.daemon.ipc_client import IpcClient
+from mu_client.errors import DaemonReplyInvalidError, cli_error_boundary
 from mu_client.host import daemonless_host
 from mu_client.install import claude_code as install_claude_code
 from mu_client.install import codex as install_codex
+from mu_client.memory_health import (
+    HEALTH_ROUTE,
+    PIN_ROUTE,
+    UNPIN_ROUTE,
+    namespace_for,
+)
 from mu_client.outbox.sqlite_outbox import SqliteOutbox
 from mu_client.workers.ingest_client import InProcessLocalIngest
 from mu_client.workers.pool import OutboxWorker
@@ -59,6 +70,52 @@ def _build_parser() -> argparse.ArgumentParser:
         "STM->MTM promotion gate (DeterministicPromoteStage: importance >= importance_promote, "
         "default 0.6). Omit to leave the engine's own default (0.5, STM-only).",
     )
+
+    # ---- memory-health + pinning (memory-health-pinning-spec.md §7.1/§7.2) -------------------
+    # These three speak to the RESIDENT DAEMON over its unix socket (the surface the spec names
+    # first), not to the daemonless one-shot host `add`/`recall`/`search` use — see
+    # `daemon/ipc_client.py` for why. Still "one behaviour, two front doors": the daemon's route
+    # handlers are the programmatic entrypoint, and this module only parses and renders.
+    health_p = sub.add_parser(
+        "health",
+        help="Show the health of your memory: stale / low-confidence / conflicting / decaying "
+        "items, plus pinned and archived markers. Read-only — changes nothing.",
+    )
+    health_p.add_argument("--user", default=None, help="Overrides ClientSettings.default_user.")
+    health_p.add_argument("--session", default=None, help="Session id (default: 'default').")
+    health_p.add_argument(
+        "--flag",
+        action="append",
+        default=None,
+        dest="flags",
+        help="Show only entries carrying this flag (repeatable): stale, low_confidence, "
+        "conflicting, decaying, pinned, archived. Omit for the service's own default.",
+    )
+    health_p.add_argument(
+        "--cursor", default=None, help="Continue the previous page (from 'next_cursor')."
+    )
+
+    pin_p = sub.add_parser(
+        "pin",
+        help="Pin one memory: never demoted, garbage-collected or auto-superseded. Changes "
+        "RETENTION only — not what is recalled, and not who can read it.",
+    )
+    pin_p.add_argument("memory_id", help="The id of the memory to pin.")
+    pin_p.add_argument(
+        "--reason",
+        default=None,
+        help="Short NAMED classification for your own pin ('policy', 'decision'), max 200 chars. "
+        "Not a note field — it is persisted on the item and never carried on the event bus.",
+    )
+    pin_p.add_argument("--user", default=None, help="Overrides ClientSettings.default_user.")
+    pin_p.add_argument("--session", default=None, help="Session id (default: 'default').")
+
+    unpin_p = sub.add_parser(
+        "unpin", help="Unpin one memory, letting the normal lifecycle resume for it."
+    )
+    unpin_p.add_argument("memory_id", help="The id of the memory to unpin.")
+    unpin_p.add_argument("--user", default=None, help="Overrides ClientSettings.default_user.")
+    unpin_p.add_argument("--session", default=None, help="Session id (default: 'default').")
 
     for name, help_text in (
         ("recall", "Federated ranked recall (STM floor + MTM dense + LTM graph, fused)."),
@@ -254,6 +311,105 @@ def _render_list(listing: RecallResult) -> None:
         )
 
 
+def _render_ipc_failure(payload: dict[str, object]) -> int:
+    """A non-200 reply from the daemon. Prints the daemon's own STABLE error NAME and status —
+    never a message body, so nothing the daemon knows about a memory can reach stdout/stderr
+    here. Exit code 1, matching :func:`~mu_client.errors.cli_error_boundary`."""
+    print(
+        f"mu: {payload.get('error', 'daemon_error')} (status={payload.get('status')})",
+        file=sys.stderr,
+    )
+    return 1
+
+
+_ReplyModel = TypeVar("_ReplyModel", bound=BaseModel)
+
+
+def _reply_body(model: type[_ReplyModel], payload: dict[str, Any]) -> _ReplyModel:
+    """Validate a 200 IPC reply against the mu-core contract it claims to be.
+
+    The renderers below took ``payload['memory_id']`` / ``entry['tier']`` directly, which meant any
+    reply of an unexpected shape became a raw ``KeyError`` traceback: ``cli_error_boundary``
+    re-raises everything outside the ``MemoryUniverseError`` hierarchy, so the CLI's promise of a
+    single content-free refusal line quietly did not hold on that path. Parsing through the
+    contract closes the class rather than one instance of it — and it is the same discipline the
+    IPC side now applies inbound (``memory_health.pin_request_of``): let mu-core's own frozen,
+    ``extra="forbid"`` model be the judge of the shape, and never re-state its rules here.
+
+    ``status`` is the IPC ENVELOPE, not part of either contract, so it is dropped before
+    validation (both models are ``extra="forbid"``).
+    """
+    try:
+        return model.model_validate({k: v for k, v in payload.items() if k != "status"})
+    except ValidationError as exc:
+        raise DaemonReplyInvalidError(model.__name__) from exc
+
+
+def _render_health(view: MemoryHealthView) -> None:
+    """Content-free by construction: ``MemoryHealthView`` has no content field to print (mu-core
+    did not build the spec's ``preview``), so every value below is an id, an enum, a number or a
+    timestamp. ``retention_unknown`` is printed rather than hidden — a lens that could not compute
+    decay for part of its page must SAY so."""
+    summary = view.summary
+    partial = " [partial: a tier was unreachable]" if view.partial else ""
+    print(
+        f"total={summary.total} pinned={summary.pinned_count} "
+        f"retention_unknown={summary.retention_unknown}{partial}"
+    )
+    if summary.by_flag:
+        print(
+            "  "
+            + "  ".join(
+                f"{flag.value}={count}"
+                for flag, count in sorted(summary.by_flag.items(), key=lambda kv: kv[0].value)
+            )
+        )
+    if not view.entries:
+        print("(nothing at risk)")
+    for entry in view.entries:
+        flags = ",".join(sorted(flag.value for flag in entry.flags)) or "-"
+        pinned = " [pinned]" if entry.pinned else ""
+        print(
+            f"{entry.memory_id}  {entry.tier.value}/{entry.state.value}  "
+            f"retention={entry.retention:.4f}  {flags}{pinned}"
+        )
+    if view.next_cursor:
+        print(f"next_cursor={view.next_cursor}")
+
+
+def _render_pin(result: PinResult) -> None:
+    print(
+        f"memory_id={result.memory_id} pinned={result.pinned} "
+        f"pinned_at={result.pinned_at} version={result.version}"
+    )
+
+
+async def _run_health(args: argparse.Namespace) -> int:
+    settings = get_client_settings()
+    ns = namespace_for(settings, user=args.user, session=args.session)
+    reply = await IpcClient(settings.ipc).request(
+        HEALTH_ROUTE,
+        {"namespace": list(ns.parts()), "flags": args.flags, "cursor": args.cursor},
+    )
+    if reply.get("status") != 200:
+        return _render_ipc_failure(reply)
+    _render_health(_reply_body(MemoryHealthView, reply))
+    return 0
+
+
+async def _run_pin(args: argparse.Namespace, *, route: str) -> int:
+    settings = get_client_settings()
+    ns = namespace_for(settings, user=args.user, session=args.session)
+    payload: dict[str, Any] = {"namespace": list(ns.parts()), "memory_id": args.memory_id}
+    if route == PIN_ROUTE:
+        payload["reason"] = args.reason
+    reply = await IpcClient(settings.ipc).request(route, payload)
+    if reply.get("status") != 200:
+        return _render_ipc_failure(reply)
+    _render_pin(_reply_body(PinResult, reply))
+    return 0
+
+
 def _run_install(args: argparse.Namespace) -> int:
     if args.install_target == "codex":
         return _run_install_codex(args)
@@ -431,6 +587,10 @@ async def _run(argv: Sequence[str]) -> int:
         return _run_install(args)
     if args.command == "uninstall":
         return _run_uninstall(args)
+    if args.command == "health":
+        return await _run_health(args)
+    if args.command in (PIN_ROUTE, UNPIN_ROUTE):
+        return await _run_pin(args, route=args.command)
     async with daemonless_host() as host:
         if args.command == "add":
             _render_write(

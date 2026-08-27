@@ -31,6 +31,23 @@ in flight on the SAME ``LifecycleWorkflowRunnerPort`` never blocks either route:
 both routes then answer a named, content-free 503 rather than raising, matching this file's
 existing "never construct a service IpcServer itself owns" discipline for ``registry``/``outbox``/
 ``bridge``.
+
+**``/health`` + ``/pin`` + ``/unpin`` (memory-health-pinning-spec.md §7.1 line 331 / §7.2 line
+339).** The spec puts ``mu health`` / ``mu pin <id>`` / ``mu unpin <id>`` on exactly this loopback
+socket so the LOCAL plane answers "how is my memory doing?" and "never forget this one" *with no
+UI open and no server*. All three dispatch through the SAME newline-delimited-JSON pipe and the
+SAME ``SO_PEERCRED`` check as every other route — no second protocol, no new auth surface (the
+spec's "per-daemon token" belongs to the loopback-HTTP variant this daemon does not implement;
+peer-uid is the stronger check on a unix socket).
+
+``health``/``pin`` are optional exactly as ``lifecycle_manager`` is, and for a harder reason: both
+``mu_engine`` services require a ``MemoryRepository`` façade **mu-core does not yet implement**
+(see :mod:`mu_client.memory_health` for the citation). Until a composition root can hand one in,
+these routes answer a named, content-free 503 — never a raise, never a fabricated view.
+
+⚠ ``health`` is NOT ``healthz``. ``healthz`` is daemon liveness (outbox depth / dead letters);
+``health`` is the user's memory-health lens. Exact-match dispatch keeps them apart functionally;
+they are one character apart on the wire, which is a reading hazard flagged for the owner.
 """
 
 from __future__ import annotations
@@ -52,6 +69,23 @@ from mu_client.capture.parsers import ParserRegistry
 from mu_client.config import DaemonIpcSettings
 from mu_client.errors import CaptureSchemaDriftError
 from mu_client.inject.recall_bridge import RecallInjectBridge
+from mu_client.memory_health import (
+    HEALTH_ROUTE,
+    HEALTH_UNWIRED,
+    PIN_ROUTE,
+    PIN_SURFACE_ERRORS,
+    PIN_UNWIRED,
+    UNKNOWN_HEALTH_FLAG,
+    UNPIN_ROUTE,
+    local_scope,
+    malformed_request_response,
+    namespace_on_the_wire,
+    parse_health_flags,
+    pin_failure_response,
+    pin_request_of,
+    private_plane_refusal,
+    unwired_response,
+)
 from mu_client.observability.events import log_activity_captured, log_capture_source_halted
 from mu_client.outbox.sqlite_outbox import SqliteOutbox
 
@@ -60,6 +94,8 @@ if TYPE_CHECKING:
     # MemoryLifecycleManager, only calls warm-read methods on one handed to it, so no runtime
     # import is needed on this socket-front-door module's own import surface.
     from mu_engine.lifecycle.manager import MemoryLifecycleManager
+    from mu_engine.services.health import MemoryHealthService
+    from mu_engine.services.pin import PinService
 
 __all__ = ["IpcServer"]
 
@@ -75,6 +111,8 @@ class IpcServer:
         outbox: SqliteOutbox,
         bridge: RecallInjectBridge,
         lifecycle_manager: MemoryLifecycleManager | None = None,
+        health: MemoryHealthService | None = None,
+        pin: PinService | None = None,
     ) -> None:
         self._settings = settings
         self._registry = registry
@@ -85,6 +123,10 @@ class IpcServer:
         # LocalDaemon._lifecycle_manager) threads one through. /state and /ready-context answer a
         # named 503 rather than raising when absent.
         self._lifecycle_manager = lifecycle_manager
+        # Same optional-injection contract as ``lifecycle_manager`` above, for the memory-health +
+        # pinning surface (spec §7). NEVER constructed here — this class does not own them.
+        self._health = health
+        self._pin = pin
         self._server: asyncio.AbstractServer | None = None
         self._accepting = True
 
@@ -178,6 +220,12 @@ class IpcServer:
             return await self._route_state(request)
         if route == "ready-context":
             return await self._route_ready_context(request)
+        if route == HEALTH_ROUTE:
+            return await self._route_health(request)
+        if route == PIN_ROUTE:
+            return await self._route_pin(request)
+        if route == UNPIN_ROUTE:
+            return await self._route_unpin(request)
         return {"status": 404, "error": "unknown_route", "route": route}
 
     async def _route_capture(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -237,6 +285,89 @@ class IpcServer:
             return {"status": 503, "error": "lifecycle_manager_not_wired"}
         rendered = self._lifecycle_manager.ready_context(str(request["session_id"]))
         return {"status": 200, **rendered.model_dump(mode="json")}
+
+    # ---- memory-health + pinning (spec §7.1 / §7.2) -------------------------------------------
+    # η on the wire is the same 5-part codec every other namespaced route uses
+    # (``Namespace.parts()``/``.from_parts()``, CANONICAL §7.3), and the ``ClientScope`` the engine
+    # services require is derived FROM that authorized η — see ``memory_health.local_scope`` for
+    # why that is sound on THIS plane and nowhere else.
+
+    async def _route_health(self, request: dict[str, Any]) -> dict[str, Any]:
+        """``/health`` -> ``MemoryHealthService.assess`` — ONE bounded page of the caller's own
+        memory health (spec §5.1). Read-pure: the service holds no write port at all, so this
+        route structurally cannot reinforce, demote or otherwise mutate what it reports on.
+
+        Content-free by construction: ``MemoryHealthView`` carries ids, enums, numbers and
+        timestamps only (mu-core did not build the spec's ``preview`` field), so the dump below
+        can never contain memory text.
+        """
+        if self._health is None:
+            return unwired_response(HEALTH_UNWIRED)
+        try:
+            ns = namespace_on_the_wire(request)
+        except (KeyError, TypeError, ValueError):
+            return malformed_request_response()
+        refusal = private_plane_refusal(ns)
+        if refusal is not None:
+            return refusal
+        try:
+            flags = parse_health_flags(request.get("flags"))
+        except (TypeError, ValueError):
+            return {"status": 422, "error": UNKNOWN_HEALTH_FLAG}
+        cursor = request.get("cursor")
+        view = await self._health.assess(
+            local_scope(ns),
+            ns,
+            filter_flags=flags,
+            cursor=str(cursor) if cursor is not None else None,
+        )
+        return {"status": 200, **view.model_dump(mode="json")}
+
+    async def _route_pin(self, request: dict[str, Any]) -> dict[str, Any]:
+        """``/pin`` -> ``PinService.pin`` — set the lifecycle-override so the item is never
+        demoted / GC'd / auto-superseded (spec §5.2).
+
+        ``reason`` is the spec's short NAMED classification ("policy", "decision"), bounded at 200
+        chars by ``PinRequest`` — it is persisted on the item and is never carried on the bus, so
+        it is passed through untouched and never logged here.
+        """
+        if self._pin is None:
+            return unwired_response(PIN_UNWIRED)
+        try:
+            ns = namespace_on_the_wire(request)
+            req = pin_request_of(request)
+        except (KeyError, TypeError, ValueError):
+            # ``ValidationError`` (a ``ValueError``) covers an empty ``memory_id`` and a ``reason``
+            # past the contract's 200-char bound — both user-reachable through ``mu pin``.
+            return malformed_request_response()
+        refusal = private_plane_refusal(ns)
+        if refusal is not None:
+            return refusal
+        try:
+            result = await self._pin.pin(local_scope(ns), ns, req)
+        except PIN_SURFACE_ERRORS as exc:
+            return pin_failure_response(exc)
+        return {"status": 200, **result.model_dump(mode="json")}
+
+    async def _route_unpin(self, request: dict[str, Any]) -> dict[str, Any]:
+        """``/unpin`` -> ``PinService.unpin`` — release the override (spec §5.2). Symmetric to
+        :meth:`_route_pin`; reachable in EVERY state, because an item that reached a settled exit
+        while pinned would otherwise be permanently un-GC-able."""
+        if self._pin is None:
+            return unwired_response(PIN_UNWIRED)
+        try:
+            ns = namespace_on_the_wire(request)
+            memory_id = pin_request_of(request).memory_id
+        except (KeyError, TypeError, ValueError):
+            return malformed_request_response()
+        refusal = private_plane_refusal(ns)
+        if refusal is not None:
+            return refusal
+        try:
+            result = await self._pin.unpin(local_scope(ns), ns, memory_id)
+        except PIN_SURFACE_ERRORS as exc:
+            return pin_failure_response(exc)
+        return {"status": 200, **result.model_dump(mode="json")}
 
 
 def _peer_is_self(writer: asyncio.StreamWriter) -> bool:

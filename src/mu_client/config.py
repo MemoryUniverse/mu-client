@@ -239,6 +239,51 @@ class McpSettings(BaseModel):
     # installed (where nothing else would ever capture).
     expose_automatic_tools: bool = False
 
+    # ---- memory-health + pinning (memory-health-pinning-spec.md §7) ------------------------
+    # TWO flags, not one, because the two verbs carry genuinely different risk. `health` is
+    # read-pure (mu-core's `MemoryHealthService` takes no write port at all —
+    # mu-core/packages/mu-engine/src/mu_engine/services/health/service.py:86-98); `pin`/`unpin`
+    # are a LIFECYCLE OVERRIDE. A single flag would force the read lens to inherit the override's
+    # risk profile and would make the most likely owner ruling — "health yes, pin no" —
+    # inexpressible in configuration.
+    #
+    # WHAT THE SPEC ACTUALLY SAYS, quoted rather than paraphrased. §7.1 line 332 is:
+    #     | **MCP tool** | `memory.local.health` | Reachable from inside the agent host where the
+    #     user works, alongside `memory.local.status` (§7.15). |
+    # That is a REACHABILITY PURPOSE CLAUSE, not silence, and `remove_tool` below defeats it: in
+    # an MCP host the model is the only caller, so "not on the model's tool list" and "not
+    # reachable inside the agent host" are the same state. §7.2 line 340's MCP row, by contrast,
+    # has an EMPTY Notes column — it asks for `memory.pin`/`memory.unpin` and says nothing more.
+    #
+    # Both are nevertheless OFF by default, and this is an OVERRIDE of §7.1:332 pending an owner
+    # ruling, not a reading of it:
+    #   1. `tests/unit/test_mcp_surface_policy_unit.py:47` — pre-existing and owner-ratified —
+    #      asserts the default surface is EXACTLY the seven deep-dive names. Adding `health` to it
+    #      breaks that test, and that test is the owner's ratified statement of this surface.
+    #   2. §7.1:332's own companion does not exist here: mu-client registers NO `status` tool
+    #      (`mcp/server.py` has add/recall/get/consolidate/search/build_context/ask/promote/
+    #      demote/update/delete only). The row is describing the design-set-wide MCP surface —
+    #      api-sdk-mcp-surface-design.md:904 puts "the 7+ MCP tools + `memory.local.status`" on the
+    #      frozen contract list — not this host's deliberately-narrowed hook-aware local surface.
+    #      Honouring it here means registering `status` too, which is another subsystem's work.
+    #   3. Flipping a flag on is reversible; retracting a tool a model has started calling is not.
+    #
+    # NOT COMPENSATED ELSEWHERE — stated plainly because the first version of this comment claimed
+    # otherwise. `mu health`/`mu pin`/`mu unpin` and the `/health` `/pin` `/unpin` IPC routes are
+    # ALSO unable to answer on a real host today: both engine services require a
+    # `MemoryRepository` and mu-core ships no implementation of it (only the Protocol at
+    # mu-core/packages/mu-contracts/src/mu_contracts/ports/memory.py:142), so every surface
+    # answers its named "not wired" degrade. The exposure question is therefore about what happens
+    # the day that façade lands, and it is open for the owner either way.
+
+    # env: MU_MCP__EXPOSE_HEALTH_TOOL — default OFF. ON puts the read-only `health` lens on the
+    # agent-facing surface, which is what §7.1:332 asks for.
+    expose_health_tool: bool = False
+
+    # env: MU_MCP__EXPOSE_PIN_TOOLS — default OFF. ON puts `pin`/`unpin` — the lifecycle override
+    # — on the agent-facing surface. Independent of `expose_health_tool` on purpose.
+    expose_pin_tools: bool = False
+
 
 class OutboxSettings(BaseModel):
     """capture-spec.md §10/§8.3, same literal default path as ``ClientSettings.outbox_db_path``

@@ -234,6 +234,12 @@ class LocalDaemon:
         #    background accept loop's own startup. ``lifecycle_manager=self._lifecycle_manager``
         #    (S3-03, Stage-3 integrate) wires the real ``/state``/``/ready-context`` routes instead
         #    of the named-503 unwired degrade.
+        #    ``health=``/``pin=`` (memory-health-pinning-spec.md §7) are NOT passed: both
+        #    ``mu_engine`` services require a ``MemoryRepository`` façade mu-core has not
+        #    implemented (see ``mu_client/memory_health.py`` for the file:line citation), so there
+        #    is nothing to construct here yet and ``/health`` ``/pin`` ``/unpin`` answer the named
+        #    503 the routes already define. THIS is the seam that changes when the façade lands —
+        #    two constructions and two keyword arguments, no route or handler change.
         self._ipc = IpcServer(
             self._settings.ipc,
             registry=registry,

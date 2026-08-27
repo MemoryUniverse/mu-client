@@ -9,7 +9,8 @@ Protocol) and by the real stdio server with a live ``LocalMemory`` (``server.bui
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Protocol
 
 from mu_contracts.contracts.defaults import DEFAULT_CONSOLIDATE_LIMIT, DEFAULT_RECALL_LIMIT
 from mu_contracts.contracts.memory import MemoryResponse
@@ -20,9 +21,18 @@ from mu_contracts.contracts.views import (
     MemoryVerbResult,
     MemoryWriteResult,
 )
+from mu_contracts.domain.model.pin import PinRequest
 from mu_engine.storage.domain.memory import MemoryTier
 
+from mu_client.errors import ServiceNotWiredError
 from mu_client.mcp.guard import SharedPrivateGuard
+from mu_client.memory_health import local_scope, namespace_for, parse_health_flags
+
+if TYPE_CHECKING:
+    from mu_engine.services.health import MemoryHealthService
+    from mu_engine.services.pin import PinService
+
+    from mu_client.config import ClientSettings
 
 __all__ = [
     "MemoryVerbs",
@@ -34,9 +44,12 @@ __all__ = [
     "tool_delete",
     "tool_demote",
     "tool_get",
+    "tool_health",
+    "tool_pin",
     "tool_promote",
     "tool_recall",
     "tool_search",
+    "tool_unpin",
     "tool_update",
 ]
 
@@ -368,4 +381,85 @@ async def tool_delete(
     evicted. NEVER a hard delete of active data. Returns a ``MemoryVerbResult`` (``invalidated``,
     ``tiers_affected``). A nonexistent id fails loud (404-equivalent), never a fake success."""
     result = await engine.delete(memory_id, user=user, session=session)
+    return result.model_dump(mode="json")
+
+
+# ---- memory-health + pinning (memory-health-pinning-spec.md §7.1 line 332 / §7.2 line 340) ------
+# These three do NOT go through :class:`MemoryVerbs`: health and pin are not ``LocalMemory`` verbs
+# at all (that class has no ``pin``/``unpin``/``health`` method — mu-core exposes them only as the
+# two standalone services). They take the service DIRECTLY, ``| None`` for the case the
+# composition root could not build one, and refuse loud in that case rather than answering — the
+# same stance ``tool_ask`` takes in heuristic mode.
+#
+# η is built here, once, from the client's env boundary (``memory_health.namespace_for``), so the
+# health page and a ``recall`` by the same caller address the SAME partition; the ``ClientScope``
+# the services require is derived from that authorized η (``memory_health.local_scope``).
+
+
+async def tool_health(
+    health: MemoryHealthService | None,
+    *,
+    settings: ClientSettings,
+    user: str,
+    session: str | None,
+    flags: Sequence[str] | None = None,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """``health`` — ONE bounded page of the caller's own memory health (``MemoryHealthView``).
+
+    A READ-ONLY LENS (spec §0): it derives its flags from fields the engine already maintains and
+    mutates nothing — no reinforcement, no tier change. Content-free by construction: every field
+    of the view is an id, an enum, a number or a timestamp (mu-core did not build the spec's
+    ``preview``), so nothing here can carry memory text.
+    """
+    if health is None:
+        raise ServiceNotWiredError("MemoryHealthService")
+    ns = namespace_for(settings, user=user, session=session)
+    view = await health.assess(
+        local_scope(ns), ns, filter_flags=parse_health_flags(flags), cursor=cursor
+    )
+    return view.model_dump(mode="json")
+
+
+async def tool_pin(
+    pin: PinService | None,
+    *,
+    settings: ClientSettings,
+    memory_id: str,
+    user: str,
+    session: str | None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """``pin`` — mark one memory so the lifecycle may never demote / GC / auto-supersede it.
+
+    Pin is RETENTION, never ACCESS and never RELEVANCE (spec §0, §6.5): it does not widen anyone's
+    read set and does not boost the item in recall. ``reason`` is a short NAMED classification the
+    owner attaches to their own pin ("policy", "decision"), bounded at 200 chars by ``PinRequest``
+    — never a note field and never memory text. Every refusal (not the owner / no such id / not
+    pinnable / over the partition's pin bound) propagates as a typed, non-enumerating error.
+    """
+    if pin is None:
+        raise ServiceNotWiredError("PinService")
+    ns = namespace_for(settings, user=user, session=session)
+    result = await pin.pin(local_scope(ns), ns, PinRequest(memory_id=memory_id, reason=reason))
+    return result.model_dump(mode="json")
+
+
+async def tool_unpin(
+    pin: PinService | None,
+    *,
+    settings: ClientSettings,
+    memory_id: str,
+    user: str,
+    session: str | None,
+) -> dict[str, Any]:
+    """``unpin`` — release the retention override, letting the normal lifecycle resume.
+
+    Reachable in EVERY state (unlike ``pin``): an item that reached a settled exit while pinned is
+    unconditionally GC-ineligible, so unpin must always be able to release it.
+    """
+    if pin is None:
+        raise ServiceNotWiredError("PinService")
+    ns = namespace_for(settings, user=user, session=session)
+    result = await pin.unpin(local_scope(ns), ns, memory_id)
     return result.model_dump(mode="json")

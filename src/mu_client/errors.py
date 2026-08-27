@@ -19,7 +19,10 @@ __all__ = [
     "CaptureSchemaDriftError",
     "ClientError",
     "ClientNotStartedError",
+    "DaemonReplyInvalidError",
+    "DaemonUnreachableError",
     "OutboxCorruptionError",
+    "ServiceNotWiredError",
     "cli_error_boundary",
 ]
 
@@ -39,6 +42,53 @@ class ClientNotStartedError(ClientError):
 class OutboxCorruptionError(ClientError):
     """The outbox WAL is unreadable at open — the daemon/CLI refuses to start (loud) rather than
     running healthy with a silently lost backlog (daemon-app-skeleton-spec.md §10)."""
+
+
+class ServiceNotWiredError(ClientError):
+    """A surface was asked for a capability whose engine service the composition root could not
+    build — REFUSED LOUD, never a fabricated answer (the same stance ``LocalMemory.ask`` takes in
+    heuristic mode, surfaced to an MCP caller as a tool error rather than a silent empty result).
+
+    Today this is the memory-health + pinning pair: ``MemoryHealthService``/``PinService`` both
+    require a ``MemoryRepository`` façade mu-core has not implemented yet (see
+    :mod:`mu_client.memory_health` for the file:line citation). Content-free — it names the
+    SERVICE, never a namespace, an id or any memory text.
+    """
+
+    def __init__(self, service: str) -> None:
+        self.service = service
+        super().__init__(
+            f"{service} is not available on this host: mu-core ships no MemoryRepository "
+            "implementation for it to read/write through, so there is nothing to answer with"
+        )
+
+
+class DaemonUnreachableError(ClientError):
+    """A CLI verb that speaks ONLY to the resident daemon could not reach its socket.
+
+    Distinct from the capture path's tolerance of the same condition: ``capture_once`` treats an
+    unreachable daemon as "spool it myself" because it holds a record it must not lose, whereas
+    ``mu health``/``mu pin`` hold nothing and have no second front door — the honest answer is to
+    say the daemon is not running, not to half-succeed. Content-free (the socket path only).
+    """
+
+
+class DaemonReplyInvalidError(ClientError):
+    """A 200 reply from the daemon did not validate against the mu-core contract it claims to be.
+
+    The CLI renders health/pin replies through ``MemoryHealthView``/``PinResult`` rather than
+    indexing the raw dict, so a daemon that answered the wrong SHAPE is a named, content-free
+    refusal here instead of a ``KeyError`` traceback escaping
+    :func:`cli_error_boundary` (which re-raises anything outside this hierarchy). Names the
+    expected CONTRACT only — never a field value, an id, or any memory text.
+    """
+
+    def __init__(self, contract: str) -> None:
+        self.contract = contract
+        super().__init__(
+            f"the daemon's reply did not match the {contract} contract — this client and the "
+            "running daemon are not the same build"
+        )
 
 
 class CaptureSchemaDriftError(SchemaDriftError):
