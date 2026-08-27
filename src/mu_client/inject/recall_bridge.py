@@ -107,14 +107,28 @@ literally here: the sync path emits at most one structlog record per notice key 
 blocking I/O on the loop thread, at IPC rate. The daemon threads this same instance through at
 ``daemon/app.py:173-178`` (``warm_cache=bridge``) — one owner, CANONICAL §7.22.
 
-**What this port CANNOT do, stated plainly rather than implied.** ``WarmRecallCacheServicePort`` has
-no count-bearing method, and ``MemoryLifecycleManager.get_state`` (``manager.py:397-421``) never
-consults ``self._warm_cache`` at all — it returns literal ``stm_count=0``/``mtm_count=0``/
-``ltm_count=0``. Wiring this bridge in therefore fixed ``ready_context`` and did NOT, and
-structurally cannot, make ``get_state``'s tier counts real. Closing that needs three mu-core changes
-this module does not own (a ``count(ns)`` primitive on the tier ports, an async seed seam on
-``LocalContainer``, and ``get_state`` reading the result) — reported, never papered over by
-fabricating a number here.
+**What this port CANNOT do, stated plainly rather than implied.** ``WarmRecallCacheServicePort``
+has no count-bearing method and ``MemoryLifecycleManager.get_state`` never consults
+``self._warm_cache`` at all, so wiring this bridge in fixed ``ready_context`` and did NOT — and
+structurally cannot — have anything to do with ``get_state``'s tier counts. This bridge caches
+rendered BODIES keyed by session; a tier count is a per-user-prefix cardinality. Different key,
+different shape, different lifetime.
+
+**Correction (ARCHITECTURE-DELTAS AD-24, and the reason this paragraph is worth reading).** An
+earlier version of this text went on to assert that ``get_state`` "returns literal
+``stm_count=0``/``mtm_count=0``/``ltm_count=0``" and that closing it would need three specific
+mu-core changes (a ``count(ns)`` primitive on the tier ports, an async seed seam on
+``LocalContainer``, and ``get_state`` reading the result). **Both claims are now stale, and the
+second was never the design that landed.** The counts are no longer ``0``: mu-core grew
+``mu_engine.lifecycle.counts.TierCountCache``, an in-memory per-``UserPrefix`` cache fed by the
+plane's own ``InprocBus`` and read synchronously by ``get_state``, wired once in
+``LocalContainer``. No tier-port count primitive and no async seed seam were involved. Read
+``mu_engine/lifecycle/counts.py`` for what the numbers mean (an observed DELTA, never a store
+cardinality) — writing a confident wrong reason into a docstring for the next agent to believe is
+precisely the failure mode AD-24 exists to remove, so it is corrected here rather than deleted.
+
+**mu-client itself needs no change for any of this** and deliberately gets none: the counts arrive
+through the same ``LifecycleStateView`` this daemon already serves.
 """
 
 from __future__ import annotations
