@@ -135,12 +135,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
 import structlog
+from mu_contracts.contracts.live_context import LiveSessionContext
 from mu_contracts.domain.errors import MemoryUniverseError
 from mu_contracts.domain.events import (
     ConsolidationCompleted,
@@ -163,6 +165,13 @@ from pydantic import BaseModel, ConfigDict
 from mu_client.config import InjectSettings
 from mu_client.host import LocalMemoryHost
 from mu_client.inject.distill import distill_items
+from mu_client.inject.live_context import (
+    ArtifactHydratorPort,
+    LiveContextSettings,
+    assemble,
+    slab_from_recall_item,
+    update_recalled,
+)
 from mu_client.observability.events import log_degraded, log_host_injection_skipped
 
 __all__ = ["RecallInjectBridge", "RenderedContext"]
@@ -218,6 +227,19 @@ _REFRESH_EVENTS: tuple[type, ...] = (
 # Length of the namespace-prefix digest appended to an F4 spill filename (below). Long enough that
 # two real η prefixes will not collide; short enough to keep the path readable.
 _SPILL_DIGEST_CHARS = 12
+
+#: The floor :meth:`RecallInjectBridge._assembly_budget` will not reserve below. A ceiling smaller
+#: than this cannot hold one named marker line, and reserving the spill note out of it would leave
+#: the assembler nothing at all — an operator who sets ``body_budget_chars`` this low gets a tiny
+#: block, not an empty one.
+_MIN_ASSEMBLY_BUDGET_CHARS = 200
+
+
+def _spill_note(spill_path: Path) -> str:
+    """The pointer the host body carries to an F4 spill. Sits AFTER ``</memory_context>`` — it is a
+    marker about the block, not a section of it, so §4's ordered-XML FORMAT invariant (CANONICAL
+    §7.22) is untouched by it. Same placement the stale and raced notes already use."""
+    return f"\n… (full context spilled to {spill_path})"
 
 
 def _user_prefix(ns: Namespace) -> str:
@@ -507,6 +529,108 @@ class _ScopedRenderCache:
                     del self._by_user[cohort]
 
 
+class _LiveStateStore:
+    """The **structured backing store** ``RenderedContext`` is now a projection OF
+    (`live-session-context-design.md:140`: "the ``LiveSessionContext`` becomes its structured
+    backing store and ``RenderedContext`` becomes its *rendered projection*").
+
+    **Why this is a SECOND store beside ``_ScopedRenderCache`` rather than a field on
+    ``_CacheEntry``.** The two have deliberately different lifetimes, and conflating them silently
+    destroys §5.3. The rendered body is dropped by every memory-mutating event (``MemoryCaptured``
+    fires on EVERY captured turn), because a body that outlives its facts is a lie. The live state
+    must NOT be: ``injected_digest`` records what the HOST already has in its context window, and
+    the host's window is not affected by this daemon evicting a cache entry. A digest that died on
+    every capture would make the cross-turn delta a no-op that still looked implemented — the
+    exact "you built a cache, not this" failure.
+
+    Same tenancy and same bounds as the render cache, for the same reasons: keyed on the full
+    six-slot ``to_prefix()`` (never the bare session id), LRU-capped at
+    ``warm_cache_max_entries``, and hard-expired at ``hot_session_ttl_s`` measured from
+    ``updated_at`` — recall-service-design.md §8's read-after-revoke bound applies to the slabs
+    held here exactly as it does to a rendered body.
+    """
+
+    def __init__(self, *, max_entries: int, clock: Clock, hot_session_ttl_s: int) -> None:
+        self._max_entries = max_entries
+        self._clock = clock
+        self._hot_session_ttl_s = hot_session_ttl_s
+        self._states: OrderedDict[str, LiveSessionContext] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._states)
+
+    @staticmethod
+    def _key(ns: Namespace) -> str:
+        """The ONE place this store decides what a state is keyed by — the full six-slot
+        ``to_prefix()``, never the host-supplied session id (CANONICAL §1 rule 5).
+
+        Written as one method rather than three call sites because a store whose read key and
+        write key can drift apart independently is a store that silently stops persisting: the
+        entry goes in under one key and is looked up under another, every render starts from a
+        fresh state, and §5.3's cross-turn digest quietly becomes a no-op that still passes its
+        own unit test."""
+        return ns.to_prefix()
+
+    def get_or_create(self, ns: Namespace) -> LiveSessionContext:
+        key = self._key(ns)
+        state = self._states.get(key)
+        now = self._clock.now()
+        if state is not None:
+            if (now - state.updated_at).total_seconds() <= self._hot_session_ttl_s:
+                self._states.move_to_end(key)
+                return state
+            del self._states[key]
+        return LiveSessionContext(namespace=ns, session_id=ns.session, updated_at=now)
+
+    def put(self, ns: Namespace, state: LiveSessionContext) -> None:
+        key = self._key(ns)
+        self._states[key] = state
+        self._states.move_to_end(key)
+        while len(self._states) > self._max_entries:
+            self._states.popitem(last=False)
+
+    def clear_digest(self, ns: Namespace) -> bool:
+        """Forget what this host's context window is believed to hold — §5.5's
+        ``context_invalidated`` row ("mark stale; clear affected ``injected_digest``"), at
+        whole-window grain.
+
+        §5.3's digest is a MODEL of someone else's memory: the host's transcript. Every entry is a
+        claim that the host still has that text. A host-side compaction (Claude Code ``PreCompact``)
+        or a fresh ``SessionStart`` on the same ``session_id`` rewrites that window out from under
+        the claim, and a digest that survives it suppresses exactly the facts the model just lost —
+        the lean delta degrading not to re-sending everything but to never re-sending anything, for
+        ``hot_session_ttl_s`` (1800 s by default) or until the daemon restarts.
+
+        The slabs are NOT dropped: they are still true, still ranked, and are what the next render
+        re-injects. Only the belief about the host is discarded."""
+        key = self._key(ns)
+        state = self._states.get(key)
+        if state is None:
+            return False
+        principal = ns.user
+        slice_ = state.slice_for(principal)
+        if not slice_.injected_digest:
+            return False
+        self._states[key] = state.with_slice(
+            principal,
+            slice_.model_copy(update={"injected_digest": ()}),
+            now=self._clock.now(),
+        )
+        return True
+
+    def forget(self, ns: Namespace, memory_id: str) -> None:
+        """§5.5 row 2 (`live-session-context-design.md:201`) at SLAB grain — "invalidate the
+        slab(s) deriving from the demoted/GC'd ``memory_id``; clear its ``injected_digest`` entry
+        so a later re-promotion can be re-injected". The rendered-body cohort drop next to this
+        call is coarse by design (the federation grain, module docstring); this is the precise
+        half, and it is the half that keeps a demoted-then-re-promoted fact injectable."""
+        key = self._key(ns)
+        state = self._states.get(key)
+        if state is None:
+            return
+        self._states[key] = state.forget_memory(memory_id, now=self._clock.now())
+
+
 class RecallInjectBridge:
     def __init__(
         self,
@@ -516,9 +640,21 @@ class RecallInjectBridge:
         recall_dir: Path | None = None,
         bus: EventBusPort | None = None,
         clock: Clock | None = None,
+        live_context: LiveContextSettings | None = None,
+        hydrator: ArtifactHydratorPort | None = None,
     ) -> None:
         self._host = host
         self._settings = settings
+        # The assembler's knobs (§5.2 sub-budgets, §5.3 digest bound, §6 hydration floor). Passed
+        # in DI-style (DEV-STANDARDS rule 9) rather than reached for: the composition root owns
+        # the values. REPORTED DELTA: these belong on ``InjectSettings`` so they reach
+        # ``MU_INJECT__*`` (DEV-STANDARDS rule 3), which is a change to
+        # ``mu-client/src/mu_client/config.py:310`` — outside this lane's file ownership.
+        self._live = live_context or LiveContextSettings()
+        # §6's by-id body read. ``None`` is the shipped state, not an oversight: no accessor
+        # exposes the container's ``ContextRepository`` to the daemon yet, so every pointer slab
+        # renders the NAMED non-hydration marker. Named absence, never silent.
+        self._hydrator = hydrator
         # DEV-STANDARDS §1.1: no bare literal default — falls back to InjectSettings.recall_dir
         # (env: MU_INJECT__RECALL_DIR) when a caller (tests, a future override) doesn't pass one.
         self._recall_dir = (recall_dir or settings.recall_dir).expanduser()
@@ -534,6 +670,13 @@ class RecallInjectBridge:
             clock=self._clock,
             hot_session_ttl_s=settings.hot_session_ttl_s,
             notices=self._notices,
+        )
+        # The structured state ``RenderedContext`` is a projection of (§5.4). Separate lifetime
+        # from the render cache — see :class:`_LiveStateStore`.
+        self._states = _LiveStateStore(
+            max_entries=settings.warm_cache_max_entries,
+            clock=self._clock,
+            hot_session_ttl_s=settings.hot_session_ttl_s,
         )
         self._subscriptions: list[Subscription] = []
         # Strong refs to in-flight push refreshes. Without the set, ``asyncio`` only weakly
@@ -628,6 +771,13 @@ class RecallInjectBridge:
         entry = self._last_rendered.entry(ns.to_prefix())
         query = entry.query if entry is not None else None
         self.invalidate(ns)
+        if isinstance(event, MemoryDemoted | MemoryGarbageCollected):
+            # §5.5 row 2 (`live-session-context-design.md:201`): the rendered cohort drop above is
+            # the coarse half; THIS is the slab-grain half the row actually specifies — drop the
+            # slabs deriving from this ``memory_id`` AND clear its ``injected_digest`` entry, so a
+            # later re-promotion of the same fact can be injected again instead of being
+            # suppressed for the rest of the session by a digest that outlived it.
+            self._states.forget(ns, event.id)
         if not isinstance(event, _REFRESH_EVENTS):
             return  # MemoryCaptured: invalidate-only by design (see ``_REFRESH_EVENTS``).
         if not self._renderable(ns):
@@ -685,7 +835,12 @@ class RecallInjectBridge:
         transition would be both wrong and wasted work."""
         try:
             async with self._refresh_slots:
-                await self.render(ns.session, query=query, user=ns.user)
+                # ``for_host=False``: a background re-warm renders into the CACHE, it does not
+                # reach the host. Unioning its emitted hashes into ``injected_digest`` would mark
+                # facts as "already in the host's window" that the host never received, and the
+                # user's next real pull would then dedup them away forever. §5.3's digest records
+                # what was INJECTED, not what was rendered.
+                await self.render(ns.session, query=query, user=ns.user, for_host=False)
         except asyncio.CancelledError:
             raise  # DEV-STANDARDS rule 1: cancellation is never swallowed as a failure
         except Exception as exc:
@@ -734,6 +889,22 @@ class RecallInjectBridge:
         by spec §5 and nothing on this seam may await store I/O."""
         self._last_rendered.pop_cohort(ns)
 
+    def on_host_context_reset(self, session_id: str, *, user: str | None = None) -> bool:
+        """The host's own context window was rewritten — drop §5.3's belief about it.
+
+        Called for a ``PreCompact`` (the host is about to compact/delete this session's turns) and
+        for a ``SessionStart`` that resumes an existing ``session_id``. Returns whether anything
+        was cleared, so a caller can log a content-free outcome.
+
+        **REPORTED, not wired — the one line this lane may not write.** ``PreCompact`` reaches the
+        client today at ``workers/ingest_client.py:93`` (``ActivityKind.PRE_COMPACT`` ->
+        ``PreCompactPromoter.on_precompact``) and never reaches ``inject/`` at all; a grep for
+        ``PreCompact`` across ``src/mu_client/`` hits ``capture/``, ``lifecycle/`` and ``workers/``
+        and nothing here. ``workers/ingest_client.py`` is outside this lane's file ownership, so
+        the seam is built and tested here and the call is reported. Until it is wired, the only
+        recovery from a compaction is ``hot_session_ttl_s`` expiry or a daemon restart."""
+        return self._states.clear_digest(self._namespace(session_id, user))
+
     def last_rendered(self, session_id: str) -> str | None:
         """``WarmRecallCacheServicePort`` required method 2 (``manager.py:239``) —
         :meth:`~mu_engine.lifecycle.manager.MemoryLifecycleManager.ready_context`'s real
@@ -742,7 +913,11 @@ class RecallInjectBridge:
         the session id maps to more than one namespace** — see :class:`_ScopedRenderCache`:
         ambiguity is refused, never guessed. A body older than ``stale_after_s`` is returned WITH
         the named stale marker rather than silently as current. Never triggers a render itself:
-        :meth:`render` (PULL) and :meth:`_refresh` (PUSH) are the only writers."""
+        :meth:`render` (PULL) and :meth:`_refresh` (PUSH) are the only writers.
+
+        **What comes back is the SNAPSHOT, not §5.3's delta.** This seam and ``/ready-context``
+        REPLACE their content on every read — they hold nothing between reads, so a delta is not
+        merely lean for them, it is wrong. See the warm-entry comment in :meth:`render`."""
         return self._warm_body(session_id)
 
     def last_rendered_for(self, ns: Namespace) -> str | None:
@@ -777,7 +952,13 @@ class RecallInjectBridge:
 
     # --------------------------------------------------------------------------------- render
     async def render(
-        self, session_id: str, *, query: str | None = None, user: str | None = None
+        self,
+        session_id: str,
+        *,
+        query: str | None = None,
+        user: str | None = None,
+        known_etag: str | None = None,
+        for_host: bool = True,
     ) -> RenderedContext:
         """``fresh``/``stale`` -> body (+ a stale marker); ``cold`` -> empty body +
         :func:`log_host_injection_skipped` — NEVER hangs/blanks the host turn on a genuine failure.
@@ -788,7 +969,28 @@ class RecallInjectBridge:
 
         ``query`` is what the hits are RANKED against, and it is remembered with the entry: a
         query-less caller (the MCP silent resource; a re-warm with no recorded prompt) re-uses the
-        last real prompt for that namespace before falling back to the session id."""
+        last real prompt for that namespace before falling back to the session id.
+
+        **Recall UPDATES the live context; it does not replace it** (§4 `:155`). The hits are
+        turned into ``ContextSlab``s (:mod:`mu_contracts.contracts.live_context`) and written into
+        the ``recalled``/``recency_floor`` slots of THIS principal's slice, preserving the persona
+        brief, reasoning register, tool state and ``injected_digest`` already there; the assembler
+        (:func:`~mu_client.inject.live_context.assemble`) then renders ``SharedZone ⊕
+        private[principal]`` down to the lean block. What the host gets is the DELTA — §5.3 skips
+        every slab whose ``content_hash`` the host already has.
+
+        ``known_etag`` is §5.4's gate (`:195`: "The host hook **skips re-inject when the etag is
+        unchanged**"). A caller that still holds a previously-injected block passes its etag; if
+        the newly assembled block is byte-identical the body comes back EMPTY with that same etag
+        and a named ``HostInjectionSkipped(reason="etag_unchanged")`` — nothing is re-sent and the
+        host's KV-cache is not churned. **REPORTED, not built:** the hook does not pass it yet. It
+        discards the etag it already receives (``capture/hook.py:204`` reads only ``body``), and
+        both ``capture/hook.py`` and ``daemon/ipc.py:259`` are outside this lane's file ownership,
+        so the gate is implemented and tested here and the two-line wire change is reported.
+
+        ``for_host`` distinguishes a render the HOST will receive from a background re-warm — see
+        :meth:`_refresh`. Only a host-facing render unions its emitted hashes into
+        ``injected_digest``."""
         ns = self._namespace(session_id, user)
         key = ns.to_prefix()
         cached = self._last_rendered.entry(key)
@@ -807,9 +1009,10 @@ class RecallInjectBridge:
         # deterministic pass (:func:`~mu_client.inject.distill.distill_items`) shared by BOTH this
         # hook-inject path and the MCP silent resource, so both surfaces emit one distilled view.
         items = distill_items(listing.items)
-        body = "\n".join(f"- {item.content}" for item in items)
         now = self._clock.now()
-        if not body:
+        if not items:
+            # NOTHING to say — distinct from "the host already has everything" below. Unchanged
+            # cold contract (never blanks the host silently).
             log_host_injection_skipped(session_id=session_id, reason="cold_cache")
             self._last_rendered.pop(ns)
             return RenderedContext(
@@ -819,8 +1022,79 @@ class RecallInjectBridge:
                 computed_at=now,
                 staleness="cold",
             )
-        rendered = self._budget(ns, body, now=now)
-        if self._last_rendered.put(ns, rendered, query=effective_query, epoch=epoch):
+        # ---- §1/§4: the hits become slabs and UPDATE this principal's slice; the four slots
+        # recall knows nothing about survive the write.
+        principal = ns.user
+        state = self._states.get_or_create(ns)
+        slabs = [slab_from_recall_item(item, visibility=Visibility.PRIVATE) for item in items]
+        state = update_recalled(
+            state,
+            principal_id=principal,
+            slabs=slabs,
+            prompt_hash=_etag(effective_query),
+            now=now,
+        )
+        # ---- §5.1 -> §5.3 -> §5.2 -> §6 -> §4, in the assembler. ``degrade`` is threaded rather
+        # than imported there so every named marker this bridge emits goes through the ONE
+        # content-free ``log_degraded`` seam.
+        assembled = await assemble(
+            state,
+            principal_id=principal,
+            prompt=effective_query,
+            budget_chars=self._assembly_budget(ns),
+            settings=self._live,
+            hydrator=self._hydrator,
+            degrade=self._hydration_degrade,
+        )
+        rendered = self._finalize(
+            ns,
+            assembled.body,
+            full_body=assembled.full_body,
+            trimmed=assembled.trimmed,
+            now=now,
+        )
+        # ---- The WARM entry is the SNAPSHOT, never the delta.
+        #
+        # §5.3's digest models what the HOST's own context window already holds, which is only true
+        # of a channel that ACCUMULATES — the hook's ``additionalContext``, appended to a
+        # transcript. This cache is read by ``last_rendered``/``last_rendered_for``, i.e. by
+        # ``MemoryLifecycleManager.ready_context`` and ``/ready-context``, which REPLACE their
+        # content on every read and hold nothing between them. Caching the delta made the second
+        # read of a session empty and every read after it emptier, and ``ready_context`` then
+        # returned ``RenderedContext(rendered="", wired=True)`` — an affirmative claim that the
+        # warm cache is wired and has nothing to say. One assembly produces both bodies.
+        warm = rendered.model_copy(
+            update={"body": assembled.snapshot_body, "etag": _etag(assembled.snapshot_body)}
+        )
+        # ---- §5.4 the etag gate. Byte-identical block ⇒ the host already has it; re-injecting
+        # would churn its KV-cache for nothing (F6). Named, never a silent empty.
+        if known_etag is not None and known_etag == rendered.etag:
+            log_host_injection_skipped(session_id=session_id, reason="etag_unchanged")
+            self._last_rendered.put(ns, warm, query=effective_query, epoch=epoch)
+            self._states.put(ns, state.model_copy(update={"render_etag": rendered.etag}))
+            return rendered.model_copy(update={"body": ""})
+        if not rendered.body:
+            # §5.3 worked: every candidate was already in the host's window. This is the LEAN
+            # outcome, not a failure — and it is NOT ``cold`` (there were candidates), so it is
+            # named separately or an operator cannot tell a working delta from a broken recall.
+            log_host_injection_skipped(session_id=session_id, reason="no_delta")
+            self._states.put(ns, state.model_copy(update={"render_etag": rendered.etag}))
+            self._last_rendered.put(ns, warm, query=effective_query, epoch=epoch)
+            return rendered
+        # ---- §5.3: "after a render, the emitted hashes are unioned into ``injected_digest``" —
+        # but ONLY for a render the host actually receives (see ``for_host``), and only the hashes
+        # of lines that survived the pooled ceiling (``assemble`` reads them off the rendered
+        # block, never off the candidate list).
+        if for_host:
+            state = state.with_slice(
+                principal,
+                state.slice_for(principal).with_injected(
+                    assembled.emitted_hashes, bound=self._live.injected_digest_max
+                ),
+                now=now,
+            )
+        self._states.put(ns, state.model_copy(update={"render_etag": rendered.etag}))
+        if self._last_rendered.put(ns, warm, query=effective_query, epoch=epoch):
             return rendered
         # THE FENCE FIRED: a mutation landed while this render was awaiting store I/O, so this body
         # predates it. It is NOT cached (that would resurrect what the event removed) and it is NOT
@@ -863,10 +1137,66 @@ class RecallInjectBridge:
         # computed, and re-stamping it would hide its age from every downstream age check.
         return cached.model_copy(update={"body": cached.body + stale_note, "staleness": "stale"})
 
-    def _budget(self, ns: Namespace, body: str, *, now: datetime) -> RenderedContext:
+    def _hydration_degrade(self, mode: str, detail: str) -> None:
+        """The ONE content-free seam every §6 non-hydration marker goes through.
+
+        ``ARTIFACT_HYDRATION_BUDGET`` is reused rather than extended (§9 item 7: "No new
+        ``DegradeReason``"); CANONICAL-CONTRACTS.md:142 already reads it as "reference body not
+        expanded (inject/answer budget) **or artifact absent**". ``detail`` carries sizes and a
+        ``slab_id`` — routing metadata, never slab text (CLAUDE.md rule 3)."""
+        log_degraded(
+            component="inject",
+            mode=mode,
+            reason=DegradeReason.ARTIFACT_HYDRATION_BUDGET,
+            detail=detail,
+        )
+
+    def _spill_path(self, ns: Namespace) -> Path:
+        """Where this η's F4 spill lands. Deterministic and computable BEFORE the render, which is
+        what lets :meth:`_assembly_budget` reserve exactly the note's length.
+
+        The filename carries an η digest, not the bare session id: the spill file holds real
+        MEMORY CONTENT, and a session-only name let two principals sharing a session id overwrite
+        — and read — each other's spilled bodies at a predictable path (same tenancy defect as the
+        cache key, with a worse blast radius because it is on disk)."""
+        return self._recall_dir / f"{ns.session}-{_etag(ns.to_prefix())[:_SPILL_DIGEST_CHARS]}.txt"
+
+    def _assembly_budget(self, ns: Namespace) -> int:
+        """The ceiling handed to :func:`~mu_client.inject.live_context.assemble`, with room for the
+        spill note already taken out.
+
+        The note is appended AFTER assembly, and whether it is needed is only known once assembly
+        has finished — so the room for it is reserved unconditionally rather than clawed back with
+        a byte slice afterwards. Clawing it back is what used to cut the block mid-line, drop the
+        closing ``</memory_context>`` tag, and un-inject whatever fell off the end. The reserve
+        costs a fixed ~90 chars of a 10 000-char default; the slice cost correctness."""
+        reserve = len(_spill_note(self._spill_path(ns)))
+        return max(self._settings.body_budget_chars - reserve, _MIN_ASSEMBLY_BUDGET_CHARS)
+
+    def _finalize(
+        self, ns: Namespace, body: str, *, full_body: str, trimmed: bool, now: datetime
+    ) -> RenderedContext:
+        """The F4 contract, now covering §5.2 trimming as well as raw over-length — and no longer
+        truncating anything.
+
+        Per-section sub-budgets plus the assembler's pooled ceiling replaced blind tail-truncation
+        as the way a too-large block is cut down, and the ceiling runs where identity is still
+        attached to text. What remains here is the other half of "named degrade, NEVER a silent
+        truncate": whenever the assembler left ANYTHING out, the untrimmed block goes to the F4
+        spill file and the body carries a pointer to it.
+
+        **The spill is for content that was CUT, never for content that never existed.** A
+        pointer slab that rendered a "no artifact store wired" marker is a named absence, not a
+        trim (:func:`~mu_client.inject.live_context._hydrate`), so it no longer drags a spill with
+        it — that turned an exceptional over-budget degrade into the routine path of every render
+        carrying one reference, writing real memory content to disk each time and reporting "over
+        budget" about a 162-char body against a 10 000-char ceiling.
+
+        The file holds memory content, so it is created 0600 inside a 0700 directory, by
+        ``os.open`` rather than by write-then-chmod: the window between the two is the whole
+        exposure."""
         session_id = ns.session
-        budget = self._settings.body_budget_chars
-        if len(body) <= budget:
+        if not trimmed:
             return RenderedContext(
                 session_id=session_id,
                 body=body,
@@ -874,17 +1204,12 @@ class RecallInjectBridge:
                 computed_at=now,
                 staleness="fresh",
             )
-        # F4: over-budget spills to a file + preview — named degrade, NEVER a silent truncate.
-        # The filename carries an η digest, not the bare session id: the spill file holds real
-        # MEMORY CONTENT, and a session-only name let two principals sharing a session id
-        # overwrite — and read — each other's spilled bodies at a predictable path (same tenancy
-        # defect as the cache key, with a worse blast radius because it is on disk).
-        self._recall_dir.mkdir(parents=True, exist_ok=True)
-        scope_digest = _etag(ns.to_prefix())[:_SPILL_DIGEST_CHARS]
-        spill_path = self._recall_dir / f"{session_id}-{scope_digest}.txt"
-        spill_path.write_text(body, encoding="utf-8")
-        note = f"\n… (full context spilled to {spill_path})"
-        preview = body[: budget - len(note)] + note
+        spill_path = self._spill_path(ns)
+        self._recall_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(spill_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(full_body)
+        preview = body + _spill_note(spill_path)
         # No dedicated "inject body over F4 budget" reason exists yet in the closed DegradeReason
         # union (capture-spec.md §7.2 names the degrade but not a reason id) — ARTIFACT_HYDRATION_
         # BUDGET is the nearest existing budget-family reason; a proper reason addition routes
@@ -893,12 +1218,15 @@ class RecallInjectBridge:
             component="inject",
             mode="body_over_budget_file_spill",
             reason=DegradeReason.ARTIFACT_HYDRATION_BUDGET,
-            detail=f"chars={len(body)} budget={budget} spill_path={spill_path}",
+            detail=(
+                f"delivered_chars={len(body)} spilled_chars={len(full_body)} "
+                f"budget={self._settings.body_budget_chars} spill_path={spill_path}"
+            ),
         )
         return RenderedContext(
             session_id=session_id,
             body=preview,
-            etag=_etag(body),
+            etag=_etag(preview),
             computed_at=now,
             staleness="fresh",
         )

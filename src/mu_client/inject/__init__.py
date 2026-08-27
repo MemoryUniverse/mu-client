@@ -3,6 +3,21 @@
 
 from __future__ import annotations
 
+from mu_client.inject.live_context import (
+    ArtifactHydratorPort,
+    AssembledContext,
+    DegradeSink,
+    LiveContextSettings,
+    SectionBudgets,
+)
 from mu_client.inject.recall_bridge import RecallInjectBridge, RenderedContext
 
-__all__ = ["RecallInjectBridge", "RenderedContext"]
+__all__ = [
+    "ArtifactHydratorPort",
+    "AssembledContext",
+    "DegradeSink",
+    "LiveContextSettings",
+    "RecallInjectBridge",
+    "RenderedContext",
+    "SectionBudgets",
+]
