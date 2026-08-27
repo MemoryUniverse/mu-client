@@ -19,23 +19,23 @@ surfaces — the client never has to redact anything, and must never add a snipp
 classification (mu-core bounds it at 200 chars), never memory text — so it is accepted from the
 caller but never logged here.
 
-THE ONE THING THAT IS NOT WIRED YET, STATED PLAINLY
----------------------------------------------------
+WHEN THESE SURFACES ANSWER, AND WHEN THEY DO NOT
+------------------------------------------------
 Both engine services take ``repo: MemoryRepository``
-(``mu-core/packages/mu-engine/src/mu_engine/services/health/service.py:89`` and
-``.../services/pin/service.py:94``). **mu-core ships no implementation of that façade** — the only
-``set_pinned``/``enumerate`` definitions in the repo are the two Protocol declarations at
-``mu-core/packages/mu-contracts/src/mu_contracts/ports/memory.py:47,70,157,171``, and the
-``TierRouter`` those docstrings fan through is listed as unbuilt scaffold at
-``mu-core/packages/mu-engine/src/mu_engine/services/__init__.py:1-12``. mu-client is a HOST, not a
-second engine (repo CLAUDE.md), so it does not implement that façade to fill the hole.
+(``mu-core/.../services/health/service.py:89`` and ``.../services/pin/service.py:94``). mu-core
+now implements that facade -- ``mu_engine.services.memory.repository.TieredMemoryRepository`` over
+a ``TierRouter`` (CANONICAL §6-P2) -- and ``mu_local.composition.LocalContainer`` builds it plus
+both services over the SAME stm/mtm/ltm adapters every other local verb uses. ``LocalMemory``
+exposes them (``.health`` / ``.pin``), ``LocalMemoryHost`` passes them through, and the daemon and
+the MCP server hand them to ``IpcServer(health=..., pin=...)`` / the MCP engine holder. So on a
+normal FULL-LOCAL binding these surfaces serve real answers over real stores.
 
-The consequence is carried honestly rather than hidden: every surface below takes its service by
-CONSTRUCTOR/PARAMETER INJECTION and answers a NAMED, content-free "not wired" degrade when the
-composition root could not build one — the identical discipline ``IpcServer`` already applies to
-``lifecycle_manager`` (``daemon/ipc.py:29-33``, ``lifecycle_manager_not_wired``). No stub, no
-``NotImplementedError``, no fabricated view: the handlers are complete and serve real answers the
-instant a real ``MemoryRepository`` is handed in.
+They stay ``| None``-shaped because ABSENCE is still a real binding state, not a placeholder:
+three of the five vector backends (``pgvector``/``chroma``/``faiss``) expose no point-get and no
+partition-walk primitive at all, so ``LocalContainer`` builds NEITHER service on such a binding
+and every surface answers a NAMED, content-free "not wired" degrade -- the identical discipline
+``IpcServer`` already applies to ``lifecycle_manager`` (``daemon/ipc.py:29-33``,
+``lifecycle_manager_not_wired``). No stub, no ``NotImplementedError``, no fabricated view.
 """
 
 from __future__ import annotations
@@ -48,8 +48,11 @@ from mu_contracts.domain.errors import (
     PinAuthorizationError,
     PinLimitExceededError,
     PinnedTransitionBlocked,
+    PinPartiallyAppliedError,
     PinTargetNotFoundError,
     PinTargetNotPinnableError,
+    TierCapabilityUnavailableError,
+    TierRepositoryUnavailableError,
 )
 from mu_contracts.domain.model.health import MemoryHealthFlag
 from mu_contracts.domain.model.memory import Namespace, Visibility
@@ -62,14 +65,19 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_SESSION",
     "HEALTH_ROUTE",
+    "HEALTH_SURFACE_ERRORS",
     "HEALTH_UNWIRED",
     "MALFORMED_REQUEST",
+    "PIN_PARTIALLY_APPLIED",
     "PIN_ROUTE",
     "PIN_SURFACE_ERRORS",
     "PIN_UNWIRED",
     "SHARED_PLANE_REFUSED",
+    "TIER_INCAPABLE",
+    "TIER_UNAVAILABLE",
     "UNKNOWN_HEALTH_FLAG",
     "UNPIN_ROUTE",
+    "health_failure_response",
     "local_scope",
     "malformed_request_response",
     "namespace_for",
@@ -110,6 +118,18 @@ UNKNOWN_HEALTH_FLAG = "unknown_health_flag"
 #: from success on the wire". A user who typed ``mu pin --reason <201 chars>`` would otherwise be
 #: told the daemon is unreachable, which is a lie about a healthy daemon.
 MALFORMED_REQUEST = "malformed_request"
+#: A tier STORE is down (``TierRepositoryUnavailableError``). 503, like the other "come back
+#: later" answers -- the binding is fine, the infrastructure is not.
+TIER_UNAVAILABLE = "tier_store_unavailable"
+#: A bound BACKEND has no such primitive and never will (``TierCapabilityUnavailableError``).
+#: 501, not 503: retrying cannot help, only rebinding can.
+TIER_INCAPABLE = "tier_capability_unavailable"
+#: A cross-store pin landed on SOME tiers and failed on others. 409, and -- uniquely in this
+#: table -- the payload carries the ``applied``/``failed`` tier sets and the direction, because
+#: those are the whole reason the error type exists: without them the caller cannot tell a
+#: conservative leftover pin from an UNPIN that stranded a row as permanently GC-ineligible. Tier
+#: enum values and a boolean are configuration, not memory content, so this stays content-free.
+PIN_PARTIALLY_APPLIED = "pin_partially_applied"
 
 #: mu-local's own session default (``mu_local.local_memory._DEFAULT_SESSION``), restated here
 #: because a client surface that builds η itself must land on the SAME partition the engine's own
@@ -134,11 +154,35 @@ _PIN_FAILURES: tuple[tuple[type[Exception], int, str], ...] = (
     # authorized η (below), but mapped rather than assumed away: it collapses to the same
     # non-enumerating 404 as "absent", which is the whole point of the discipline.
     (NamespaceIsolationError, 404, "not_found"),
+    # The three the FACADE introduced. Unmapped they were not "propagated loud" -- an unhandled
+    # exception in a route handler closes the IPC connection with NO reply, which this module's
+    # own docstring calls indistinguishable from success on the wire. So a half-landed pin -- the
+    # single most operationally important outcome this feature has -- would have reached the
+    # caller as a dropped connection and lived only in a daemon-side log line.
+    #
+    # ``TierCapabilityUnavailableError`` is NOT a subclass of ``TierRepositoryUnavailableError``:
+    # they are siblings by design (errors.py:133 vs :265), "this store is down, retry" versus
+    # "this backend can never answer, rebind". Both are listed; neither shadows the other.
+    (PinPartiallyAppliedError, 409, PIN_PARTIALLY_APPLIED),
+    (TierCapabilityUnavailableError, 501, TIER_INCAPABLE),
+    (TierRepositoryUnavailableError, 503, TIER_UNAVAILABLE),
 )
 
 #: The ``except`` clause for a pin/unpin call site. Anything OUTSIDE this tuple is a genuine bug
 #: and propagates loud (DEV-STANDARDS rule 8 — no bare catch, no silent fallback).
 PIN_SURFACE_ERRORS: tuple[type[Exception], ...] = tuple(exc for exc, _, _ in _PIN_FAILURES)
+
+#: The ``except`` clause for the ``/health`` call site. Health is a READ, so the pin-specific
+#: refusals cannot occur on it; what CAN is a tier store going down past the service's ONE
+#: modelled degrade, a bound backend that can never walk a partition, and a replayed or malformed
+#: ``cursor`` (which ``services/memory/cursor.py`` refuses with ``NamespaceIsolationError`` and is
+#: user-reachable through ``mu health --cursor``). All three were previously uncaught, and an
+#: uncaught exception on this socket is a close with no reply.
+HEALTH_SURFACE_ERRORS: tuple[type[Exception], ...] = (
+    NamespaceIsolationError,
+    TierCapabilityUnavailableError,
+    TierRepositoryUnavailableError,
+)
 
 
 def local_scope(ns: Namespace) -> ClientScope:
@@ -227,12 +271,43 @@ def pin_failure_response(exc: Exception) -> dict[str, Any]:
     """Map one caught :data:`PIN_SURFACE_ERRORS` member onto its transport payload.
 
     Content-free: the status and the stable name only — never ``str(exc)``.
+
+    ONE member carries a body: a half-landed cross-store pin also reports WHICH tiers took
+    the write, which did not, and which DIRECTION half-landed. That is the entire reason
+    ``PinPartiallyAppliedError`` is a distinct type (errors.py:217) — a leftover PINNED leg
+    is merely un-GC-able until reconciled, while a leftover leg after an UNPIN strands the
+    row as permanently GC-ineligible, and a bare 409 cannot tell the caller which one they
+    are in. Tier enum values and a boolean are configuration, never memory text.
     """
+    if isinstance(exc, PinPartiallyAppliedError):
+        return {
+            "status": 409,
+            "error": PIN_PARTIALLY_APPLIED,
+            "applied": sorted(exc.applied),
+            "failed": sorted(exc.failed),
+            "pinned": exc.pinned,
+        }
     for exc_type, status, name in _PIN_FAILURES:
         if isinstance(exc, exc_type):
             return {"status": status, "error": name}
     raise AssertionError(  # pragma: no cover — PIN_SURFACE_ERRORS is derived from the same table
         f"unmapped pin failure {type(exc).__name__}"
+    )
+
+
+def health_failure_response(exc: Exception) -> dict[str, Any]:
+    """Map one caught :data:`HEALTH_SURFACE_ERRORS` member onto its transport payload.
+
+    Reuses the SAME status/name table the pin path does, so ``/health`` and ``/pin`` cannot
+    drift into two different names for one condition. Content-free: status and stable name
+    only, never ``str(exc)`` — a cursor refusal in particular must stay non-enumerating
+    (``cursor.py`` names neither partition on purpose).
+    """
+    for exc_type, status, name in _PIN_FAILURES:
+        if isinstance(exc, exc_type):
+            return {"status": status, "error": name}
+    raise AssertionError(  # pragma: no cover — HEALTH_SURFACE_ERRORS is a subset of the table
+        f"unmapped health failure {type(exc).__name__}"
     )
 
 

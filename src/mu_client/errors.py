@@ -49,17 +49,22 @@ class ServiceNotWiredError(ClientError):
     build — REFUSED LOUD, never a fabricated answer (the same stance ``LocalMemory.ask`` takes in
     heuristic mode, surfaced to an MCP caller as a tool error rather than a silent empty result).
 
-    Today this is the memory-health + pinning pair: ``MemoryHealthService``/``PinService`` both
-    require a ``MemoryRepository`` façade mu-core has not implemented yet (see
-    :mod:`mu_client.memory_health` for the file:line citation). Content-free — it names the
-    SERVICE, never a namespace, an id or any memory text.
+    Today this is the memory-health + pinning pair: ``MemoryHealthService``/``PinService`` are
+    built by ``mu_local.composition.LocalContainer`` over mu-core's ``MemoryRepository`` façade
+    and reach this host through ``LocalMemory.health``/``.pin``, so on a normal FULL-LOCAL binding
+    they ARE wired. What is left is the real binding case: three of the five vector backends
+    (``pgvector``/``chroma``/``faiss``) expose no point-get and no partition-walk primitive, so on
+    those the container builds neither service and these surfaces refuse instead of fabricating a
+    health view or acking a pin no store would persist (see :mod:`mu_client.memory_health`).
+    Content-free — it names the SERVICE, never a namespace, an id or any memory text.
     """
 
     def __init__(self, service: str) -> None:
         self.service = service
         super().__init__(
-            f"{service} is not available on this host: mu-core ships no MemoryRepository "
-            "implementation for it to read/write through, so there is nothing to answer with"
+            f"{service} is not available on this host: the bound stores cannot serve the "
+            "partition walk and id-stable pin upsert it reads/writes through, so there is "
+            "nothing to answer with"
         )
 
 

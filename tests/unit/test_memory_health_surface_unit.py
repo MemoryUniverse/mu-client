@@ -33,8 +33,11 @@ from mu_contracts.domain.errors import (
     PinAuthorizationError,
     PinLimitExceededError,
     PinnedTransitionBlocked,
+    PinPartiallyAppliedError,
     PinTargetNotFoundError,
     PinTargetNotPinnableError,
+    TierCapabilityUnavailableError,
+    TierRepositoryUnavailableError,
 )
 from mu_contracts.domain.model.health import MemoryHealthFlag, MemoryHealthView
 from mu_contracts.domain.model.memory import (
@@ -72,9 +75,12 @@ from mu_client.memory_health import (
     HEALTH_ROUTE,
     HEALTH_UNWIRED,
     MALFORMED_REQUEST,
+    PIN_PARTIALLY_APPLIED,
     PIN_ROUTE,
     PIN_UNWIRED,
     SHARED_PLANE_REFUSED,
+    TIER_INCAPABLE,
+    TIER_UNAVAILABLE,
     UNKNOWN_HEALTH_FLAG,
     UNPIN_ROUTE,
     local_scope,
@@ -1084,3 +1090,100 @@ async def test_the_ipc_client_refuses_a_socket_that_answers_nothing(tmp_path: Pa
     finally:
         server.close()
         await server.wait_closed()
+
+
+# ============================================ 6. the three errors the FAÇADE introduced, mapped
+class _DownTierRepository(_FakeMemoryRepository):
+    """A repository whose tier store is unreachable — what a real Qdrant/FalkorDB/Valkey outage
+    looks like AFTER ``TierRouter.guarded`` has translated it."""
+
+    async def enumerate(self, ns: Namespace, **kwargs: Any) -> Any:
+        raise TierRepositoryUnavailableError("the ltm tier store (falkordb) could not serve")
+
+
+class _PartialPinRepository(_FakeMemoryRepository):
+    """A repository whose cross-store pin lands on some tiers and fails on others.
+
+    Only ``set_pinned`` diverges: the pin-explosion bound counts with a real ``enumerate`` page on
+    every pin, so a repository that also failed THAT would be refused before the write was ever
+    issued — which is itself the shape ``_DownTierRepository`` above exercises.
+    """
+
+    async def set_pinned(self, ns: Namespace, id: str, pinned: bool, **kwargs: Any) -> int:
+        raise PinPartiallyAppliedError(
+            "pin applied on ['stm'] but not on ['ltm']",
+            applied=frozenset({"stm"}),
+            failed=frozenset({"ltm"}),
+            pinned=pinned,
+        )
+
+
+class _IncapableRepository(_FakeMemoryRepository):
+    """A binding whose vector backend has no partition-walk primitive (pgvector/chroma/faiss).
+
+    Reachable even though ``LocalContainer`` now refuses to build the services on such a binding:
+    a host that constructs them itself, or a backend that loses the capability at runtime, still
+    reaches this route — and an uncaught raise here is a close with no reply."""
+
+    async def enumerate(self, ns: Namespace, **kwargs: Any) -> Any:
+        raise TierCapabilityUnavailableError("the mtm backend 'pgvector' cannot enumerate")
+
+
+async def test_a_tier_outage_is_a_named_503_on_health_not_a_dropped_connection(
+    daemon_factory: Any,
+) -> None:
+    """``MemoryHealthService`` models exactly ONE degrade (LTM down -> ``partial``). Anything past
+    it — including the narrowed retry failing too — propagates, and this route wrapped ``assess``
+    in no ``try`` at all. An unhandled exception in a handler closes the connection with NO reply,
+    which ``daemon/ipc.py``'s own docstring calls indistinguishable from success on the wire."""
+    ns = _ns()
+    daemon = await daemon_factory(health=_health_service(_DownTierRepository()))
+
+    answer = await daemon.client.request(HEALTH_ROUTE, {"namespace": list(ns.parts())})
+
+    assert answer == {"status": 503, "error": TIER_UNAVAILABLE}
+
+
+async def test_a_backend_that_can_never_walk_is_a_named_501_not_a_503(
+    daemon_factory: Any,
+) -> None:
+    """``TierCapabilityUnavailableError`` is NOT a subclass of ``TierRepositoryUnavailableError``
+    (errors.py:265 vs :133) and the distinction is the point: 503 says retry, 501 says this
+    binding will never answer and only rebinding helps. Mapping them to one status would tell an
+    operator to wait for a recovery that cannot happen."""
+    ns = _ns()
+    daemon = await daemon_factory(health=_health_service(_IncapableRepository()))
+
+    answer = await daemon.client.request(HEALTH_ROUTE, {"namespace": list(ns.parts())})
+
+    assert answer == {"status": 501, "error": TIER_INCAPABLE}
+
+
+async def test_a_half_landed_pin_reaches_the_caller_with_both_tier_sets(
+    daemon_factory: Any,
+) -> None:
+    """The applied/failed sets are the entire reason ``PinPartiallyAppliedError`` exists.
+
+    A leftover PINNED leg is merely un-GC-able until reconciled; a leftover leg after an UNPIN
+    strands the row as permanently GC-ineligible — which is exactly what unpin exists to prevent.
+    A bare 409 cannot tell the caller which one they are in, and before this mapping the sets
+    reached only a daemon-side log line while the caller got a dropped connection.
+    """
+    ns = _ns()
+    repo = _PartialPinRepository([_item("m1", ns)])
+    daemon = await daemon_factory(pin=_pin_service(repo))
+    payload = {"namespace": list(ns.parts()), "memory_id": "m1"}
+
+    pinned = await daemon.client.request(PIN_ROUTE, payload)
+    assert pinned == {
+        "status": 409,
+        "error": PIN_PARTIALLY_APPLIED,
+        "applied": ["stm"],
+        "failed": ["ltm"],
+        "pinned": True,
+    }
+
+    released = await daemon.client.request(UNPIN_ROUTE, payload)
+    assert (
+        released["pinned"] is False
+    ), "the DIRECTION must survive to the caller: the unpin case is the dangerous one"
