@@ -40,6 +40,7 @@ from mu_client.host import LocalMemoryHost
 from mu_client.inject.recall_bridge import RecallInjectBridge
 from mu_client.mcp import tools
 from mu_client.mcp.guard import SharedPrivateGuard
+from mu_client.mcp.surface import withdrawn_tool_names
 
 if TYPE_CHECKING:
     from mu_engine.services.health import MemoryHealthService
@@ -73,8 +74,9 @@ _INSTRUCTIONS = (
 #: done by the capture hooks, and promotion/consolidation by the daemon's lifecycle triggers
 #: (`lifecycle/session_save.py`). Offering them to the model invites it to duplicate writes the
 #: hook already made and to second-guess a lifecycle it cannot see. Prose alone does not reliably
-#: stop that; not offering the tool does.
-_AUTOMATIC_TOOL_NAMES = frozenset({"add", "consolidate", "promote", "demote"})
+#: stop that; not offering the tool does. The SET itself is
+#: :data:`mu_client.mcp.surface.AUTOMATIC_TOOL_NAMES` — see that module for why it does not live
+#: here any more.
 
 #: memory-health + pinning (memory-health-pinning-spec.md §7). Held off the DEFAULT surface by
 #: two INDEPENDENT flags — see below for why they are two and not one, and for the spec clause
@@ -122,13 +124,14 @@ _AUTOMATIC_TOOL_NAMES = frozenset({"add", "consolidate", "promote", "demote"})
 #: `memory.local.health` to be reachable inside the agent host, and this build does not make it so
 #: by default; ratify or reverse.* It is NOT "the spec is silent".
 #:
+#: THE SETS are :data:`mu_client.mcp.surface.HEALTH_TOOL_NAMES` /
+#: :data:`~mu_client.mcp.surface.PIN_TOOL_NAMES`; only the ARGUMENT lives here.
+#:
 #: NO COMPENSATING PATH — do not let this decision rest on one. `mu health`/`mu pin`/`mu unpin`
 #: and the `/health` `/pin` `/unpin` IPC routes cannot answer on a real host either: both engine
 #: services need a `MemoryRepository` and mu-core ships only the Protocol
 #: (mu-contracts/src/mu_contracts/ports/memory.py:142), so every surface answers its named
 #: not-wired degrade. Reported to the owner as the blocking gap; not fixable from this repo.
-_HEALTH_TOOL_NAMES = frozenset({"health"})
-_PIN_TOOL_NAMES = frozenset({"pin", "unpin"})
 
 
 class _EngineHolder:
@@ -570,19 +573,19 @@ def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
     # prevent that — an unoffered tool does. What remains is the deliberate DEEP-DIVE set
     # (recall/search/get/build_context/ask) plus the two verbs that encode real user intent hooks
     # cannot infer (update/delete).
-    if not resolved.mcp.expose_automatic_tools:
-        for tool_name in sorted(_AUTOMATIC_TOOL_NAMES):
-            server.remove_tool(tool_name)
-
+    #
     # ---- memory-health + pinning ------------------------------------------------------------
-    # Two INDEPENDENT gates (see _HEALTH_TOOL_NAMES above for the full argument and the spec
-    # clause this overrides). `remove_tool` deletes the tool outright — it leaves tools/list AND
-    # tools/call — so after this the default surface has no `health`/`pin`/`unpin` at any level.
-    if not resolved.mcp.expose_health_tool:
-        for tool_name in sorted(_HEALTH_TOOL_NAMES):
-            server.remove_tool(tool_name)
-    if not resolved.mcp.expose_pin_tools:
-        for tool_name in sorted(_PIN_TOOL_NAMES):
-            server.remove_tool(tool_name)
+    # Two INDEPENDENT gates (see the health/pin comment block above for the full argument and
+    # the spec clause this overrides). `remove_tool` deletes the tool outright — it leaves
+    # tools/list AND tools/call — so the default surface has no `health`/`pin`/`unpin` at any level.
+    #
+    # ALL THREE gates are evaluated by `mu_client.mcp.surface.withdrawn_tool_names`, not restated
+    # here. That module is also what `mu_client.consent.capabilities` reads to answer "which of
+    # this device's capabilities does an AgentShareGrant NOT confer?" — the "keeps Y private" half
+    # of Decision D4's exposes-vs-keeps-private contract. Evaluating the policy twice is how the
+    # two answers drift apart, and a consent object that says "your private memory is withheld"
+    # off a drifted list is a privacy misstatement, not a stale constant.
+    for tool_name in sorted(withdrawn_tool_names(resolved.mcp)):
+        server.remove_tool(tool_name)
 
     return server

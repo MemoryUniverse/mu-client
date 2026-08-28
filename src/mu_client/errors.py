@@ -19,10 +19,13 @@ __all__ = [
     "CaptureSchemaDriftError",
     "ClientError",
     "ClientNotStartedError",
+    "ConsentStoreCorruptionError",
     "DaemonReplyInvalidError",
     "DaemonUnreachableError",
     "OutboxCorruptionError",
     "ServiceNotWiredError",
+    "SharedPlaneNotConfiguredError",
+    "SharedPlaneUnreachableError",
     "cli_error_boundary",
 ]
 
@@ -66,6 +69,95 @@ class ServiceNotWiredError(ClientError):
             "partition walk and id-stable pin upsert it reads/writes through, so there is "
             "nothing to answer with"
         )
+
+
+class ConsentStoreCorruptionError(ClientError):
+    """The local agent-share tombstone store is unreadable at open.
+
+    A consent surface REFUSES rather than degrades: a "your agent is shared here" screen backed by
+    a store it could not read cannot tell a live share from a withdrawn one, and guessing either
+    way is a privacy misstatement (D4 §4.2-A). Content-free — the file path only.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(
+            f"the local agent-share consent store at {path} could not be opened; this device "
+            "cannot say which shares it has withdrawn, so it refuses to answer at all"
+        )
+
+
+class NaiveConsentTimestampError(ClientError):
+    """A consent timestamp arrived without a timezone, so this device refuses to interpret it.
+
+    ``datetime.astimezone`` reads a naive value as LOCAL time. Applied to a grant's server-authored
+    ``issued_at``, that silently shifted the instant a blanket withdrawal is compared against — on
+    any host west of UTC it made a covering cut stop covering, i.e. re-presented a withdrawn share
+    as live with no error anywhere. A refusal is the only safe reading. Content-free: the offending
+    timestamp only, which is not memory content.
+    """
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+        super().__init__(
+            f"consent timestamp {value!r} has no timezone; this device will not guess one, "
+            "because guessing it silently changes which shares read as withdrawn"
+        )
+
+
+class InvalidRevokeReasonError(ClientError):
+    """``--reason`` was not a NAMED reason.
+
+    ``wire.py`` and ``tombstone.py`` both call this field *"a NAMED reason for an operator
+    (``user_revoked``, ``policy_change``), never prose about the conversation"*, and the value lands
+    on a Trust Ledger row that ``trust-ledger-spec.md`` §2 rule 3 requires to carry *"only ids,
+    content hashes, principal ids, enums, timestamps, and counts"*. A 64-character cap does not make
+    prose into a name — 62 characters of conversation content fitted, and was forwarded. This
+    refusal is what actually enforces the sentence those docstrings assert.
+
+    Raised BEFORE the revoke's local cut, never during it: a validation error thrown between the
+    server read and the durable write would defeat the consent-first ordering the whole verb is
+    built on. Content-free — it names the RULE, and never echoes the rejected value.
+    """
+
+    def __init__(self, rule: str) -> None:
+        self.rule = rule
+        super().__init__(
+            f"--reason must be a named reason ({rule}), e.g. 'user_revoked' or 'policy_change'; "
+            "it lands on a content-free trust-ledger row, so it may not carry prose"
+        )
+
+
+class SharedPlaneNotConfiguredError(ClientError):
+    """A shared-plane consent verb was called on a device with no server configured.
+
+    ``ConsentSettings.server_base_url`` is ``None`` by default: FULL-LOCAL is the norm, and a
+    laptop with no team server has no agent share to inspect. Named and loud rather than an empty
+    result, because "no share found" and "this device cannot look" are different answers and only
+    one of them means the agent is not shared.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "no shared plane is configured on this device (MU_CONSENT__SERVER_BASE_URL is unset), "
+            "so there is no agent-share grant to read or revoke here"
+        )
+
+
+class SharedPlaneUnreachableError(ClientError):
+    """The configured server did not answer an agent-share request.
+
+    Carries the HTTP status when there was one (``None`` for a transport failure) and NOTHING else:
+    no response body, no URL with ids in it. A revoke that raises this has still performed its
+    LOCAL cut — see :mod:`mu_client.consent.service` for the consent-first ordering that makes that
+    true.
+    """
+
+    def __init__(self, *, operation: str, status_code: int | None = None) -> None:
+        self.operation = operation
+        self.status_code = status_code
+        detail = "no response" if status_code is None else f"HTTP {status_code}"
+        super().__init__(f"the shared plane did not answer {operation} ({detail})")
 
 
 class DaemonUnreachableError(ClientError):

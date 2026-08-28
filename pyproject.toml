@@ -29,6 +29,13 @@ dependencies = [
     # 4): codex config is TOML, and preserving the owner's existing comments/formatting on a
     # backup-first, never-clobber merge needs a writer — stdlib `tomllib` is read-only.
     "tomlkit>=0.13,<1",
+    # Decision D4's client-side agent-share consent surface (mu_client/consent/) speaks two REST
+    # routes on mu-server: GET /v1/rooms/{id}/agent-share/{agent} and POST .../agent-share/revoke.
+    # httpx, NOT `mu-sdk`: mu-sdk is a FOURTH sibling repo (not a mu-core package, despite the root
+    # CLAUDE.md's repo table) and wraps zero room/consent/trust surface, so it cannot speak these
+    # routes at all. This keeps import-linter's `client-has-no-server` contract trivially clean.
+    # The dependency question is REPORTED as an architecture delta for an owner ruling.
+    "httpx>=0.27,<1",
 ]
 
 [project.scripts]
