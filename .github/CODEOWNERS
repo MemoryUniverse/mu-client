@@ -1,0 +1,20 @@
+# Code owners for mu-client.
+#
+# GitHub silently IGNORES an entry naming an account without write access here — no warning, and an
+# ignored line is indistinguishable from a working one. Only verified accounts are listed. Add
+# teams (@MemoryUniverse/<team>) once they exist; never add a name speculatively.
+
+*                                    @TRextabat
+
+# The plane boundary and the gates that enforce it.
+/.importlinter                        @TRextabat
+/tests/unit/test_import_boundaries.py @TRextabat
+/.github/                             @TRextabat
+/pyproject.toml                       @TRextabat
+/uv.lock                              @TRextabat
+
+# Anything that touches a user's own machine outside this repo's own directory: agent config
+# files, installed hooks, and the local capture surface.
+/src/mu_client/install/               @TRextabat
+/src/mu_client/capture/               @TRextabat
+/src/mu_client/consent/               @TRextabat

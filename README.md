@@ -57,11 +57,70 @@ leaving your device unless you explicitly share it.
 
 ## Quickstart
 
+`mu-client` is not on PyPI yet, and neither are the three `mu-core` distributions it runs on
+(`mu-contracts`, `mu-engine`, `mu-local`). Until they are, there are exactly two install routes
+that work, and both are stated here in full rather than implied.
+
+**Route 1 — clone `mu-core` as a sibling, then `uv sync`.** This is the developer route: it binds
+the engine to a working tree you can edit.
+
 ```bash
+git clone -b dev/mlm-build https://github.com/MemoryUniverse/mu-core   # branch AND sibling — see below
 git clone https://github.com/MemoryUniverse/mu-client
 cd mu-client
 uv sync --extra dev
 ```
+
+The `mu-core` clone is **not optional and not a nicety.** `pyproject.toml` resolves
+`mu-contracts` / `mu-engine` / `mu-local` through `[tool.uv.sources]` as `../mu-core/packages/...`,
+relative to *this* file, so the two repos must sit side by side in the same parent directory. Clone
+`mu-client` alone and `uv sync` stops with:
+
+```
+error: Failed to generate package metadata for `mu-contracts==0.1.0 @ editable+../mu-core/packages/mu-contracts`
+  Caused by: Distribution not found at: file:///.../mu-core/packages/mu-contracts
+```
+
+(The `docker compose -f ../mu-core/...` line further down assumes the same layout.)
+
+**`-b dev/mlm-build` is equally not optional**, and it fails far more quietly. GitHub's default
+branch on `mu-core` is `main`, and `main` still carries the empty `mu_contracts.contracts`
+scaffold. Clone `mu-core` without the branch and nothing complains — `uv sync --extra dev` exits
+`0`, all 178 packages install — and then the very first command dies:
+
+```
+$ uv run mu --help
+  File ".../src/mu_client/host.py", line 26, in <module>
+    from mu_contracts.contracts.recall import RecallResult
+ModuleNotFoundError: No module named 'mu_contracts.contracts.recall'
+```
+
+A clean install followed by an instant crash is worse than a resolver error, so it is stated here
+rather than left to be discovered. `dev/mlm-build` is `mu-core`'s trunk; landing it on `main` is
+the real fix and is the repository owner's call, not a documentation one.
+
+**Route 2 — install straight from git, no clone, no registry.** This is the "just let me try it"
+route. It needs `--no-sources`: the `[tool.uv.sources]` table above is a *development* override,
+and uv otherwise honours it even over a git URL and tries to resolve `../mu-core/...` against the
+git remote.
+
+```bash
+uv venv --python 3.12 && source .venv/bin/activate
+uv pip install --no-sources \
+  "mu-contracts @ git+https://github.com/MemoryUniverse/mu-core@dev/mlm-build#subdirectory=packages/mu-contracts" \
+  "mu-engine    @ git+https://github.com/MemoryUniverse/mu-core@dev/mlm-build#subdirectory=packages/mu-engine" \
+  "mu-local     @ git+https://github.com/MemoryUniverse/mu-core@dev/mlm-build#subdirectory=packages/mu-local" \
+  "mu-client    @ git+https://github.com/MemoryUniverse/mu-client"
+```
+
+The three `mu-core` URLs carry `@dev/mlm-build` for the reason given above; `mu-client`'s own
+default branch *is* its trunk, so it needs no ref. There is no lockfile pin that can substitute:
+`[tool.uv.sources]` binds `mu-core` by filesystem path, so `uv.lock` records
+`editable = "../mu-core/packages/mu-contracts"` and has no branch to hold — which branch is
+checked out in that sibling directory is decided by the `git clone` above and by nothing else.
+
+All four URLs are required: `mu-client`'s own metadata names `mu-contracts`/`mu-engine`/`mu-local`,
+and with nothing published under those names a resolver has nowhere else to find them.
 
 **One prerequisite, stated up front:** the engine binds real stores — a Redis/Valkey-compatible KV
 floor for STM, Qdrant for MTM, FalkorDB for LTM. `mu-client` ships no compose file of its own, so

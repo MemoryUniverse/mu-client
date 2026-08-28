@@ -1,0 +1,51 @@
+name: Feature request or design question
+description: Something mu-client should do, or a decision that looks wrong from outside.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `mu-client` is the on-device half. Anything that only exists because *other people, devices
+        or tenants* are involved belongs to the hosted plane, which is not in this repository —
+        this client reaches it only over versioned wire contracts and never by importing it.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that mu-client makes hard or impossible?
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today instead
+      description: The workaround, and what it costs you.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you think should happen
+      description: Optional. A command shape, a config key, an MCP tool signature.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Where does this belong
+      options:
+        - Runs entirely on one machine — belongs in mu-client
+        - Belongs in the engine itself — mu-core
+        - Involves other people, devices or tenants — the hosted plane, not this repo
+        - Not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Are you offering to build it
+      options:
+        - label: I would be willing to open a PR for this if a maintainer agrees with the shape.

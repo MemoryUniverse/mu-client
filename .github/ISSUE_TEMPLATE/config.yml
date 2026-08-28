@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/MemoryUniverse/mu-client/security/advisories/new
+    about: Report privately. Never in a public issue.
+  - name: How to contribute, and the two-repo setup
+    url: https://github.com/MemoryUniverse/mu-client/blob/HEAD/.github/CONTRIBUTING.md
+    about: Why you need a sibling mu-core checkout, the exact gate commands, and the one known flaky test.
+  - name: mu-core — the engine underneath
+    url: https://github.com/MemoryUniverse/mu-core
+    about: If the bug is in extraction, ranking, tiers or storage, it probably lives there.

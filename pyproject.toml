@@ -13,12 +13,25 @@ description = "Memory Universe — mu-client: on-device LOCAL client (LocalMemor
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 readme = "README.md"
+# No "License ::" trove classifier on purpose: PEP 639 replaced it with the `license` expression
+# above, and declaring both is the deprecated form.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
 dependencies = [
-    # mu-core distributions ONLY (never mu-server) — path deps onto the sibling repo, mirroring
-    # mu-sdk-python/pyproject.toml's convention (mu-core is not yet published to a registry).
-    "mu-contracts",
-    "mu-engine",
-    "mu-local",
+    # mu-core distributions ONLY (never mu-server). BOUNDED ranges, not bare names (OSS-GATE-0828
+    # §"unbounded internal pins"): the wheel this repo builds carries `Requires-Dist: mu-contracts`
+    # verbatim, and `[tool.uv.sources]` below is a DEV-ONLY override that never reaches wheel
+    # metadata — so a bare name told any future registry installer "any mu-contracts ever
+    # published will do", including a 0.9 that no longer speaks this wire vocabulary. The four
+    # mu-core distributions version in lockstep with this one, so the range is the 0.1.x line.
+    "mu-contracts>=0.1.0,<0.2.0",
+    "mu-engine>=0.1.0,<0.2.0",
+    "mu-local>=0.1.0,<0.2.0",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3",
     # Local-plane MCP server surface (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase 1): the official
@@ -37,6 +50,14 @@ dependencies = [
     # The dependency question is REPORTED as an architecture delta for an owner ruling.
     "httpx>=0.27,<1",
 ]
+
+# Open-source metadata (OSS-GATE-0828): without these a published page carries no link back to
+# the source, the tracker, or the license text — and `mu-client` is one of the four Apache-2.0
+# repos the Open-Source Gate is about.
+[project.urls]
+Homepage = "https://github.com/MemoryUniverse"
+Repository = "https://github.com/MemoryUniverse/mu-client"
+Issues = "https://github.com/MemoryUniverse/mu-client/issues"
 
 [project.scripts]
 # The daemonless one-shot muscle-memory binary (daemon-app-skeleton-spec.md §2, §6):
@@ -66,9 +87,23 @@ build-backend = "hatchling.build"
 packages = ["src/mu_client"]
 
 [tool.uv.sources]
-# Directory dependencies onto the sibling mu-core repo's packages (PACKAGING-v2 §5.5: "day one"
-# pin is pending an actual registry push; mu-client and mu-core are sibling repos under
-# mu_project/, not one uv workspace — see mu-sdk-python/pyproject.toml for the identical pattern).
+# DEV-ONLY override. Directory dependencies onto the sibling mu-core repo's packages (PACKAGING-v2
+# §5.5: "day one" pin is pending an actual registry push; mu-client and mu-core are sibling repos
+# under mu_project/, not one uv workspace — see mu-sdk-python/pyproject.toml for the identical
+# pattern). `editable = true` keeps a monorepo checkout resolving against the mu-core WORKING TREE
+# (AD-90), which is the whole point.
+#
+# TWO CONSEQUENCES A STRANGER HITS, both verified 2026-08-28 and both documented in README.md:
+#  1. These paths are relative to THIS file, so `git clone mu-client && uv sync` on its own fails
+#     with "Distribution not found at: .../mu-core/packages/mu-contracts". mu-core must be cloned
+#     as a SIBLING directory first. The README Quickstart now says so.
+#  2. uv honours this table even when mu-client is consumed as a git URL, and rewrites the paths
+#     against the git remote — `uv pip install "mu-client @ git+https://.../mu-client"` fails with
+#     `has no subdirectory ../mu-core/packages/mu-contracts`. The registry-free install route is
+#     therefore `uv pip install --no-sources` with explicit git URLs (README).
+# Neither is a lockfile bug and neither is fixable from this table while dev must bind the working
+# tree; both disappear the day the four mu-core distributions are on a registry and this whole
+# table is deleted.
 mu-contracts = { path = "../mu-core/packages/mu-contracts", editable = true }
 mu-engine = { path = "../mu-core/packages/mu-engine", editable = true }
 mu-local = { path = "../mu-core/packages/mu-local", editable = true }

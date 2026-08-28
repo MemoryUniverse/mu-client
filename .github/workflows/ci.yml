@@ -1,0 +1,181 @@
+# mu-client CI — the gates that exist, run the way a contributor runs them.
+#
+# READ THIS BEFORE YOU BLAME THE PIPELINE, because two things about this workflow are unusual and
+# both are deliberate:
+#
+# 1. It checks out a SECOND repository. mu-client depends on mu-core through filesystem path
+#    dependencies (`../mu-core/packages/...` in pyproject.toml and 9 editable pins in uv.lock).
+#    A clean clone of mu-client alone cannot resolve `mu-contracts` — there is no ../mu-core. Until
+#    mu-core is published to a registry this is the only honest way to build this repo in CI, and
+#    the workflow makes the coupling visible instead of pretending it is not there.
+#    See .github/RELEASING.md § "Cross-repo ordering" for the sequence that ends it.
+#
+# 2. The test step is EXPECTED TO BE INTERMITTENTLY RED at the time this file was written, and it
+#    has not been weakened to hide that. `tests/unit/test_sqlite_wal.py::
+#    test_ac_1_1_two_real_os_processes_exactly_one_acquires` is racy: measured 2 failures in 6
+#    consecutive runs on a clean clone. The test spawns two OS processes that each hold the lease
+#    for a fixed 1.0 s, so when the second interpreter's start-up lags the first's by more than a
+#    second, the first has already released and BOTH legitimately acquire. That is a defect in the
+#    test's rendezvous, not in the lease adapter. It is documented in .github/CONTRIBUTING.md
+#    § "One known flaky test", and deselecting it would have traded a visible defect for an
+#    invisible one.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "dev/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.8.13"
+  # mu-core's INTEGRATION trunk, which is not its GitHub default branch. mu-client is developed
+  # against the tip of that trunk, so that is what CI must build against; pointing this at `main`
+  # would test mu-client against a mu-core its own lockfile has never seen. One line to change on
+  # the day mu-core's default branch becomes the trunk — or the day the path deps become version
+  # pins and this whole checkout disappears.
+  MU_CORE_REF: dev/mlm-build
+
+jobs:
+  gates:
+    name: gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout mu-client
+        uses: actions/checkout@v7
+        with:
+          path: mu-client
+
+      # Must land at $GITHUB_WORKSPACE/mu-core so that `../mu-core/...` resolves from mu-client/.
+      - name: Checkout mu-core (sibling — path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: MemoryUniverse/mu-core
+          ref: ${{ env.MU_CORE_REF }}
+          path: mu-core
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          working-directory: mu-client
+          cache-dependency-glob: uv.lock
+
+      # --locked: a pyproject edit that never re-locked is a defect. Note this can also go red
+      # because mu-core gained a dependency and this lock has not caught up — that is a true
+      # signal about a real cross-repo coupling, and the fix is `uv lock`, never `--frozen`.
+      - name: Install (locked)
+        working-directory: mu-client
+        run: uv sync --locked --extra dev
+
+      # --no-sync on every tool call: without it `uv run` re-resolves and can hand you a different,
+      # unpinned tool than the lockfile names.
+      - name: ruff (lint)
+        if: ${{ !cancelled() }}
+        working-directory: mu-client
+        run: uv run --no-sync ruff check .
+
+      - name: ruff-format (format)
+        if: ${{ !cancelled() }}
+        working-directory: mu-client
+        run: uv run --no-sync ruff format --check .
+
+      # The one contract that matters here: mu_client must never import mu_server.
+      - name: import-linter (client-has-no-server)
+        if: ${{ !cancelled() }}
+        working-directory: mu-client
+        run: uv run --no-sync lint-imports
+
+      - name: mypy --strict
+        if: ${{ !cancelled() }}
+        working-directory: mu-client
+        run: uv run --no-sync mypy src
+
+      # Integration tests are deselected: they need real Valkey / Qdrant / FalkorDB containers
+      # (zero mocks, non-negotiable) and run on the project's dev VM, not on a GitHub runner.
+      - name: pytest (everything that does not need a real store)
+        if: ${{ !cancelled() }}
+        working-directory: mu-client
+        run: uv run --no-sync pytest -m "not integration"
+
+      # `-m "not integration"` above deselects SILENTLY, and one of the things it deselects is the
+      # only test of MU-SERVER-BUILD-PLAN.md §2 invariant 6's cross-plane half:
+      # tests/integration/test_cross_plane_privacy_invariant_int.py — a private local fact must
+      # produce zero server request, node, vector, edge or placeholder. Until this step existed,
+      # DELETING that test changed no CI result in any repository, and the run stayed green.
+      #
+      # This step does not — cannot — RUN it: the run needs four real stores AND the local SLM
+      # sidecar the capture path calls (src/mu_client/config.py:444, http://127.0.0.1:11435/v1),
+      # and mocking either is forbidden (DEV-STANDARDS: "INTEGRATION TESTS USE THE REAL SYSTEM —
+      # ZERO MOCKS"). It EXECUTES on the dev VM:
+      #     infra/mu-vm/vm_test.sh mu-client tests/integration/test_cross_plane_privacy_invariant_int.py
+      # which provisions mu-server and its venv on the far side and exports MU_REQUIRE_PRIVACY_IT=1
+      # so a BLOCKED skip there is a FAILURE rather than a green skip.
+      #
+      # What this step DOES do is make the deselection loud and falsifiable. `--collect-only`
+      # imports the module for real, so it goes RED on a deleted file, a renamed test, a dropped
+      # `integration` marker, or an import error in the gate. MEASURED, all three planted and
+      # watched red: marker -> "no tests collected (1 deselected)"; rename -> collected
+      # `::test_privacy_thing`, node id not found; file removed -> "ERROR: file or directory not
+      # found". Each exited 1.
+      - name: cross-plane privacy invariant (NOT run here — asserted present + collectable)
+        if: ${{ !cancelled() }}
+        working-directory: mu-client
+        run: |
+          set -o pipefail
+          uv run --no-sync pytest \
+            tests/integration/test_cross_plane_privacy_invariant_int.py \
+            -m integration --collect-only -q -p no:cacheprovider | tee collected.txt
+          # The exact node id, not just the path: a rename must be a deliberate, visible edit here
+          # rather than something that slides past a path-shaped grep.
+          if ! grep -qF \
+            'tests/integration/test_cross_plane_privacy_invariant_int.py::test_a_private_local_fact_produces_zero_server_artifact' \
+            collected.txt; then
+            echo "THE CROSS-PLANE PRIVACY INVARIANT COLLECTED NOTHING." >&2
+            echo "It is the ONLY test of MU-SERVER-BUILD-PLAN.md §2 invariant 6's cross-plane" >&2
+            echo "half. Deleted, renamed, un-marked or broken at import — whichever it is, the" >&2
+            echo "invariant is now asserted by nobody, here or on the VM. Restore it; never" >&2
+            echo "delete this check to make the red go away." >&2
+            exit 1
+          fi
+          echo "PRESENT and collectable. EXECUTED on the dev VM, not here:"
+          echo "  infra/mu-vm/vm_test.sh mu-client tests/integration/test_cross_plane_privacy_invariant_int.py"
+
+  build:
+    name: build (sdist + wheel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # `uv build` does not resolve dependencies, so this job needs no sibling checkout.
+      - name: uv build
+        run: uv build
+
+      - name: Show what was built
+        run: ls -l dist/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

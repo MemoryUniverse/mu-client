@@ -1,0 +1,95 @@
+name: Bug report
+description: mu-client behaves differently than it says it does.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste real memory content, agent transcripts, tokens or personal data into this
+        form.** Redact, and say what you redacted.
+
+        Security problem? Do not file it here — see
+        [SECURITY.md](https://github.com/MemoryUniverse/mu-client/blob/HEAD/.github/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, and what happened instead of what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+      description: If the README, a `--help` text or a docstring says otherwise, quote it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The smallest command sequence that shows it.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface
+      multiple: true
+      options:
+        - "`mu` CLI (daemonless add/recall/search)"
+        - "`mu daemon` (resident daemon, outbox, workers)"
+        - "MCP server (`mu-mcp`)"
+        - "capture hooks / `mu install`"
+        - "consent / sharing surface"
+        - "engine host (mu-core embedded)"
+        - not sure
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit (this repo)
+      description: "`git rev-parse --short HEAD`. There is no released version yet, so the commit is the version."
+    validations:
+      required: true
+
+  - type: input
+    id: core-commit
+    attributes:
+      label: Commit of the sibling mu-core checkout
+      description: "`git -C ../mu-core rev-parse --short HEAD`. This repo depends on mu-core by path, so both halves matter."
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Python version, which agent (Claude Code / Codex / other), which stores were up.
+      placeholder: "macOS 15 · Python 3.12.11 · Claude Code · no containers"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or traceback
+      description: Redacted. Text, not a screenshot.
+      render: shell
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed every piece of real memory content, transcript text, token and personal datum from everything above.
+          required: true
+        - label: I checked whether this is the known flaky lease test documented in CONTRIBUTING.md.
+          required: true
