@@ -42,12 +42,17 @@ import contextlib
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
+import structlog
+
 from mu_client.capture.codex import CodexNotifyParserV1
 from mu_client.capture.hook import replay_spool
 from mu_client.capture.parsers import ClaudeCodeParserV1, ParserRegistry
 from mu_client.config import ClientSettings, get_client_settings
+from mu_client.consent.composition import open_consent_service
+from mu_client.consent.service import AgentShareConsentService
 from mu_client.daemon.ipc import IpcServer
 from mu_client.daemon.maintenance import MaintenanceLoop
+from mu_client.errors import ClientError
 from mu_client.host import LocalMemoryHost
 from mu_client.inject.recall_bridge import RecallInjectBridge
 from mu_client.lifecycle.precompact import PreCompactPromoter
@@ -56,6 +61,8 @@ from mu_client.outbox.sqlite_outbox import SqliteOutbox
 from mu_client.runners.sqlite_wal import SqliteWalLeaseAdapter, SqliteWalRunner
 from mu_client.workers.ingest_client import InProcessLocalIngest
 from mu_client.workers.pool import OutboxWorker, WorkerPool
+
+_log = structlog.get_logger("mu.client.daemon")
 
 if TYPE_CHECKING:
     from mu_engine.lifecycle.manager import MemoryLifecycleManager
@@ -91,9 +98,52 @@ class LocalDaemon:
         self._lifecycle_runner: SqliteWalRunner | None = None
         self._lifecycle_lease: SqliteWalLeaseAdapter | None = None
         self._lifecycle_manager: MemoryLifecycleManager | None = None
+        # Decision D4's client-side consent surface. Built ONLY when a server is configured
+        # (``ConsentSettings.server_base_url``) — on a FULL-LOCAL device there is no agent share to
+        # inspect and the IPC routes answer a named 503 rather than pretending "not shared", which
+        # an owner would read as a privacy fact. Held so shutdown can close the sqlite handle and
+        # the httpx pool in order.
+        self._consent_exit: contextlib.AsyncExitStack | None = None
+        self._consent: AgentShareConsentService | None = None
         self._drain_stop: asyncio.Event = asyncio.Event()
         self._tg: asyncio.TaskGroup | None = None
         self._run_task: asyncio.Task[None] | None = None
+
+    async def _open_consent_surface(self) -> None:
+        """Build Decision D4's client consent surface, or degrade to the named 503. **Never raise.**
+
+        Two independent reasons this must not abort ``start()``:
+
+        * ``open_consent_service`` refuses by name when no server is configured — a FULL-LOCAL
+          laptop has no agent share to inspect — which is why it is only entered when one IS;
+        * everything it touches is SHARED-plane (an httpx pool, a consent sqlite file). Capture,
+          inject and the outbox do not depend on the shared plane and must not die with it
+          (``mu-client/CLAUDE.md``: *"FULL-LOCAL must be a complete, good memory system with no
+          server required"*).
+
+        The comment that used to stand here CLAIMED this catch and there was no ``try`` anywhere in
+        the block — so an unreadable consent sqlite file (``ConsentStoreCorruptionError`` out of
+        ``SqliteGrantTombstones.open``, raised straight through ``enter_async_context``) took the
+        whole daemon down: no capture, no inject, no outbox, because a shared-plane file could not
+        be opened.
+
+        The degrade is the one that already exists and is already tested: ``self._consent`` stays
+        ``None`` and both consent routes answer the named 503 (``ipc.py``'s
+        ``SHARED_PLANE_UNCONFIGURED``) rather than a wrong answer.
+        """
+        if self._settings.consent.server_base_url is None:
+            return
+        self._consent_exit = contextlib.AsyncExitStack()
+        try:
+            self._consent = await self._consent_exit.enter_async_context(
+                open_consent_service(self._settings)
+            )
+        except ClientError as exc:
+            # Content-free: the exception TYPE, never the store path or the server URL.
+            _log.warning("daemon.consent_surface_unavailable", error=type(exc).__name__)
+            await self._consent_exit.aclose()
+            self._consent_exit = None
+            self._consent = None
 
     @property
     def outbox(self) -> SqliteOutbox:
@@ -247,6 +297,9 @@ class LocalDaemon:
         #    They are still ``| None``: on a vector backend with no partition-walk primitive
         #    (pgvector/chroma/faiss) the container builds NEITHER service, and the routes fall
         #    back to the named 503 rather than throwing on every call.
+        # 7b) D4 CONSENT SURFACE — see `_open_consent_surface`. Never fatal to daemon startup.
+        await self._open_consent_surface()
+
         self._ipc = IpcServer(
             self._settings.ipc,
             registry=registry,
@@ -255,6 +308,7 @@ class LocalDaemon:
             lifecycle_manager=self._lifecycle_manager,
             health=self._host.health,
             pin=self._host.pin,
+            consent=self._consent,
         )
         await self._ipc.bind()
 
@@ -348,6 +402,12 @@ class LocalDaemon:
             # refresh. MUST precede ``self._host.aclose()`` below: a refresh still in flight is
             # holding a real recall against store adapters the host is about to close.
             await self._bridge.aclose()
+        if self._consent_exit is not None:
+            # 2d. Close the consent surface's httpx pool and its sqlite handle, in that order (the
+            # exit stack reverses ``open_consent_service``'s own ordering, which is network-first
+            # for the reason stated there). Before the outbox, after the bridge: it holds no engine
+            # adapter, so it is not part of step 3's release-the-engine-last rule.
+            await self._consent_exit.aclose()
         if self._outbox is not None:
             await self._outbox.aclose()
         if self._lifecycle_lease is not None:

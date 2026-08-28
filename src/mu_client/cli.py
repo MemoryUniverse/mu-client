@@ -33,6 +33,8 @@ from mu_client.capture.codex import backfill_codex
 from mu_client.capture.hook import capture_once, replay_spool
 from mu_client.capture.model import HostKind
 from mu_client.config import get_client_settings, render_endpoint_env
+from mu_client.consent.composition import open_consent_service
+from mu_client.consent.wire import NAMED_REASON_RULE
 from mu_client.daemon.app import LocalDaemon
 from mu_client.daemon.ipc_client import IpcClient
 from mu_client.errors import DaemonReplyInvalidError, cli_error_boundary
@@ -116,6 +118,42 @@ def _build_parser() -> argparse.ArgumentParser:
     unpin_p.add_argument("memory_id", help="The id of the memory to unpin.")
     unpin_p.add_argument("--user", default=None, help="Overrides ClientSettings.default_user.")
     unpin_p.add_argument("--session", default=None, help="Session id (default: 'default').")
+
+    # ---- Decision D4: the agent-share consent surface -----------------------------------------
+    # D4 §4.2-D step 4 asks for an explicit opt-in flow that "shows the exposes-vs-private
+    # contract" plus "a persistent 'your agent is shared here' affordance with one-tap revoke".
+    # There is deliberately NO `share` verb here: on mu-server a grant is minted by
+    # `POST /v1/rooms/{id}/bind` and there is no issue endpoint, because "sharing an agent IS the
+    # consent act" (mu-server/src/mu_server/routes/rooms.py:829-834). Offering `mu agent-share
+    # grant` would be a CLI verb with no route behind it.
+    share_p = sub.add_parser(
+        "agent-share",
+        help="What sharing an agent into a room exposes, and one-tap revoke (Decision D4).",
+    )
+    share_sub = share_p.add_subparsers(dest="agent_share_action", required=True)
+
+    share_status_p = share_sub.add_parser(
+        "status",
+        help="Show the exposes-vs-keeps-private contract for a shared agent, computed against "
+        "what THIS device can actually do.",
+    )
+    share_status_p.add_argument("--room", required=True, help="Room (session) id.")
+    share_status_p.add_argument("--agent", required=True, help="The shared agent's principal id.")
+
+    share_revoke_p = share_sub.add_parser(
+        "revoke",
+        help="Withdraw the share. Cuts on THIS device first (durably), then asks the server, then "
+        "reports everything the revoke could not reach.",
+    )
+    share_revoke_p.add_argument("--room", required=True, help="Room (session) id.")
+    share_revoke_p.add_argument("--agent", required=True, help="The shared agent's principal id.")
+    share_revoke_p.add_argument(
+        "--reason",
+        default=None,
+        help="A NAMED reason for an operator ('user_revoked', 'policy_change'). It lands on a "
+        "content-free trust-ledger row, so it is REFUSED unless it is a name: "
+        f"{NAMED_REASON_RULE}. Prose about the conversation is not a name.",
+    )
 
     for name, help_text in (
         ("recall", "Federated ranked recall (STM floor + MTM dense + LTM graph, fused)."),
@@ -410,6 +448,33 @@ async def _run_pin(args: argparse.Namespace, *, route: str) -> int:
     return 0
 
 
+async def _run_agent_share(args: argparse.Namespace) -> int:
+    """``mu agent-share status|revoke`` — the owner's own consent surface.
+
+    Goes DIRECT to :func:`~mu_client.consent.composition.open_consent_service` rather than through
+    the daemon's IPC routes, on purpose: a consent screen an owner cannot open without first
+    starting a daemon is not an affordance. The daemon serves the same service on the same two
+    verbs for the resident case (:mod:`mu_client.consent.ipc_surface`); both call one service, so
+    there is no second opinion about what a grant exposes.
+    """
+    settings = get_client_settings()
+    async with open_consent_service(settings) as consent:
+        if args.agent_share_action == "revoke":
+            outcome = await consent.revoke(
+                room_id=args.room, agent_principal_id=args.agent, reason=args.reason
+            )
+            for line in outcome.render():
+                print(line)
+            # EXIT CODE IS NOT 0 WHEN THE SERVER DID NOT CONFIRM. A script that revokes in a loop
+            # must be able to tell "withdrawn everywhere it could be" from "withdrawn here only,
+            # the agent may still be acting in the room" WITHOUT parsing prose.
+            return 0 if outcome.server_confirmed else 2
+        status = await consent.describe(room_id=args.room, agent_principal_id=args.agent)
+        for line in status.render():
+            print(line)
+        return 0
+
+
 def _run_install(args: argparse.Namespace) -> int:
     if args.install_target == "codex":
         return _run_install_codex(args)
@@ -591,6 +656,8 @@ async def _run(argv: Sequence[str]) -> int:
         return await _run_health(args)
     if args.command in (PIN_ROUTE, UNPIN_ROUTE):
         return await _run_pin(args, route=args.command)
+    if args.command == "agent-share":
+        return await _run_agent_share(args)
     async with daemonless_host() as host:
         if args.command == "add":
             _render_write(

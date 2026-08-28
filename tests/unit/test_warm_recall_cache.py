@@ -508,7 +508,14 @@ async def test_a_warm_body_is_marked_stale_by_age_and_evicted_past_the_hard_ttl(
 
     recall.return_value = _listing("the deploy target is staging-eu")
     await bridge.render(_SESSION)
-    assert bridge.last_rendered(_SESSION) == "- the deploy target is staging-eu"
+    fresh = bridge.last_rendered(_SESSION)
+    # Containment, not equality: `4b2d2c2` wrapped the render in §4's named sections
+    # (`<memory_context><recalled_memory>`), and this test is about STALENESS, not about the
+    # section markup. The two assertions below it already read this way; this line did not, so a
+    # deliberate render change failed a cache test. It still bites — the body must be there, and
+    # a body inside `stale_after_s` must carry no age notice.
+    assert fresh is not None and "the deploy target is staging-eu" in fresh
+    assert "may be" not in fresh, "a body inside stale_after_s was served with an age notice"
 
     clock.advance(timedelta(seconds=121))
     aged = bridge.last_rendered(_SESSION)

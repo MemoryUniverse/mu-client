@@ -69,7 +69,16 @@ from mu_contracts.domain.model.memory import Namespace
 from mu_client.capture.model import HostKind
 from mu_client.capture.parsers import ParserRegistry
 from mu_client.config import DaemonIpcSettings
-from mu_client.errors import CaptureSchemaDriftError
+from mu_client.consent.ipc_surface import (
+    AGENT_SHARE_REVOKE_ROUTE,
+    AGENT_SHARE_ROUTE,
+    CONSENT_SURFACE_ERRORS,
+    consent_failure_response,
+    consent_malformed_response,
+    consent_request_of,
+)
+from mu_client.consent.service import AgentShareConsentService
+from mu_client.errors import CaptureSchemaDriftError, SharedPlaneNotConfiguredError
 from mu_client.inject.recall_bridge import RecallInjectBridge
 from mu_client.memory_health import (
     HEALTH_ROUTE,
@@ -117,6 +126,7 @@ class IpcServer:
         lifecycle_manager: MemoryLifecycleManager | None = None,
         health: MemoryHealthService | None = None,
         pin: PinService | None = None,
+        consent: AgentShareConsentService | None = None,
     ) -> None:
         self._settings = settings
         self._registry = registry
@@ -131,6 +141,12 @@ class IpcServer:
         # pinning surface (spec §7). NEVER constructed here — this class does not own them.
         self._health = health
         self._pin = pin
+        # Decision D4's client-side consent surface. Optional on the SAME contract as ``health``/
+        # ``pin`` and for a stronger reason: FULL-LOCAL is the norm and a device with no server
+        # configured (``ConsentSettings.server_base_url is None``) genuinely has no agent share to
+        # inspect, so the composition root builds none and both routes answer a named 503 — never
+        # a raise, and never a fabricated "not shared" that an owner could read as a privacy fact.
+        self._consent = consent
         self._server: asyncio.AbstractServer | None = None
         self._accepting = True
 
@@ -207,6 +223,18 @@ class IpcServer:
             # the ordered shutdown, so one stuck handler otherwise hangs the whole daemon's exit.
             # Content-free — the exception TYPE only, never the request.
             _log.info("ipc.request_aborted", error=type(exc).__name__, timeout_s=timeout_s)
+        except Exception as exc:
+            # ANYTHING a route did not model. Before this clause such an exception fell straight to
+            # ``finally`` and the socket closed with NO response — the same failure the 413 branch
+            # above refuses by name ("a silent close is indistinguishable from a success at the
+            # client, and that is exactly how captures were being dropped"), reachable from every
+            # route rather than one. A named 500 keeps DEV-STANDARDS rule 8 (never a silent wrong
+            # answer) while still surfacing the bug. Content-free: the exception TYPE only.
+            _log.info("ipc.route_failed", error=type(exc).__name__)
+            with contextlib.suppress(Exception):
+                await _respond(
+                    writer, {"status": 500, "error": "internal_error"}, timeout_s=timeout_s
+                )
         finally:
             writer.close()
             with contextlib.suppress(Exception):
@@ -230,7 +258,55 @@ class IpcServer:
             return await self._route_pin(request)
         if route == UNPIN_ROUTE:
             return await self._route_unpin(request)
+        if route == AGENT_SHARE_ROUTE:
+            return await self._route_agent_share(request)
+        if route == AGENT_SHARE_REVOKE_ROUTE:
+            return await self._route_agent_share_revoke(request)
         return {"status": 404, "error": "unknown_route", "route": route}
+
+    async def _route_agent_share(self, request: dict[str, Any]) -> dict[str, Any]:
+        """D4 §4.2-D step 4's *"your agent is shared here"* affordance, with the exposes-vs-keeps-
+        private contract COMPUTED for the grant the server actually holds."""
+        if self._consent is None:
+            return consent_failure_response(SharedPlaneNotConfiguredError())
+        try:
+            room_id, agent_principal_id, _ = consent_request_of(request)
+        except (KeyError, TypeError, ValueError):
+            return consent_malformed_response()
+        try:
+            status = await self._consent.describe(
+                room_id=room_id, agent_principal_id=agent_principal_id
+            )
+        except CONSENT_SURFACE_ERRORS as exc:
+            return consent_failure_response(exc)
+        return {"status": 200, "agent_share": status.model_dump(mode="json")}
+
+    async def _route_agent_share_revoke(self, request: dict[str, Any]) -> dict[str, Any]:
+        """D4's one-tap revoke.
+
+        ⚠ A :class:`~mu_client.errors.SharedPlaneUnreachableError` here does NOT mean nothing
+        happened: :meth:`AgentShareConsentService.revoke` writes the durable local tombstone before
+        it calls the server, so the local cut stands and is reported in the outcome. That is why
+        the service swallows the transport failure into residue rather than raising it, and why the
+        only error this route can answer is "no consent surface is configured at all".
+        """
+        if self._consent is None:
+            return consent_failure_response(SharedPlaneNotConfiguredError())
+        try:
+            room_id, agent_principal_id, reason = consent_request_of(request)
+        except (KeyError, TypeError, ValueError):
+            return consent_malformed_response()
+        try:
+            outcome = await self._consent.revoke(
+                room_id=room_id, agent_principal_id=agent_principal_id, reason=reason
+            )
+        except CONSENT_SURFACE_ERRORS as exc:
+            # Includes `InvalidRevokeReasonError`, which `revoke` raises at step 0 having touched
+            # nothing. It MUST be answered rather than allowed to escape `_dispatch`: `_handle`
+            # would close the socket with no reply, and "a silent close is indistinguishable from a
+            # success at the client, and that is exactly how captures were being dropped".
+            return consent_failure_response(exc)
+        return {"status": 200, "revocation": outcome.model_dump(mode="json")}
 
     async def _route_capture(self, request: dict[str, Any]) -> dict[str, Any]:
         host = HostKind(request["host"])

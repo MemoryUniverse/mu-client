@@ -133,6 +133,10 @@ def render_endpoint_env(settings: ClientSettings) -> dict[str, str]:
     ``.mcp.json`` self-contained and CWD-independent: the client inherits the real endpoints from
     the spawn environment, never from a ``.env`` that may not be next to it (gap A)."""
     out: dict[str, str] = {"MU_RUNTIME_MODE": "local"}
+    # NOTE what is deliberately NOT flattened: ``settings.consent``. Its ``api_token`` is a real
+    # bearer credential, and this mapping is written verbatim into a ``.mcp.json`` / codex
+    # ``config.toml`` on disk. DEV-STANDARDS security: *"secrets only from the secret seam — never
+    # in logs, errors, commits, or config literals."* The consent surface reads its own env.
     _flatten_env("MU_STORAGE", settings.storage, out)
     if settings.model is not None:
         # MUST match the field's own env alias (see ClientSettings.model): emitting the old
@@ -147,6 +151,7 @@ __all__ = [
     "USER_CONFIG_ENV_FILE",
     "CaptureSettings",
     "ClientSettings",
+    "ConsentSettings",
     "DaemonIpcSettings",
     "InjectSettings",
     "ModelProfileSettings",
@@ -381,6 +386,41 @@ class DaemonIpcSettings(BaseModel):
     request_io_timeout_s: float = Field(default=5.0, gt=0)
 
 
+class ConsentSettings(BaseModel):
+    """The agent-share consent surface's env boundary (Decision D4 §4.2-A). ``env: MU_CONSENT__*``.
+
+    **``server_base_url`` defaults to ``None``, and that default is the product rule, not
+    laziness.**
+    ``mu-client/CLAUDE.md``: *"FULL-LOCAL must be a complete, good memory system with no server
+    required."* A laptop with no team server has no agent share to inspect, so every verb on this
+    surface answers a named ``SharedPlaneNotConfiguredError`` rather than pretending an empty
+    result — "no share found" and "this device cannot look" are different answers, and only one of
+    them means the agent is not shared.
+
+    The token is a ``SecretStr`` read from the env seam (DEV-STANDARDS security: *"secrets only from
+    the secret seam — never in logs, errors, commits, or config literals"*). Nothing in
+    :mod:`mu_client.consent` ever logs it, and
+    :class:`~mu_client.errors.SharedPlaneUnreachableError` carries a status code and an operation
+    name, never a URL.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: e.g. ``https://mu.example.com``. The two D4 routes are appended under ``/v1/rooms/...``.
+    #: env: ``MU_CONSENT__SERVER_BASE_URL``
+    server_base_url: str | None = None
+    #: ``Authorization: Bearer <token>`` (``mu-server/src/mu_server/auth.py:116-148``).
+    #: env: ``MU_CONSENT__API_TOKEN``
+    api_token: SecretStr | None = None
+    #: DEV-STANDARDS async-correctness: *"timeouts on every external call."* A consent screen that
+    #: hangs is a consent screen an owner abandons.
+    request_timeout_s: float = Field(default=10.0, gt=0.0)
+    #: The durable local withdrawal record (:mod:`mu_client.consent.tombstone`). A sibling of the
+    #: outbox under the same directory, never the outbox file itself — different schema, different
+    #: owner, and a corrupt outbox must not take the revoke path down with it.
+    tombstone_db_path: Path = Path("~/.memory-universe/consent.sqlite")
+
+
 class ModelProfileSettings(BaseModel):
     """Where the client's model slot points. ``mu_local``'s composition root (``mu_local/
     composition.py:_build_llm_catalog``) closed the ``StorageSettings.llm=None`` seam on
@@ -474,6 +514,9 @@ class ClientSettings(BaseSettings):
     outbox: OutboxSettings = Field(default_factory=OutboxSettings)
     inject: InjectSettings = Field(default_factory=InjectSettings)
     ipc: DaemonIpcSettings = Field(default_factory=DaemonIpcSettings)
+    # Decision D4's client-side agent-sharing consent surface. Inert (every verb refuses by name)
+    # until ``MU_CONSENT__SERVER_BASE_URL`` is set — see ConsentSettings for why that is the rule.
+    consent: ConsentSettings = Field(default_factory=ConsentSettings)
 
     # The η defaults LocalMemoryHost/CLI fall back to when a caller doesn't name one (DEV-STANDARDS
     # rule 3: even a "default" string is config, never an inline literal at the call site).
