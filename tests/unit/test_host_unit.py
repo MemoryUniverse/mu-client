@@ -121,3 +121,48 @@ async def test_start_with_none_model_profile_keeps_heuristic_mode(
     storage = captured["storage"]
     assert isinstance(storage, LocalBackendSettings)
     assert storage.llm is None
+
+
+async def test_start_defaults_embed_backend_to_in_process_minilm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare ``ClientSettings()`` (no ``MU_EMBED_BACKEND`` set) must still select the in-process
+    default — CLAUDE.md's boundary rule (FULL-LOCAL works with zero setup, no VM required)."""
+    captured: dict[str, object] = {}
+    fake_memory = AsyncMock()
+
+    def _fake_local_memory(storage: LocalBackendSettings, **_: object) -> AsyncMock:
+        captured["storage"] = storage
+        return fake_memory
+
+    monkeypatch.setattr("mu_client.host.LocalMemory", _fake_local_memory)
+    host = LocalMemoryHost(ClientSettings(model=None))
+    await host.start()
+
+    storage = captured["storage"]
+    assert isinstance(storage, LocalBackendSettings)
+    assert storage.embedding.backend == "minilm_local"
+
+
+async def test_start_wires_configured_embed_backend_into_backend_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The genuine fix under test: ``ClientSettings.embed_backend`` (``MU_EMBED_BACKEND``) must
+    reach ``LocalMemory`` as ``StorageSettings.embedding.backend`` — the knob that selects the
+    HTTP/VM `EmbeddingPort` seam (`mu_local.composition.LocalContainer._SUPPORTED_EMBEDDING`)
+    instead of the in-process default."""
+    captured: dict[str, object] = {}
+    fake_memory = AsyncMock()
+
+    def _fake_local_memory(storage: LocalBackendSettings, **_: object) -> AsyncMock:
+        captured["storage"] = storage
+        return fake_memory
+
+    monkeypatch.setattr("mu_client.host.LocalMemory", _fake_local_memory)
+    settings = ClientSettings(model=None, embed_backend="minilm_vm_http")
+    host = LocalMemoryHost(settings)
+    await host.start()
+
+    storage = captured["storage"]
+    assert isinstance(storage, LocalBackendSettings)
+    assert storage.embedding.backend == "minilm_vm_http"

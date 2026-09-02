@@ -313,7 +313,16 @@ class InjectSettings(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    top_k: int = 8
+    # ``None`` (the default) asks the engine's `RecallService` to DERIVE the width from the
+    # configured model's own context budget (mu-core ACCURACY-PLAN-0831.md item 4 — "FULL-LOCAL
+    # must stay good on the same mechanism" as every other plane, root CLAUDE.md's boundary
+    # rule). This used to be a bare hardcoded `8` — a mem0/MemOS-style constant this product
+    # criticised THEM for shipping (RETRIEVAL-EVAL-0829.md §13.4: mem0 sends 60, MemOS 40, this
+    # shipped 8) — never measured against this deployment's actual context window. An explicit
+    # `MU_INJECT__TOP_K=<n>` still always overrides derivation, unchanged (recall_bridge.py's own
+    # call site passes this straight through as `RecallResult`'s `limit`, and an explicit int
+    # there always wins over derivation, `RecallQuery.limit`'s own docstring).
+    top_k: int | None = None
     hot_session_ttl_s: int = 1800
     stale_after_s: int = 120
     body_budget_chars: int = 10_000  # Claude Code additionalContext cap (F4)
@@ -499,6 +508,18 @@ class ClientSettings(BaseSettings):
         default_factory=ModelProfileSettings,
         validation_alias="MU_MODEL_PROFILE",
     )
+
+    # Which `EmbeddingPort` seam mu-local's composition root activates
+    # (`mu_local.config.StorageSettings.embedding.backend` / `LocalContainer._SUPPORTED_EMBEDDING`
+    # — host.py threads this field into that `BackendChoice`). "minilm_local" (the default) is the
+    # in-process MiniLM singleton — zero setup, no VM required (CLAUDE.md boundary rule:
+    # FULL-LOCAL must work well with nothing running). "minilm_vm_http" selects the HTTP/VM
+    # backend (`mu_engine.providers.embedding.HttpEmbedder`); ITS OWN knobs (api_base/model/
+    # dimension) are on the ENGINE's env boundary, not this one —
+    # `MU_MODEL_CATALOG__HTTP_EMBED_*` (`mu_engine.config.engine_settings.EngineSettings.
+    # model_catalog`, which also reads this same `~/.memory-universe/config.env`). A flat string,
+    # not a nested subtree (mirrors `device_id` below) — env: **MU_EMBED_BACKEND**.
+    embed_backend: str = "minilm_local"
 
     # Daemon-stage seams (kept flat for backward compat with the foundation stage's tests); env:
     # MU_DAEMON_SOCKET_PATH / MU_OUTBOX_DB_PATH. Same literal defaults as daemon-app-skeleton-

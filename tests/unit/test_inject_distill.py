@@ -18,16 +18,26 @@ pytestmark = pytest.mark.unit
 
 
 def _item(
-    content: str, *, channel: str = "stm", fused_score: float = 1.0, is_floor: bool = False
+    content: str,
+    *,
+    channel: str = "stm",
+    fused_score: float = 1.0,
+    is_floor: bool = False,
+    artifact_ref: str | None = None,
+    mid: str | None = None,
 ) -> RecallItemView:
     tier = {"stm": Tier.STM, "mtm": Tier.MTM, "ltm": Tier.LTM}[channel]
     return RecallItemView(
-        memory_id=f"m-{abs(hash(content)) % 10_000}",
+        # `mid` is an explicit override because the default keys on the CONTENT, and a pointer
+        # hit's content is empty by definition — two distinct pointers would otherwise share one
+        # memory_id and the test would be asserting on an artefact of the helper.
+        memory_id=mid or f"m-{abs(hash(content)) % 10_000}",
         content=content,
         tier=tier,
         channel=channel,
         fused_score=fused_score,
         is_floor=is_floor,
+        artifact_ref=artifact_ref,
     )
 
 
@@ -88,6 +98,30 @@ def test_distill_dedupes_by_normalised_content() -> None:
         _item("Ada lives in Paris"),
     ]
     assert len(distill_items(items)) == 1
+
+
+def test_a_pointer_hit_survives_distillation_and_dedupes_on_its_artifact_id() -> None:
+    """A `kind=reference` hit has NO inline body — that is what makes it a pointer (§6). Keying
+    dedup on `content` alone dropped it here before `slab_from_recall_item` could classify it, so
+    the whole pointer/hydration path was unreachable through `RecallInjectBridge` (AD-199).
+
+    Two pointers at the SAME artifact are the same body and still collapse; an empty row with no
+    pointer at all is still nothing and is still dropped."""
+    kept = distill_items(
+        [
+            _item("", artifact_ref="art-1", mid="p1"),
+            _item("", artifact_ref="art-1", mid="p2"),  # same artifact -> same body -> collapses
+            _item("", artifact_ref="art-2", mid="p3"),
+            _item("", mid="p4"),  # no body and no pointer -> nothing to say
+            _item("the on-call is Ada"),
+        ]
+    )
+
+    assert [(i.content, i.artifact_ref) for i in kept] == [
+        ("", "art-1"),
+        ("", "art-2"),
+        ("the on-call is Ada", None),
+    ]
 
 
 def test_distill_sinks_query_insensitive_floor_below_ranked_hits() -> None:

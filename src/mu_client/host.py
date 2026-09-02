@@ -31,6 +31,7 @@ from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
 from mu_contracts.ports.time import Clock
 from mu_engine.platform.observability import build_metrics, build_tracer
 from mu_engine.storage.domain.memory import MemoryTier
+from mu_local.config import BackendChoice
 from mu_local.config import ModelProfileSettings as LocalModelProfileSettings
 from mu_local.config import StorageSettings as LocalBackendSettings
 from mu_local.local_memory import LocalMemory
@@ -87,7 +88,12 @@ class LocalMemoryHost:
         # instead of the ``LocalBackendSettings()`` no-args construction this replaced, which always
         # left ``llm=None`` and silently forced heuristic mode regardless of
         # ``ClientSettings.model``.
-        backend_settings = LocalBackendSettings(llm=self._local_llm_profile())
+        backend_settings = LocalBackendSettings(
+            llm=self._local_llm_profile(),
+            # ``ClientSettings.embed_backend`` (``MU_EMBED_BACKEND``) — "minilm_local" (default,
+            # in-process) or "minilm_vm_http" (the VM/HTTP backend); see that field's docstring.
+            embedding=BackendChoice(backend=self._settings.embed_backend),
+        )
         # Content-free observability of the previously-silent decision (DEV-STANDARDS rule 4): the
         # defect this fixes was invisible precisely because nothing logged which mode a start()
         # landed in — operational config only (provider/model/group), never memory content.
@@ -101,6 +107,7 @@ class LocalMemoryHost:
             )
         else:
             _log.info("host.start.heuristic_mode", reason="ClientSettings.model is None")
+        _log.info("host.start.embed_backend_selected", backend=backend_settings.embedding.backend)
         with self._tracer.span("host.start"):
             # LocalContainer.__init__ is synchronous and loads the REAL local embedder (a genuine
             # CPU-bound model load, not I/O) — run it off the event loop (DEV-STANDARDS async
@@ -132,7 +139,10 @@ class LocalMemoryHost:
             provider=profile.provider,
             base_url=profile.base_url,
             model=profile.model_name,
-            api_key=profile.api_key.get_secret_value(),
+            # The target field is ``SecretStr | None`` (mu_local/config.py:123). Unwrapping to a
+            # bare ``str`` here was a mypy --strict error AND a needless de-protection: the value
+            # crosses this seam still wrapped, and pydantic keeps it wrapped on the far side.
+            api_key=profile.api_key,
         )
 
     async def aclose(self) -> None:
@@ -236,8 +246,12 @@ class LocalMemoryHost:
         user: str | None = None,
         session: str | None = None,
         tier: MemoryTier | None = None,
-        limit: int = 10,
+        limit: int | None = None,
     ) -> RecallResult:
+        """``limit=None`` (the default, mu-core ACCURACY-PLAN-0831.md item 4 — "FULL-LOCAL must
+        stay good on the same mechanism") asks the underlying ``LocalMemory.recall`` to derive
+        the width from the configured model's own context budget instead of a hardcoded constant;
+        an explicit ``limit=`` here always overrides it, unchanged."""
         memory = self._require_memory()
         return await memory.recall(
             query,
@@ -255,7 +269,7 @@ class LocalMemoryHost:
         user: str | None = None,
         session: str | None = None,
         tier: MemoryTier | None = None,
-        limit: int = 10,
+        limit: int | None = None,
     ) -> RecallResult:
         """mem0 muscle-memory alias for :meth:`recall` (mirrors ``LocalMemory.search``)."""
         return await self.recall(query, user=user, session=session, tier=tier, limit=limit)

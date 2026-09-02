@@ -290,10 +290,33 @@ def prompt_tokens(prompt: str | None) -> frozenset[str]:
 def slab_from_recall_item(item: RecallItemView, *, visibility: Visibility) -> ContextSlab:
     """One ranked hit -> one :class:`ContextSlab`, section assigned by what the hit IS.
 
-    * ``artifact_ref`` set  -> :attr:`Section.REFERENCES` as a **pointer slab** (``text=None``):
-      §6 says a ``kind=reference`` body is never pre-inlined into the state, it is hydrated by id
-      at render time under budget. The surface DTO already carries ``artifact_ref``
-      (``mu_contracts/contracts/recall.py:97``) and the inject path has never read it until now.
+    * ``artifact_ref`` set **AND no inline body** -> :attr:`Section.REFERENCES` as a **pointer
+      slab** (``text=None``): §6 says a ``kind=reference`` body is never pre-inlined into the
+      state, it is hydrated by id at render time under budget.
+
+      ⚠ **The "and no inline body" half was missing, and it emptied the injected context.**
+      This branch used to fire on ``artifact_ref is not None`` alone. CANONICAL-CONTRACTS.md:202
+      says only that *"a ``kind=reference`` recall hit **MAY** carry ``artifact_ref``"* — a MAY in
+      one direction, which does not license the converse — and §6's own definition of a pointer
+      slab is *"``ContextSlab.text=None`` + ``artifact_ref``/``result_ref`` set"*, i.e. the
+      absence of a body is the defining property, not the presence of a link. Meanwhile
+      ``mu-core``'s ``LocalContainer`` threads a real ``ContextRepository`` into the ingest
+      pipeline, which turns on ``PersistRawArtifactStage`` for **every** capture (its own comment:
+      *"every capture becomes kind=REFERENCE targeting a persisted ContextArtifact"*), so EVERY
+      recalled hit carries an ``artifact_ref``. The two together meant every hit became a pointer
+      slab; no hydrator is wired on this plane (see :class:`ArtifactHydratorPort`), so every
+      render produced ``<references>[reference … not expanded — no artifact store wired]`` and
+      **zero recalled content** — the injected context, which is the product. MEASURED on the VM,
+      2026-08-30: seven `tests/integration/` cases failed on exactly this, e.g. *"assert 'Paris'
+      in '<memory_context>\\n<references>\\n- [reference art_… not expanded …]'"*.
+
+      The engine hands back a real ``content`` for every hit, so "the body lives only in the
+      artifact" is now read off the body itself. A genuine pointer slab (no body) still takes the
+      §6 path unchanged, and ``artifact_ref`` is still carried on every slab either way, so
+      hydration remains available the day a hydrator is wired. The deeper question — whether
+      ``mu-core`` should be stamping ``artifact_ref``/``kind=REFERENCE`` on every proposition at
+      all, when CANONICAL:469 defines the field as *"→ ``ContextArtifact.id`` **when
+      kind=reference**"* — is recorded as a delta and belongs to the owner, not to this branch.
     * ``is_floor``         -> :attr:`Section.RECENT`, the verbatim recency floor (recall §1.3).
     * otherwise            -> :attr:`Section.RECALLED_MEMORY`, the answer-bearing band.
 
@@ -303,7 +326,7 @@ def slab_from_recall_item(item: RecallItemView, *, visibility: Visibility) -> Co
     is in fact the right question for §5.3.
     """
     engine_hash = getattr(item, "content_hash", None)
-    if item.artifact_ref is not None:
+    if item.artifact_ref is not None and not item.content:
         section, text = Section.REFERENCES, None
     elif item.is_floor:
         section, text = Section.RECENT, item.content

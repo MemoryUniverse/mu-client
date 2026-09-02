@@ -544,6 +544,31 @@ async def test_a_reference_hit_is_a_pointer_slab_not_an_inlined_body() -> None:
     assert slab.artifact_ref == "art-42"
 
 
+async def test_a_hit_with_a_provenance_link_and_a_body_is_not_a_pointer_slab() -> None:
+    """The regression that emptied the injected context (ARCHITECTURE-DELTAS AD-199).
+
+    ``mu-core``'s ``LocalContainer`` threads a real ``ContextRepository`` into the ingest
+    pipeline, so ``PersistRawArtifactStage`` runs on EVERY capture and stamps an ``artifact_ref``
+    on every memory — the raw transcript's provenance, not a statement that the body lives
+    elsewhere. Classifying on ``artifact_ref is not None`` alone therefore turned every recalled
+    hit into a pointer slab, and since no hydrator is wired on this plane every render emitted
+    ``<references>[reference … not expanded — no artifact store wired]`` and NOTHING else.
+    Measured on the VM, 2026-08-30: seven real-store integration cases failed on it.
+
+    CANONICAL-CONTRACTS.md:202 only says a ``kind=reference`` hit **MAY** carry ``artifact_ref``;
+    §6's definition of a pointer slab is the ABSENCE of a body. So the body decides, and the link
+    still rides along for the day a hydrator exists."""
+    slab = slab_from_recall_item(
+        _item("Ada lives in Paris", mid="m1", artifact_ref="art-42"),
+        visibility=Visibility.PRIVATE,
+    )
+
+    assert slab.text == "Ada lives in Paris", "the engine's own body was thrown away"
+    assert slab.section is Section.RECALLED_MEMORY
+    assert slab.is_pointer is False
+    assert slab.artifact_ref == "art-42", "the provenance link must still ride along"
+
+
 async def test_a_budget_forbidden_hydration_emits_a_named_marker_not_a_silent_drop(
     client_config: ClientSettings,
 ) -> None:
@@ -937,7 +962,11 @@ async def test_two_principals_sharing_a_session_id_get_independent_live_state(
 
     recall = cast(AsyncMock, started_host._memory.recall)  # type: ignore[union-attr]
     bridge = RecallInjectBridge(started_host, settings=InjectSettings(), hydrator=_Hydrator())
-    recall.return_value = _listing(_item("see the ADR doc", mid="m1", artifact_ref="art-1"))
+    # A GENUINE pointer slab: no inline body, so §6 must hydrate it. (It used to be enough to
+    # set `artifact_ref` with a body present, but that is no longer a pointer slab — see
+    # `slab_from_recall_item`'s ⚠ note: every capture carries an `artifact_ref` today, and
+    # treating that alone as "no body" emptied the injected context.)
+    recall.return_value = _listing(_item("", mid="m1", artifact_ref="art-1"))
 
     await bridge.render(_SESSION, user="alice", query="which graph store")
     await bridge.render(_SESSION, user="bob", query="which graph store")
@@ -1244,7 +1273,8 @@ async def test_a_named_non_hydration_does_not_spill_memory_content_to_disk(
     )
     recall.return_value = _listing(
         _item("alice's salary is 200000 eur", mid="m1"),
-        _item("the design doc", mid="m2", artifact_ref="art-1"),
+        # No inline body -> a real pointer slab, which is what produces the marker under test.
+        _item("", mid="m2", artifact_ref="art-1"),
     )
     rendered = await bridge.render(_SESSION, query="salary")
 

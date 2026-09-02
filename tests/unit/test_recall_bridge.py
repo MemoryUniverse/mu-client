@@ -47,6 +47,30 @@ async def test_fresh_render_includes_recalled_content(started_host: LocalMemoryH
     assert rendered.etag
 
 
+async def test_default_top_k_forwards_none_so_the_engine_derives_the_width(
+    started_host: LocalMemoryHost,
+) -> None:
+    """mu-core ACCURACY-PLAN-0831.md item 4 / root CLAUDE.md's "FULL-LOCAL must stay good on the
+    same mechanism": ``InjectSettings.top_k`` used to be a bare hardcoded ``8`` — this pins that
+    the DEFAULT config now forwards ``limit=None`` all the way to ``LocalMemory.recall``, so the
+    engine's own context-budget derivation actually activates, rather than silently continuing to
+    send a fixed width nobody measured against this deployment's own model."""
+    started_host._memory.recall.return_value = _listing("Ada lives in Paris")  # type: ignore[union-attr]
+    bridge = RecallInjectBridge(started_host, settings=InjectSettings())
+    await bridge.render("s1", query="Where does Ada live?")
+    _, kwargs = started_host._memory.recall.call_args  # type: ignore[union-attr]
+    assert kwargs["limit"] is None
+
+
+async def test_explicit_top_k_still_overrides_derivation(started_host: LocalMemoryHost) -> None:
+    """An operator-configured ``MU_INJECT__TOP_K`` always wins over derivation, unchanged."""
+    started_host._memory.recall.return_value = _listing("Ada lives in Paris")  # type: ignore[union-attr]
+    bridge = RecallInjectBridge(started_host, settings=InjectSettings(top_k=5))
+    await bridge.render("s1", query="Where does Ada live?")
+    _, kwargs = started_host._memory.recall.call_args  # type: ignore[union-attr]
+    assert kwargs["limit"] == 5
+
+
 async def test_cold_cache_on_empty_recall(started_host: LocalMemoryHost) -> None:
     started_host._memory.recall.return_value = _listing()  # type: ignore[union-attr]
     bridge = RecallInjectBridge(started_host, settings=InjectSettings())

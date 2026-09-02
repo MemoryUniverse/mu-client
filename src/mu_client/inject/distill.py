@@ -101,7 +101,18 @@ def distill_items(items: Sequence[RecallItemView]) -> list[RecallItemView]:
     for item in ordered:
         if is_tool_noise(item.content):
             continue
-        key = _normalise(item.content)
+        # A POINTER hit has no inline body by definition — its body lives in the artifact and is
+        # hydrated by id at render time (§6). Keying dedup on `content` alone therefore dropped it
+        # here, silently, BEFORE `slab_from_recall_item` could ever classify it: `not key` was
+        # true for every genuine `kind=reference` hit, so the whole §6 pointer/hydration path was
+        # unreachable through this bridge (ARCHITECTURE-DELTAS AD-199; found when two `test_live_
+        # context_assembly` cases were corrected to model a REAL pointer slab and stopped seeing
+        # their reference at all). Dedupe such a hit on its artifact id instead: two hits pointing
+        # at the same artifact are the same body, and an empty row with no pointer is still
+        # nothing and is still dropped.
+        key = _normalise(item.content) or (
+            f"artifact:{item.artifact_ref}" if item.artifact_ref else ""
+        )
         if not key or key in seen:
             continue
         seen.add(key)

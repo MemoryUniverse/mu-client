@@ -158,6 +158,43 @@ Codex is wired the same way: `uv run mu install codex` writes the `notify` progr
 there, and `mu backfill-codex` replays existing rollout files. Codex sessions can also use the
 daemonless `mu add` / `mu recall` commands directly.
 
+### Where embedding runs (`MU_EMBED_BACKEND`)
+
+By default the daemon embeds **in-process**, with `sentence-transformers/all-MiniLM-L6-v2` loaded
+once inside the client process. That is the FULL-LOCAL posture and it needs nothing running
+anywhere: no VM, no endpoint, no key. Leave it alone unless you have a reason not to.
+
+If you would rather not pay a model load on the machine you are typing on, point the seam at an
+OpenAI-compatible `/embeddings` endpoint instead. Four settings, all readable from
+`~/.memory-universe/config.env`:
+
+```bash
+MU_EMBED_BACKEND=minilm_vm_http                                   # default: minilm_local
+MU_MODEL_CATALOG__HTTP_EMBED_API_BASE=http://127.0.0.1:11435/v1   # unset = backend not offered
+MU_MODEL_CATALOG__HTTP_EMBED_MODEL=all-minilm                     # default
+MU_MODEL_CATALOG__HTTP_EMBED_DIMENSION=384                        # default
+```
+
+`HTTP_EMBED_API_BASE` is the switch: with it unset the HTTP backend is not even registered, so an
+untouched box behaves exactly as it did before this existed. Reverting is one line — comment
+`MU_EMBED_BACKEND` and the in-process default takes over again.
+
+**The dimension is not a preference.** Live MTM collections are named
+`mu_mtm__<hash>__<visibility>__<dim>` — `384` on every existing corpus — and a vector of a
+different width, or from a different model family, is incomparable to everything already stored.
+`all-minilm` is Ollama's GGUF conversion of the same `all-MiniLM-L6-v2`: measured cosine **0.999999**
+against the in-process model on identical text, and a VM-embedded query retrieves in-process-embedded
+memories at their correct rank (0.63 / 0.79 / 0.85 on the three probes recorded in
+`docs/tracking/ARCHITECTURE-DELTAS.md`, 2026-08-31). Changing to a model of a different width is a
+re-embed migration, not a config edit.
+
+The adapter fails **loud**, never soft: an unreachable endpoint, a timeout, a non-2xx, a wrong
+vector width, a wrong item count, or an all-zero vector all raise. It will not write a zero vector,
+a padded vector, or a truncated one — that failure (D1) is silent by nature and corrupts a corpus
+without ever erroring, so every one of those cases is a hard refusal. Verified by breaking the
+endpoint five different ways through the real `add()` path and confirming zero points were written
+each time.
+
 ## Architecture, in one paragraph
 
 ```mermaid
