@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
     from mu_engine.services.health.service import MemoryHealthService
     from mu_engine.services.pin.service import PinService
+    from mu_engine.storage.user_registry import UserPrefixRegistryPort
 
 __all__ = ["LocalMemoryHost", "daemonless_host"]
 
@@ -186,6 +187,18 @@ class LocalMemoryHost:
         upsert or cannot count the partition's pin bound. Same passthrough discipline as
         :attr:`health`."""
         return self._require_memory().pin
+
+    @property
+    def user_registry(self) -> UserPrefixRegistryPort | None:
+        """AD-268 fix (ADR 0071, PROTOTYPE-DEBT-0924.md D5) — the owned ``LocalMemory``'s durable,
+        cross-namespace user-prefix registry (``LocalMemory.user_registry`` ->
+        ``LocalContainer.stm``), or ``None`` when the bound STM backend does not satisfy
+        :class:`~mu_engine.storage.user_registry.UserPrefixRegistryPort` (e.g. the in-process
+        test/degrade STM adapter has no durable substrate to register into). Passed into
+        ``MaintenanceLoop(user_registry=...)`` (``daemon/app.py``) so a restarted daemon can
+        rebuild its active-user registry from durable storage instead of starting from empty —
+        same passthrough discipline as :attr:`health`/:attr:`pin`."""
+        return self._require_memory().user_registry
 
     def build_lifecycle_manager(
         self,

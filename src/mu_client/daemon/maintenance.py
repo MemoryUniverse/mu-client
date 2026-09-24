@@ -17,6 +17,15 @@ Three independent trigger paths run concurrently, mirroring the MMA dual-trigger
    invariant is ``pre_ttl_scan_interval_s <= pre_ttl_window_s / 2``, not a comparison against
    ``stm_ttl_s - pre_ttl_window_s``). AC-1.3a (§14.1).
 
+All three above only ever act on a user already IN :attr:`_active_users` — a plain in-process
+dict, empty on every fresh process. A **4th path, discovery** (§7 "hybrid discovery", ADR 0071 /
+AD-268 / PROTOTYPE-DEBT-0924.md D5), durably REFILLS that dict instead of firing a sweep itself:
+once at :meth:`run` startup and then on ``lifecycle.full_scan_interval_s`` (:meth:`_full_scan_loop`
+/ :meth:`_discover_known_users`), reading every registered :class:`UserPrefix` from
+:attr:`_user_registry` (``UserPrefixRegistryPort``, when the bound STM backend supports it) so a
+restarted daemon does not have to wait for a user to WRITE before any of paths 2/3 can see them
+again — see :meth:`_discover_known_users`'s own docstring for the closed gap this fixes.
+
 ``MaintenanceLoop`` itself carries NO promotion/demotion/consolidate/cursor logic — that is
 entirely ``MemoryLifecycleManager.sweep_user``'s business (S1-03, wrapping ``PromotionService``/
 ``DemotionService``/``DistillPipeline`` — S1-01/S1-02/S1-05, including the durable consumed-offset
@@ -54,6 +63,7 @@ from mu_contracts.domain.events import DegradeReason, DomainEvent, MemoryCapture
 from mu_contracts.domain.model.lifecycle import JobHandle, UserPrefix
 from mu_contracts.ports.bus import EventBusPort, Subscription
 from mu_engine.lifecycle.settings import LifecycleSettings
+from mu_engine.storage.user_registry import UserPrefixRegistryPort
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mu_client.observability.events import log_degraded
@@ -166,11 +176,18 @@ class MaintenanceLoop:
         bus: EventBusPort,
         lifecycle_manager: LifecycleManagerPort | None = None,
         settings: LifecycleSettings | None = None,
+        user_registry: UserPrefixRegistryPort | None = None,
     ) -> None:
         self._bus = bus
         self._mlm: LifecycleManagerPort = lifecycle_manager or _UnwiredLifecycleManager()
         self._settings = settings or MaintenanceEnvSettings()
         self._stop = asyncio.Event()
+        # AD-268 fix (ADR 0071, PROTOTYPE-DEBT-0924.md D5): the durable, cross-namespace
+        # discovery source — `None` on a binding whose STM backend cannot durably enumerate
+        # (module docstring's `_UnwiredLifecycleManager` degrade-honest pattern, applied to
+        # discovery instead of to the sweep itself: this loop still runs, still answers bus
+        # events, it just cannot rediscover a restart's existing users from durable storage).
+        self._user_registry = user_registry
 
         # Event-driven fast-fire state (§7).
         self._batch_counts: dict[UserPrefix, int] = {}
@@ -201,6 +218,9 @@ class MaintenanceLoop:
         self.coalesced_count = 0
         self.rescue_fire_count = 0
         self.rescue_coalesced_count = 0
+        # AD-268 (D5) discovery counters — content-free, read by tests/health checks.
+        self.discovery_tick_count = 0
+        self.discovered_user_count = 0
 
     @property
     def settings(self) -> LifecycleSettings:
@@ -268,17 +288,78 @@ class MaintenanceLoop:
         finally:
             self._inflight_rescue.discard(user_prefix)
 
+    # --------------------------------------------------------------- AD-268 discovery (D5 fix) ===
+    async def _discover_known_users(self) -> None:
+        """Reseed :attr:`_active_users` from the durable, cross-namespace registry (spec §7
+        "hybrid discovery" — the slow full-scan HALF; the event-driven half is
+        :meth:`_on_bus_event`, unchanged). A no-op, not a degrade, when :attr:`_user_registry` is
+        ``None`` (an unsupporting STM backend) — this loop still runs on bus events alone, exactly
+        its pre-fix behaviour, it simply cannot ALSO rediscover a restart's existing users.
+
+        Deliberately ``setdefault``: a prefix this process has ALREADY observed via a real bus
+        event keeps its (fresher, actually-current) ``touched_at`` — discovery only ever ADDS a
+        prefix this process has not seen yet, never overwrites live in-process state with a
+        durable-but-staler timestamp.
+
+        Best-effort by design (the same posture :meth:`RedisStmAdapter._register_user_prefix`
+        takes on the write side, mu-core): a transient registry-read fault must never crash this
+        supervised task or stop bus-driven sweeps from firing — it is logged as a named degrade
+        and the NEXT tick tries again, rather than propagating out of :meth:`run`'s ``TaskGroup``
+        and taking every other supervised daemon task down with it."""
+        if self._user_registry is None:
+            return
+        try:
+            prefixes = await self._user_registry.list_user_prefixes(
+                limit=self._settings.max_users_per_sweep
+            )
+        except Exception as exc:  # best-effort discovery, see docstring — never crash this task.
+            log_degraded(
+                component="lifecycle",
+                mode="discover_known_users",
+                reason=DegradeReason.DURABLE_SUBSTRATE_DOWN,
+                detail=f"user_registry_read_failed={type(exc).__name__}",
+            )
+            return
+        now = time.monotonic()
+        for prefix in prefixes:
+            self._active_users.setdefault(prefix, now)
+        self.discovery_tick_count += 1
+        self.discovered_user_count = len(prefixes)
+
+    async def _full_scan_loop(self) -> None:
+        """The slow full-scan backstop cadence (spec §7, ``LifecycleSettings.full_scan_interval_s``
+        — a field that existed since S0-07 and had zero callers anywhere in this repo until this
+        fix, PROTOTYPE-DEBT-0924.md D5/AD-268). Same immediate-first-tick / cooperative
+        ``wait_for``-bounded-stop shape as :meth:`_periodic_maintenance_loop`/:meth:`_pre_ttl_loop`
+        — this is a 3rd, independent cadence, not folded into either: it answers a DIFFERENT
+        question ("which users exist that this process has not seen an event for") on a
+        deliberately slower clock (spec default: 24h, same order as the maintenance sweep) than
+        either lifecycle cadence needs to run at."""
+        while not self._stop.is_set():
+            await self._discover_known_users()
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=self._settings.full_scan_interval_s
+                )
+            except TimeoutError:
+                continue
+
     # ---------------------------------------------------------------------------------- run/stop
     async def run(self) -> None:
         """Started as the 3rd ``TaskGroup`` member (``daemon/app.py::_supervise``, one additional
-        ``tg.create_task(maintenance.run())`` line). Subscribes to the bus, then runs the two
-        independent periodic cadences (§7b) concurrently; a cancellation (ordered shutdown,
-        ``stop()``) unsubscribes cleanly before returning."""
+        ``tg.create_task(maintenance.run())`` line). Subscribes to the bus, reseeds the active-user
+        registry from durable storage BEFORE either periodic cadence's first tick can run (AD-268
+        fix — a restart must not sweep/rescue zero users while a durable registry says otherwise),
+        then runs the three independent periodic loops (§7b + the D5 full-scan backstop)
+        concurrently; a cancellation (ordered shutdown, ``stop()``) unsubscribes cleanly before
+        returning."""
         self._subscribe()
+        await self._discover_known_users()
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self._periodic_maintenance_loop())
                 tg.create_task(self._pre_ttl_loop())
+                tg.create_task(self._full_scan_loop())
         finally:
             await self._unsubscribe()
 
@@ -344,12 +425,16 @@ class MaintenanceLoop:
         :meth:`_pre_ttl_loop`'s body, which was the defect). See :meth:`_sweep_active_users_rescue`
         for the narrow pre-TTL-only sibling.
 
-        Discovery gap (integrate-phase note, spec §7's "hybrid discovery"): this loop's only user
-        directory is the ACTIVE-user registry populated by bus events — the spec's
-        ``full_scan_interval_s`` "slow full-scan backstop... so a user with no recent events still
-        ages" needs a user-enumeration port no Stage-0/Stage-1 task in this plan yet exposes. Until
-        one lands, a user who never triggers a single ``MemoryCaptured``/``MemoryPromoted`` event
-        is invisible to both periodic loops here — tracked, not silently assumed complete.
+        **Discovery gap — CLOSED (2026-09-24, ADR 0071, AD-268, PROTOTYPE-DEBT-0924.md D5).** This
+        loop's user directory was ONLY the in-process active-user registry populated by bus
+        events — after a daemon restart it started empty and stayed empty for any user who did
+        not write again, run-verified (``active_user_count 0``, ``sweep_user calls 0``). Fixed by
+        :meth:`_discover_known_users`/:meth:`_full_scan_loop`: :attr:`_user_registry`, when the
+        bound STM backend supports it (``UserPrefixRegistryPort``, ``mu_engine.storage.
+        user_registry``), durably reseeds :attr:`_active_users` once at :meth:`run` startup AND on
+        the ``full_scan_interval_s`` cadence the spec always named for exactly this. A binding
+        with no supporting backend keeps the PRE-fix behaviour (bus-events-only) rather than
+        failing — see :meth:`_discover_known_users`'s own docstring.
         """
         for user_prefix in list(self._active_users)[:cap]:
             await self._fire_sweep(user_prefix)

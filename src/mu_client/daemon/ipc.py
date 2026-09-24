@@ -100,7 +100,7 @@ from mu_client.memory_health import (
     unwired_response,
 )
 from mu_client.observability.events import log_activity_captured, log_capture_source_halted
-from mu_client.outbox.sqlite_outbox import SqliteOutbox
+from mu_client.outbox.sqlite_outbox import OUTBOX_REDRIVE_ROUTE, SqliteOutbox
 
 if TYPE_CHECKING:
     # Type-only (mirrors host.py/app.py's identical guard): IpcServer never CONSTRUCTS a
@@ -262,6 +262,8 @@ class IpcServer:
             return await self._route_agent_share(request)
         if route == AGENT_SHARE_REVOKE_ROUTE:
             return await self._route_agent_share_revoke(request)
+        if route == OUTBOX_REDRIVE_ROUTE:
+            return await self._route_outbox_redrive(request)
         return {"status": 404, "error": "unknown_route", "route": route}
 
     async def _route_agent_share(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -345,6 +347,20 @@ class IpcServer:
             "outbox_depth": await self._outbox.outbox_depth(),
             "dead_letter_count": await self._outbox.undelivered_count(),
         }
+
+    async def _route_outbox_redrive(self, request: dict[str, Any]) -> dict[str, Any]:
+        """AD-270a fix (ADR 0072, PROTOTYPE-DEBT-0924.md B3) — the operator-verb surface
+        ``SqliteOutbox.redrive_dead`` never had (see that method's own docstring for why this is
+        deliberately a verb, not an automatic policy). ``limit`` is REQUIRED on the wire (never a
+        module-level default here — ``cli.py`` resolves its own default from
+        ``OutboxSettings.batch_size``, DEV-STANDARDS rule 3) and must be a positive int; a
+        malformed request is answered, never raised into a socket close (module docstring's "this
+        server never answers with silence")."""
+        limit = request.get("limit")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            return {"status": 400, "error": "malformed_request", "field": "limit"}
+        redriven = await self._outbox.redrive_dead(limit=limit)
+        return {"status": 200, "redriven": redriven}
 
     async def _route_state(self, request: dict[str, Any]) -> dict[str, Any]:
         """``/state`` -> ``MemoryLifecycleManager.get_state(ns)`` — instant warm read (spec §5).

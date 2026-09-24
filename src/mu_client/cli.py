@@ -47,7 +47,7 @@ from mu_client.memory_health import (
     UNPIN_ROUTE,
     namespace_for,
 )
-from mu_client.outbox.sqlite_outbox import SqliteOutbox
+from mu_client.outbox.sqlite_outbox import OUTBOX_REDRIVE_ROUTE, SqliteOutbox
 from mu_client.workers.ingest_client import InProcessLocalIngest
 from mu_client.workers.pool import OutboxWorker
 
@@ -153,6 +153,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="A NAMED reason for an operator ('user_revoked', 'policy_change'). It lands on a "
         "content-free trust-ledger row, so it is REFUSED unless it is a name: "
         f"{NAMED_REASON_RULE}. Prose about the conversation is not a name.",
+    )
+
+    # ---- AD-270a fix (ADR 0072): the outbox dead-letter operator surface (PROTOTYPE-DEBT-0924.md
+    # B3) — `SqliteOutbox.redrive_dead` was built, tested, and had no caller. Deliberately an
+    # OPERATOR verb (see that method's own docstring): a DEAD row already failed every automatic
+    # retry this outbox offers, so redriving it is a decision a person makes after reading
+    # `last_error`, not a timer.
+    outbox_p = sub.add_parser(
+        "outbox", help="Inspect/operate the capture durability spine (AD-270a)."
+    )
+    outbox_sub = outbox_p.add_subparsers(dest="outbox_action", required=True)
+    outbox_redrive_p = outbox_sub.add_parser(
+        "redrive",
+        help="Move DEAD (retries-exhausted) captures back to PENDING so the outbox worker "
+        "re-delivers them. Requires the daemon to be running.",
+    )
+    outbox_redrive_p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max rows to redrive in one call (default: OutboxSettings.batch_size).",
     )
 
     for name, help_text in (
@@ -448,6 +469,23 @@ async def _run_pin(args: argparse.Namespace, *, route: str) -> int:
     return 0
 
 
+async def _run_outbox_redrive(args: argparse.Namespace) -> int:
+    """``mu outbox redrive`` — AD-270a fix (ADR 0072). Goes over the daemon's IPC socket (never
+    a direct ``SqliteOutbox`` open from this process): the daemon's ``WorkerPool`` owns the ONE
+    live connection to the outbox db, and a second writer opening it directly would race that
+    connection's own ``asyncio.Lock`` serialization (``SqliteOutbox``'s own module docstring).
+    Requires a running daemon — a named failure, not a fallback to a second connection, when it
+    is not (:func:`_render_ipc_failure` on a connection-refused reply from
+    :class:`~mu_client.daemon.ipc_client.IpcClient`)."""
+    settings = get_client_settings()
+    limit = args.limit if args.limit is not None else settings.outbox.batch_size
+    reply = await IpcClient(settings.ipc).request(OUTBOX_REDRIVE_ROUTE, {"limit": limit})
+    if reply.get("status") != 200:
+        return _render_ipc_failure(reply)
+    print(f"redriven {reply['redriven']} dead-lettered capture(s) back to pending.")
+    return 0
+
+
 async def _run_agent_share(args: argparse.Namespace) -> int:
     """``mu agent-share status|revoke`` — the owner's own consent surface.
 
@@ -658,6 +696,9 @@ async def _run(argv: Sequence[str]) -> int:
         return await _run_pin(args, route=args.command)
     if args.command == "agent-share":
         return await _run_agent_share(args)
+    if args.command == "outbox":
+        if args.outbox_action == "redrive":
+            return await _run_outbox_redrive(args)
     async with daemonless_host() as host:
         if args.command == "add":
             _render_write(

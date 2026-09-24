@@ -427,3 +427,66 @@ async def test_capture_ack_p99_within_budget_while_maintenance_loop_sweeps_many_
         f"capture_ack_p99_delta_budget_ms={budget_ms}ms "
         f"(baseline p99={base_p99_ms:.1f}ms, loaded p99={loaded_p99_ms:.1f}ms)"
     )
+
+
+# =====================================================================================
+# AD-268 fix (ADR 0071/0072, PROTOTYPE-DEBT-0924.md D5) — the cross-namespace STM user-prefix
+# registry. PROBE 2 (the audit) measured a real `MaintenanceLoop` one second after a simulated
+# restart, with a month of a user's memories sitting in real Valkey: `active_user_count 0`,
+# `sweep_user calls 0`, `rescue_pre_ttl_user calls 0`. This section reproduces that EXACT
+# scenario against the SAME real store and proves the fix closes it — real `RedisStmAdapter`
+# writes (no bus event fired, ever, for this namespace: nothing in this test publishes on the
+# bus), then a BRAND NEW `MaintenanceLoop` instance discovers and sweeps the user anyway.
+# =====================================================================================
+
+
+@pytest.mark.asyncio
+async def test_restarted_loop_discovers_and_sweeps_a_user_it_never_saw_a_bus_event_for(
+    redis_client: Redis, uid: str
+) -> None:
+    """The fix, proved the same way the defect was: run a real `MaintenanceLoop`, never publish
+    a single bus event, and confirm it still finds and sweeps the user — because a DIFFERENT
+    process (or an earlier incarnation of this same one) already wrote their memories to the
+    REAL, durable store.
+
+    **MUTATION:** delete the ``await self._discover_known_users()`` call from
+    ``MaintenanceLoop.run()`` -> this test goes RED reproducing PROBE 2's exact measurement
+    (``active_user_count 0``, ``sweep_user calls 0``) against this same real Valkey.
+    """
+    ns = _ns(uid=uid)
+    adapter = RedisStmAdapter(redis_client)
+    item = _item(ns=ns, content="a memory written before this daemon incarnation started")
+    await adapter.put(item)
+    try:
+        # A restart's own bus is brand new — no in-process memory of `ns` exists anywhere here,
+        # exactly as a freshly-started daemon process has none.
+        bus = InprocBus()
+        mlm = _CursorAwareConsolidateStub(adapter, ns=ns)
+        settings = LifecycleSettings(maintenance_interval_s=3600, pre_ttl_scan_interval_s=3600)
+        loop = MaintenanceLoop(
+            bus=bus, lifecycle_manager=mlm, settings=settings, user_registry=adapter
+        )
+
+        run_task = asyncio.create_task(loop.run())
+        try:
+            await asyncio.sleep(0.5)
+            print(  # noqa: T201
+                f"AD-268 POST-FIX PROBE: active_user_count={loop.active_user_count} "
+                f"sweep_user_calls={len(mlm.seen_ids)}"
+            )
+            assert loop.active_user_count >= 1, (
+                "a durably-written user must be discovered without any bus event — this is the "
+                "EXACT defect PROBE 2 measured as active_user_count=0"
+            )
+            assert UserPrefix(ns) in loop._active_users
+            assert item.id in mlm.seen_ids, (
+                "discovery must feed the SAME sweep path a bus-discovered user gets — a memory "
+                "already resident in real Valkey before this loop started must be swept"
+            )
+        finally:
+            await loop.stop()
+            await run_task
+    finally:
+        await adapter.evict(ns, item.id)
+        await redis_client.zrem(RedisMapper.user_registry_key(), str(UserPrefix(ns)))
+        await _cleanup_ns(redis_client, ns)

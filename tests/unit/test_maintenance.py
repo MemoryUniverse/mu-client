@@ -187,6 +187,148 @@ async def test_coalescing_never_launches_two_concurrent_sweeps_for_the_same_user
     await loop._unsubscribe()
 
 
+# ------------------------------------------------------ AD-268 discovery (D5 fix, ADR 0071/0072)
+class _StubUserRegistry:
+    """A minimal ``UserPrefixRegistryPort`` — records every ``list_user_prefixes`` call so a test
+    can assert the discovery cadence, and can be told to raise (transient store fault) on demand."""
+
+    def __init__(self, prefixes: list[UserPrefix] | None = None, *, raises: bool = False) -> None:
+        self.prefixes = prefixes or []
+        self.raises = raises
+        self.call_count = 0
+
+    async def list_user_prefixes(self, *, limit: int) -> list[UserPrefix]:
+        self.call_count += 1
+        if self.raises:
+            raise ConnectionError("simulated transient registry fault")
+        return list(self.prefixes)[:limit]
+
+
+async def test_run_reseeds_active_users_from_the_durable_registry_before_any_periodic_tick(
+    bus: InprocBus,
+) -> None:
+    """PROTOTYPE-DEBT-0924.md D5's own PROBE 2, proved as a fix: a ``MaintenanceLoop`` built over
+    a registry that ALREADY durably knows about a user — no bus event for that user in THIS
+    process — must show that user in :attr:`active_user_count` immediately (before either
+    periodic loop's first tick even runs), and the very next maintenance tick must sweep them.
+
+    **MUTATION:** remove the ``await self._discover_known_users()`` call from ``run()`` -> this
+    test goes RED on both asserts (pre-fix behaviour: ``active_user_count == 0``, ``mlm.calls ==
+    []``, exactly PROBE 2's measured `active_user_count 0, sweep_user calls 0`)."""
+    ns = _ns(user="restarted-user")
+    registry = _StubUserRegistry(prefixes=[UserPrefix(ns)])
+    settings = LifecycleSettings(maintenance_interval_s=3600, pre_ttl_scan_interval_s=3600)
+    mlm = _RecordingLifecycleManager()
+    loop = MaintenanceLoop(
+        bus=bus, lifecycle_manager=mlm, settings=settings, user_registry=registry
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    try:
+        await asyncio.sleep(0.05)
+        assert loop.active_user_count == 1, "a durably-registered user must be found on restart"
+        assert UserPrefix(ns) in mlm.calls, (
+            "the FIRST maintenance tick (body-first, immediate) must sweep a user discovered from "
+            "durable storage, exactly as it would sweep one discovered from a bus event"
+        )
+    finally:
+        await loop.stop()
+        await run_task
+
+
+async def test_discovery_with_no_registry_is_a_safe_no_op(bus: InprocBus) -> None:
+    """The pre-fix behaviour (bus-events-only) must be exactly preserved when the bound STM
+    backend does not support the registry (``user_registry=None``, the default) — discovery must
+    never itself be a reason the loop cannot start."""
+    settings = LifecycleSettings(maintenance_interval_s=3600, pre_ttl_scan_interval_s=3600)
+    loop = MaintenanceLoop(
+        bus=bus, lifecycle_manager=_RecordingLifecycleManager(), settings=settings
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    try:
+        await asyncio.sleep(0.05)
+        assert loop.active_user_count == 0
+        assert loop.discovery_tick_count == 0
+    finally:
+        await loop.stop()
+        await run_task
+
+
+async def test_discovery_read_failure_never_crashes_the_loop(bus: InprocBus) -> None:
+    """Best-effort by design (module docstring): a transient registry fault must not propagate
+    out of the supervised ``run()`` task and take the whole daemon's TaskGroup down with it."""
+    settings = LifecycleSettings(maintenance_interval_s=3600, pre_ttl_scan_interval_s=3600)
+    registry = _StubUserRegistry(raises=True)
+    loop = MaintenanceLoop(
+        bus=bus,
+        lifecycle_manager=_RecordingLifecycleManager(),
+        settings=settings,
+        user_registry=registry,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    try:
+        await asyncio.sleep(0.05)
+        assert not run_task.done(), "a registry read fault must not crash the supervised task"
+        assert registry.call_count >= 1
+        assert loop.active_user_count == 0
+    finally:
+        await loop.stop()
+        await run_task
+
+
+async def test_discovery_never_overwrites_a_fresher_in_process_touched_at(bus: InprocBus) -> None:
+    """A user this process has ALREADY observed via a real bus event keeps its own state —
+    discovery only ever ADDS a prefix the process has not seen yet (``setdefault``, never a raw
+    assignment that could stomp fresher in-process activity with a staler durable timestamp)."""
+    ns = _ns(user="already-active")
+    registry = _StubUserRegistry(prefixes=[UserPrefix(ns)])
+    settings = LifecycleSettings(
+        maintenance_interval_s=3600, pre_ttl_scan_interval_s=3600, batch_size=1000
+    )
+    mlm = _RecordingLifecycleManager()
+    loop = MaintenanceLoop(
+        bus=bus, lifecycle_manager=mlm, settings=settings, user_registry=registry
+    )
+    loop._subscribe()
+    await bus.publish(MemoryCaptured(namespace=ns, ids=["m1"], tier=Tier.STM))
+    touched_at_before = loop._active_users[UserPrefix(ns)]
+
+    await loop._discover_known_users()
+
+    assert loop._active_users[UserPrefix(ns)] == touched_at_before
+    await loop._unsubscribe()
+
+
+async def test_full_scan_loop_ticks_on_its_own_cadence(bus: InprocBus) -> None:
+    """The D5 backstop is a genuinely independent 4th cadence, not folded into either lifecycle
+    loop — same "ticks repeatedly on its own short interval while the others stay far outside
+    their window" proof :meth:`test_both_periodic_loops_tick_independently_at_their_own_cadence`
+    already uses for the pre-TTL loop."""
+    settings = LifecycleSettings(
+        maintenance_interval_s=3600, pre_ttl_scan_interval_s=3600, full_scan_interval_s=1
+    )
+    registry = _StubUserRegistry()
+    loop = MaintenanceLoop(
+        bus=bus,
+        lifecycle_manager=_RecordingLifecycleManager(),
+        settings=settings,
+        user_registry=registry,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    try:
+        await asyncio.sleep(2.2)  # >= 2 ticks on a 1s cadence
+    finally:
+        await loop.stop()
+        await run_task
+
+    assert loop.discovery_tick_count >= 2
+    assert loop.maintenance_tick_count == 1, "the OTHER two cadences must not have sped up"
+    assert loop.pre_ttl_tick_count == 1
+
+
 # ---------------------------------------------------------------------------- env settings
 def test_maintenance_env_settings_reads_mu_lifecycle_prefix(
     monkeypatch: pytest.MonkeyPatch,
