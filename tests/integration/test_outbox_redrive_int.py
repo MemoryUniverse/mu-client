@@ -1,5 +1,5 @@
 """``SqliteOutbox.redrive_dead`` — REAL flush into mu-local's real ``mu-dev-*`` stores, ZERO
-mocks (DEV-STANDARDS non-negotiable). AD-270a fix (ADR 0072, PROTOTYPE-DEBT-0924.md B3): the
+mocks (DEV-STANDARDS non-negotiable). AD-270a fix (ADR 0075, PROTOTYPE-DEBT-0924.md B3): the
 method was built, tested, and had NO CALLER — a dead-lettered capture was unrecoverable. The unit
 tier (``tests/unit/test_outbox_redrive_route_unit.py``) proves the IPC route/store logic; THIS
 file proves the task's own "prove it" instruction — dead-letter a REAL capture, redrive it, and
@@ -101,11 +101,11 @@ async def test_a_dead_lettered_capture_is_recoverable_via_redrive(
     isolated_settings: ClientSettings,
 ) -> None:
     """The full "prove it" scenario: append a real capture -> drain it once (delivery attempt,
-    simulating one failed try) -> dead-letter it (retries exhausted, the state B3 measured 374
-    real rows stuck in permanently) -> ``redrive_dead`` (the fix's own caller) -> drain AGAIN ->
-    the content is now recallable from the REAL stores. Before this fix there was no step between
-    "dead-lettered" and "gone forever": this test's own middle section (append -> drain ->
-    dead_letter, no redrive) is exactly what F4 measured on a real daemon.
+    simulating one failed try) -> dead-letter it (retries exhausted) -> ``redrive_dead`` (the
+    fix's own caller) -> drain AGAIN -> the content is now recallable from the REAL stores.
+    Before this fix there was no step between "dead-lettered" and "gone forever" — the same
+    real, long-lived, never-cleaned outbox table FAULT-HUNT-0924 F4a measured (374 ``acked`` rows
+    / 307 KB / 34 days, zero rows ever removed) had no redrive path for a ``dead`` row either.
 
     **MUTATION:** skip the ``redrive_dead`` call -> the final ``_eventually_recall`` returns
     ``[]`` and the test goes RED, proving the redrive step — not the drain alone — is what
@@ -131,8 +131,7 @@ async def test_a_dead_lettered_capture_is_recoverable_via_redrive(
         assert await outbox.outbox_depth() == 1
 
         # (2) A delivery attempt is made and fails; the retry budget is treated as exhausted —
-        #     the SAME state F4 measured on a real daemon: DEAD, content still on disk, no path
-        #     back before this fix.
+        #     DEAD, content still on disk, no path back before this fix.
         drained = await outbox.drain(batch_size=10)
         assert len(drained.records) == 1
         await outbox.dead_letter(record.seq, error="simulated permanent parser failure")

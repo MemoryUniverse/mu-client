@@ -187,7 +187,7 @@ async def test_coalescing_never_launches_two_concurrent_sweeps_for_the_same_user
     await loop._unsubscribe()
 
 
-# ------------------------------------------------------ AD-268 discovery (D5 fix, ADR 0071/0072)
+# ------------------------------------------------------ AD-268 discovery (D5 fix, ADR 0075)
 class _StubUserRegistry:
     """A minimal ``UserPrefixRegistryPort`` — records every ``list_user_prefixes`` call so a test
     can assert the discovery cadence, and can be told to raise (transient store fault) on demand."""

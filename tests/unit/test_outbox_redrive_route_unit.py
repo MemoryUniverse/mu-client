@@ -1,4 +1,4 @@
-"""``OUTBOX_REDRIVE_ROUTE`` — AD-270a fix (ADR 0072, PROTOTYPE-DEBT-0924.md B3).
+"""``OUTBOX_REDRIVE_ROUTE`` — AD-270a fix (ADR 0075, PROTOTYPE-DEBT-0924.md B3).
 
 ``SqliteOutbox.redrive_dead`` was built, tested, and had NO CALLER — a dead-lettered capture was
 unrecoverable. These tests prove the SURFACE (real ``IpcServer`` dispatch over a real, on-disk

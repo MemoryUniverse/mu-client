@@ -430,7 +430,7 @@ async def test_capture_ack_p99_within_budget_while_maintenance_loop_sweeps_many_
 
 
 # =====================================================================================
-# AD-268 fix (ADR 0071/0072, PROTOTYPE-DEBT-0924.md D5) — the cross-namespace STM user-prefix
+# AD-268 fix (ADR 0075, PROTOTYPE-DEBT-0924.md D5) — the cross-namespace STM user-prefix
 # registry. PROBE 2 (the audit) measured a real `MaintenanceLoop` one second after a simulated
 # restart, with a month of a user's memories sitting in real Valkey: `active_user_count 0`,
 # `sweep_user calls 0`, `rescue_pre_ttl_user calls 0`. This section reproduces that EXACT

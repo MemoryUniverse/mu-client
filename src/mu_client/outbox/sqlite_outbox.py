@@ -25,7 +25,7 @@ from mu_client.outbox.model import OutboxBatch, OutboxRecord, RecordState
 
 __all__ = ["OUTBOX_REDRIVE_ROUTE", "SqliteOutbox"]
 
-# AD-270a fix (ADR 0072, PROTOTYPE-DEBT-0924.md B3) — the OPERATOR-VERB surface `redrive_dead`
+# AD-270a fix (ADR 0075, PROTOTYPE-DEBT-0924.md B3) — the OPERATOR-VERB surface `redrive_dead`
 # has always been missing (see that method's own docstring for why this is a verb, never an
 # automatic policy). Named here, next to the method it drives, so the IPC route
 # (`daemon/ipc.py`) and the CLI command (`cli.py`) both import ONE literal instead of two call
@@ -263,13 +263,15 @@ class SqliteOutbox:
         :class:`~mu_client.workers.pool.WorkerPool`'s normal drain loop picks them up on its next
         poll — the exact same path any fresh capture takes, never a second delivery mechanism.
 
-        **AD-270a fix (ADR 0072, PROTOTYPE-DEBT-0924.md B3) — this method had no caller.** A row
+        **AD-270a fix (ADR 0075, PROTOTYPE-DEBT-0924.md B3) — this method had no caller.** A row
         only reaches ``DEAD`` after EXHAUSTING its retry budget (``OutboxWorker``'s
         ``retry_later``/``dead_letter`` calls, ``OutboxSettings.max_attempts``) — i.e. it already
         failed repeatedly for a REASON recorded in ``last_error``. Without a caller that failure
-        was PERMANENT: the row (and the raw ``activity_json`` it still carries — F4 measured 374
-        such rows / 307 KB / 34 days on a real daemon, zero ever redriven or deleted) sat forever
-        with no path back, silently losing whatever the user said in it.
+        was PERMANENT: the row (and the raw ``activity_json`` it still carries) sat forever with
+        no path back, silently losing whatever the user said in it. FAULT-HUNT-0924 F4a measured
+        this SAME table, on this SAME real daemon, at 374 rows / 307 KB / 34 days with zero rows
+        ever removed (those 374 were ``acked``, not ``dead`` — the measurement that proves the
+        table is real, long-lived and unattended, not a count of dead-lettered rows).
 
         **Deliberately an OPERATOR VERB (``mu outbox redrive``, ``daemon/ipc.py``'s
         ``OUTBOX_REDRIVE_ROUTE``), never an automatic policy.** A DEAD row failed AFTER retries
@@ -279,7 +281,7 @@ class SqliteOutbox:
         cycle) or, worse, mask a real defect (a parser regression, a store outage) behind a loop
         that keeps quietly hiding its own failures instead of surfacing them once, loudly, in
         ``last_error``, for a person to actually read before deciding whether redriving is even
-        the right response (see ADR 0072 §"why not automatic" for the full reasoning)."""
+        the right response (see ADR 0075 §"why not automatic" for the full reasoning)."""
         conn = self._require_conn()
 
         def _do() -> int:

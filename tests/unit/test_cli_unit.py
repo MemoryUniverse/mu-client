@@ -115,7 +115,7 @@ async def test_run_recall_calls_host_recall_and_renders_result(
 
 
 # =====================================================================================
-# AD-270a fix (ADR 0072, PROTOTYPE-DEBT-0924.md B3) — `mu outbox redrive`. The route/store logic
+# AD-270a fix (ADR 0075, PROTOTYPE-DEBT-0924.md B3) — `mu outbox redrive`. The route/store logic
 # itself is proven end-to-end in `tests/unit/test_outbox_redrive_route_unit.py`; these cover only
 # this module's own responsibility: parsing + the default-limit resolution + the IPC call shape.
 # =====================================================================================

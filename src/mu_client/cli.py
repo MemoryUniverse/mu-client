@@ -155,7 +155,7 @@ def _build_parser() -> argparse.ArgumentParser:
         f"{NAMED_REASON_RULE}. Prose about the conversation is not a name.",
     )
 
-    # ---- AD-270a fix (ADR 0072): the outbox dead-letter operator surface (PROTOTYPE-DEBT-0924.md
+    # ---- AD-270a fix (ADR 0075): the outbox dead-letter operator surface (PROTOTYPE-DEBT-0924.md
     # B3) — `SqliteOutbox.redrive_dead` was built, tested, and had no caller. Deliberately an
     # OPERATOR verb (see that method's own docstring): a DEAD row already failed every automatic
     # retry this outbox offers, so redriving it is a decision a person makes after reading
@@ -470,7 +470,7 @@ async def _run_pin(args: argparse.Namespace, *, route: str) -> int:
 
 
 async def _run_outbox_redrive(args: argparse.Namespace) -> int:
-    """``mu outbox redrive`` — AD-270a fix (ADR 0072). Goes over the daemon's IPC socket (never
+    """``mu outbox redrive`` — AD-270a fix (ADR 0075). Goes over the daemon's IPC socket (never
     a direct ``SqliteOutbox`` open from this process): the daemon's ``WorkerPool`` owns the ONE
     live connection to the outbox db, and a second writer opening it directly would race that
     connection's own ``asyncio.Lock`` serialization (``SqliteOutbox``'s own module docstring).

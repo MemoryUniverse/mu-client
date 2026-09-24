@@ -190,7 +190,7 @@ class LocalMemoryHost:
 
     @property
     def user_registry(self) -> UserPrefixRegistryPort | None:
-        """AD-268 fix (ADR 0071, PROTOTYPE-DEBT-0924.md D5) — the owned ``LocalMemory``'s durable,
+        """AD-268 fix (ADR 0075, PROTOTYPE-DEBT-0924.md D5) — the owned ``LocalMemory``'s durable,
         cross-namespace user-prefix registry (``LocalMemory.user_registry`` ->
         ``LocalContainer.stm``), or ``None`` when the bound STM backend does not satisfy
         :class:`~mu_engine.storage.user_registry.UserPrefixRegistryPort` (e.g. the in-process

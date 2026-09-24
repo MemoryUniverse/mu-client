@@ -18,7 +18,7 @@ Three independent trigger paths run concurrently, mirroring the MMA dual-trigger
    ``stm_ttl_s - pre_ttl_window_s``). AC-1.3a (§14.1).
 
 All three above only ever act on a user already IN :attr:`_active_users` — a plain in-process
-dict, empty on every fresh process. A **4th path, discovery** (§7 "hybrid discovery", ADR 0071 /
+dict, empty on every fresh process. A **4th path, discovery** (§7 "hybrid discovery", ADR 0075 /
 AD-268 / PROTOTYPE-DEBT-0924.md D5), durably REFILLS that dict instead of firing a sweep itself:
 once at :meth:`run` startup and then on ``lifecycle.full_scan_interval_s`` (:meth:`_full_scan_loop`
 / :meth:`_discover_known_users`), reading every registered :class:`UserPrefix` from
@@ -182,7 +182,7 @@ class MaintenanceLoop:
         self._mlm: LifecycleManagerPort = lifecycle_manager or _UnwiredLifecycleManager()
         self._settings = settings or MaintenanceEnvSettings()
         self._stop = asyncio.Event()
-        # AD-268 fix (ADR 0071, PROTOTYPE-DEBT-0924.md D5): the durable, cross-namespace
+        # AD-268 fix (ADR 0075, PROTOTYPE-DEBT-0924.md D5): the durable, cross-namespace
         # discovery source — `None` on a binding whose STM backend cannot durably enumerate
         # (module docstring's `_UnwiredLifecycleManager` degrade-honest pattern, applied to
         # discovery instead of to the sweep itself: this loop still runs, still answers bus
@@ -425,7 +425,7 @@ class MaintenanceLoop:
         :meth:`_pre_ttl_loop`'s body, which was the defect). See :meth:`_sweep_active_users_rescue`
         for the narrow pre-TTL-only sibling.
 
-        **Discovery gap — CLOSED (2026-09-24, ADR 0071, AD-268, PROTOTYPE-DEBT-0924.md D5).** This
+        **Discovery gap — CLOSED (2026-09-24, ADR 0075, AD-268, PROTOTYPE-DEBT-0924.md D5).** This
         loop's user directory was ONLY the in-process active-user registry populated by bus
         events — after a daemon restart it started empty and stayed empty for any user who did
         not write again, run-verified (``active_user_count 0``, ``sweep_user calls 0``). Fixed by

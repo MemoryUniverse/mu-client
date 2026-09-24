@@ -349,7 +349,7 @@ class IpcServer:
         }
 
     async def _route_outbox_redrive(self, request: dict[str, Any]) -> dict[str, Any]:
-        """AD-270a fix (ADR 0072, PROTOTYPE-DEBT-0924.md B3) — the operator-verb surface
+        """AD-270a fix (ADR 0075, PROTOTYPE-DEBT-0924.md B3) — the operator-verb surface
         ``SqliteOutbox.redrive_dead`` never had (see that method's own docstring for why this is
         deliberately a verb, not an automatic policy). ``limit`` is REQUIRED on the wire (never a
         module-level default here — ``cli.py`` resolves its own default from

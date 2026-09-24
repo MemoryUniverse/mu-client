@@ -326,7 +326,7 @@ class LocalDaemon:
         # 8) MAINTENANCE LOOP — the 3rd supervised task (memory-lifecycle-manager-spec.md §14
         #    slice 1 / S1-07): event-driven fast-fire + the two decoupled periodic cadences (§7/
         #    §7b), over the REAL bus + the REAL MemoryLifecycleManager built in step 5 above.
-        #    ``user_registry=self._host.user_registry`` (AD-268 fix, ADR 0071,
+        #    ``user_registry=self._host.user_registry`` (AD-268 fix, ADR 0075,
         #    PROTOTYPE-DEBT-0924.md D5) — the SAME durable, cross-namespace STM registry
         #    ``LocalContainer`` already built, never a second one, so a restarted daemon reseeds
         #    its active-user directory from durable storage instead of starting empty (`| None`
