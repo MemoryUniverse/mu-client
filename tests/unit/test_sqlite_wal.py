@@ -123,6 +123,120 @@ async def test_lease_only_construction_also_lays_down_both_tables(tmp_path: Path
         await adapter.aclose()
 
 
+# ---------------------------------------------------------------------- AD-265/AD-272: one lock
+async def test_runner_and_lease_adapter_share_one_connection_and_lock_on_the_same_path(
+    tmp_path: Path,
+) -> None:
+    """AD-265/AD-272: a ``SqliteWalRunner`` and a ``SqliteWalLeaseAdapter`` opened against the
+    IDENTICAL file must resolve to the SAME ``sqlite3.Connection`` and the SAME ``asyncio.Lock`` —
+    not two independent connections each serialized only against itself. This is the exact
+    property whose absence produced the deterministic, reproduced-3-times ``exit=139`` full-suite
+    segfault (ADR 0064 §2, ADR 0066 §7, ADR 0068): two real connections to one file, each
+    individually thread-safe, but nothing serializing a ``BEGIN IMMEDIATE`` on one against a
+    ``BEGIN IMMEDIATE`` on the other.
+
+    Mutation check (recorded, not re-run by pytest itself): reverting `_acquire_shared_connection`
+    to `self._conn = await asyncio.to_thread(_open_wal_connection, self._path)` (giving each
+    adapter its own private connection again, exactly the pre-fix code) turns this RED
+    deterministically every run — `is` on two independently-`sqlite3.connect()`-ed objects is
+    never true — unlike a timing-dependent repro of the crash itself.
+    """
+    path = tmp_path / "wal.sqlite"
+    runner = SqliteWalRunner(path)
+    lease = SqliteWalLeaseAdapter(path, device_id="dev-1")
+    await runner.open()
+    await lease.open()
+    try:
+        assert runner._require_conn() is lease._require_conn(), (
+            "runner and lease adapter opened the SAME file but got DIFFERENT sqlite3.Connection "
+            "objects — the AD-265 race (two unserialized connections to one file) is back."
+        )
+        assert runner._lock is lease._lock, (
+            "runner and lease adapter opened the SAME file but got DIFFERENT asyncio.Lock "
+            "objects — a BEGIN IMMEDIATE on one is no longer serialized against the other."
+        )
+    finally:
+        await lease.aclose()
+        await runner.aclose()
+
+
+async def test_a_different_path_never_shares_the_other_paths_connection(tmp_path: Path) -> None:
+    """The registry is keyed on the resolved path, not "any open adapter" — two DIFFERENT files
+    must NOT end up sharing a connection (that would silently merge two users'/devices' job
+    logs)."""
+    path_a = tmp_path / "a" / "wal.sqlite"
+    path_b = tmp_path / "b" / "wal.sqlite"
+    runner_a = SqliteWalRunner(path_a)
+    runner_b = SqliteWalRunner(path_b)
+    await runner_a.open()
+    await runner_b.open()
+    try:
+        assert runner_a._require_conn() is not runner_b._require_conn()
+        assert runner_a._lock is not runner_b._lock
+    finally:
+        await runner_a.aclose()
+        await runner_b.aclose()
+
+
+async def test_reopening_a_path_after_every_holder_closed_gets_a_fresh_connection(
+    tmp_path: Path,
+) -> None:
+    """Once every adapter sharing a path has ``aclose()``'d, the registry entry is gone — a later
+    ``open()`` against the same (now fully-closed) path must not resurrect a closed connection."""
+    path = tmp_path / "wal.sqlite"
+    first = SqliteWalRunner(path)
+    await first.open()
+    first_conn = first._require_conn()
+    await first.aclose()
+
+    second = SqliteWalLeaseAdapter(path, device_id="dev-1")
+    await second.open()
+    try:
+        assert second._require_conn() is not first_conn
+        # And it still works — the schema was correctly re-laid-down against the fresh connection.
+        assert {"lifecycle_jobs", "lifecycle_leases"} <= _table_names(path)
+    finally:
+        await second.aclose()
+
+
+async def test_concurrent_submit_and_acquire_on_the_shared_file_never_raises_database_locked(
+    tmp_path: Path,
+) -> None:
+    """Behavioural regression guard, alongside the identity test above: hammer
+    ``SqliteWalRunner.submit`` and ``SqliteWalLeaseAdapter.acquire``/``release`` concurrently
+    against the SAME file from many real asyncio tasks. Pre-fix (two independent connections, two
+    independent locks) this raced two real ``BEGIN IMMEDIATE`` transactions against each other and
+    could surface as ``sqlite3.OperationalError: database is locked`` under load (SQLite's default
+    ``busy_timeout=0``) even where it did not segfault — the milder, non-crashing face of the same
+    missing-serialization defect. Bounded iteration count (DEV-STANDARDS / root CLAUDE.md rule 14:
+    no busy-loops) — this is a fixed-size stress burst, not an unbounded one."""
+    path = tmp_path / "wal.sqlite"
+    runner = SqliteWalRunner(path)
+    lease = SqliteWalLeaseAdapter(path, device_id="dev-1")
+    await runner.open()
+    await lease.open()
+    try:
+
+        async def _submit_one(i: int) -> None:
+            await runner.submit(_job(f"job-{i}", _prefix(f"user{i}")))
+
+        async def _acquire_one(i: int) -> None:
+            try:
+                async with lease.acquire(_prefix(f"lease-user{i}")):
+                    pass
+            except LifecycleLeaseBusyError:
+                pass  # a genuine, expected outcome of concurrent acquire — not the defect
+
+        n = 60
+        await asyncio.gather(
+            *(_submit_one(i) for i in range(n)),
+            *(_acquire_one(i) for i in range(n)),
+        )
+    finally:
+        await lease.aclose()
+        await runner.aclose()
+
+
 # ------------------------------------------------------------------------------ runner: happy path
 async def test_submit_claim_complete_and_await_result_round_trip(tmp_path: Path) -> None:
     runner = SqliteWalRunner(tmp_path / "wal.sqlite")

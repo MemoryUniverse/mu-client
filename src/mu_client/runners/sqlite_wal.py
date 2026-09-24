@@ -10,14 +10,32 @@ WAL-mode pattern replicated verbatim from ``mu_client.outbox.sqlite_outbox.Sqlit
 ``asyncio.to_thread``, one ``asyncio.Lock`` serializing the shared connection so a cancelled
 caller never leaves the connection mid-statement for the next caller (DEV-STANDARDS rule 1).
 
-Both classes independently ``open()`` their own connection but execute the identical
-``_SCHEMA_SQL`` (idempotent ``CREATE TABLE IF NOT EXISTS``) against the SAME file path — whichever
-one is constructed first lays down both tables, satisfying "the job log and the lease table live
-in the SAME sqlite WAL database file" (this task's acceptance) without coupling the two adapters'
-Python object graphs (each is a genuine, independently-constructible adapter for its own Port —
-``LifecycleWorkflowRunnerPort`` / ``LifecycleLeasePort``, spec §5 / §4b — and, critically for
-AC-1.1, each OS process in the cross-process test constructs its OWN instance/connection against
-the shared file; a SQLite connection cannot cross a process boundary anyway).
+**AD-265/AD-272 correction (2026-09-24): the two classes now share ONE connection + ONE lock per
+resolved file path, not two.** They still independently ``open()`` — each is a genuine,
+independently-constructible adapter for its own Port (``LifecycleWorkflowRunnerPort`` /
+``LifecycleLeasePort``, spec §5 / §4b) — but ``open()`` now resolves to the SAME
+``sqlite3.Connection``/``asyncio.Lock`` pair (:func:`_acquire_shared_connection`, a process-local,
+refcounted registry keyed on the resolved path) whenever two adapters are opened against the
+IDENTICAL file, which is exactly what ``daemon/app.py`` does for one daemon's runner and lease
+adapter. **Before this fix, "independently constructible" meant "independently CONNECTED":** two
+real ``sqlite3.Connection`` objects open on the same on-disk file, each individually serialized by
+its own PRIVATE ``asyncio.Lock``, with NOTHING serializing the runner's connection against the
+lease adapter's connection — so a ``BEGIN IMMEDIATE`` on one could run concurrently with a
+``BEGIN IMMEDIATE`` on the other, on `asyncio.to_thread` worker threads. That is the shape a full
+suite run segfaulted on — reproduced independently across three separate passes (ADR 0064 §2's
+isolated-file runs, ADR 0066 §7's full-suite runs, and ADR 0068's full-suite run), ``exit=139``
+each time, the ``Current thread`` alternating between ``sqlite_wal.py``'s two ``BEGIN IMMEDIATE``
+sites and landing nowhere else.
+
+Sharing one connection+lock per file removes the race outright: whichever adapter opens a path
+first creates the entry (and lays down both tables via the identical idempotent ``_SCHEMA_SQL``,
+preserving "the job log and the lease table live in the SAME sqlite WAL database file"), and every
+subsequent ``open()`` against that same resolved path — same object or not — joins it. **AC-1.1 is
+unaffected:** the registry is a plain module-level ``dict``, per OS process; the cross-process test
+(``test_ac_1_1_two_real_os_processes_exactly_one_acquires``) spawns two REAL ``python`` processes,
+each with its own empty registry and its own connection, so cross-process mutual exclusion still
+goes through ``BEGIN IMMEDIATE``'s real file-level lock exactly as before (a SQLite connection —
+or a Python object — cannot cross a process boundary anyway).
 
 **Cross-process mutual exclusion (AC-1.1, BQ1).** ``SqliteWalLeaseAdapter.acquire()`` uses
 ``BEGIN IMMEDIATE`` — SQLite's own file-level exclusive-write-intent lock, portable across the
@@ -107,6 +125,75 @@ def _open_wal_connection(path: Path) -> sqlite3.Connection:
     return conn
 
 
+class _SharedConnection:
+    """One ``sqlite3.Connection`` + one ``asyncio.Lock`` + a refcount, shared by every
+    :class:`SqliteWalRunner`/:class:`SqliteWalLeaseAdapter` in THIS process that is opened
+    against the identical resolved file path (AD-265/AD-272). Only the fields; the registry
+    below owns the lifecycle."""
+
+    __slots__ = ("conn", "lock", "refcount")
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.lock = asyncio.Lock()
+        self.refcount = 0
+
+
+# AD-272 fix for AD-265: previously `SqliteWalRunner` and `SqliteWalLeaseAdapter` each opened
+# their OWN `sqlite3.Connection` to the SAME on-disk file with their OWN private `asyncio.Lock`
+# (module docstring, pre-fix: "each independently `open()`s its own connection... against the
+# SAME file path"). Each lock correctly serialized calls WITHIN one adapter, but nothing
+# serialized the runner's connection against the lease adapter's connection — two genuinely
+# independent `sqlite3.Connection` objects, each individually thread-safe (`check_same_thread=
+# False` + the module's own per-connection lock), racing `BEGIN IMMEDIATE` against each other on
+# the same file from `asyncio.to_thread` worker threads. This registry makes "same resolved file
+# path, same process" mean "same connection, same lock": a `SqliteWalRunner` and a
+# `SqliteWalLeaseAdapter` constructed against the identical path (`daemon/app.py:223-230`'s own
+# wiring) now genuinely share ONE connection and ONE lock, so every `BEGIN IMMEDIATE` across BOTH
+# adapters is serialized the same way calls within a single adapter already were.
+#
+# Per-PROCESS only (module-level dict) — AC-1.1's own acceptance test (two REAL OS processes,
+# `test_ac_1_1_two_real_os_processes_exactly_one_acquires`) is untouched: each process gets its
+# own empty registry, so cross-process mutual exclusion still goes through `BEGIN IMMEDIATE`'s
+# real file-level lock, never a shared Python object (which cannot cross a process boundary
+# anyway, per this module's own docstring).
+#
+# Refcounted so closing one adapter early (a test that opens/closes a runner, then opens a fresh
+# lease adapter against the same NOW-CLOSED path) still gets a correctly fresh connection —
+# unchanged from the pre-fix behaviour once every prior holder has released it.
+_shared_connections: dict[str, _SharedConnection] = {}
+_shared_connections_guard = asyncio.Lock()
+
+
+async def _acquire_shared_connection(path: Path) -> _SharedConnection:
+    """Returns the process-wide shared connection+lock for ``path``'s RESOLVED location,
+    opening it (once) if this is the first caller for that path. Guarded by one module-level
+    ``asyncio.Lock`` so two coroutines racing to open the SAME new path can never each create
+    (and leak) their own connection — the registry-creation race a bare dict-of-locks would
+    still have."""
+    key = str(path.expanduser().resolve())
+    async with _shared_connections_guard:
+        entry = _shared_connections.get(key)
+        if entry is None:
+            conn = await asyncio.to_thread(_open_wal_connection, path)
+            entry = _SharedConnection(conn)
+            _shared_connections[key] = entry
+        entry.refcount += 1
+    return entry
+
+
+async def _release_shared_connection(path: Path, entry: _SharedConnection) -> None:
+    """Decrements the refcount for ``path``'s shared entry; the underlying connection is closed
+    (and the registry entry dropped) only once every holder — runner AND lease adapter alike —
+    has released it."""
+    key = str(path.expanduser().resolve())
+    async with _shared_connections_guard:
+        entry.refcount -= 1
+        if entry.refcount <= 0:
+            _shared_connections.pop(key, None)
+            await asyncio.to_thread(entry.conn.close)
+
+
 def _row_to_job(row: tuple[Any, ...]) -> LifecycleJob:
     (
         job_id,
@@ -146,31 +233,39 @@ class SqliteWalRunner:
 
     def __init__(self, path: Path, *, clock: Clock | None = None) -> None:
         self._path = path.expanduser()
-        self._conn: sqlite3.Connection | None = None
-        self._lock = asyncio.Lock()
+        self._shared: _SharedConnection | None = None
         self._clock: Clock = clock or SystemClock()
 
     @property
     def is_open(self) -> bool:
-        return self._conn is not None
+        return self._shared is not None
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        """The connection's shared lock (AD-265/AD-272) — the SAME lock a
+        :class:`SqliteWalLeaseAdapter` opened against this identical file gets too, so every
+        ``BEGIN IMMEDIATE`` across BOTH adapters is serialized against the others."""
+        if self._shared is None:
+            raise RuntimeError("SqliteWalRunner.open() was not called")
+        return self._shared.lock
 
     async def open(self) -> None:
         """Idempotent. Does NOT itself reset crashed ``RUNNING`` rows — that is
         :meth:`resume_pending`'s explicit job (spec: "resume_pending() replays ... on a fresh
         construction"), called by whoever owns daemon boot, mirroring the port's own naming."""
-        if self._conn is not None:
+        if self._shared is not None:
             return
-        self._conn = await asyncio.to_thread(_open_wal_connection, self._path)
+        self._shared = await _acquire_shared_connection(self._path)
 
     async def aclose(self) -> None:
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            await asyncio.to_thread(conn.close)
+        shared, self._shared = self._shared, None
+        if shared is not None:
+            await _release_shared_connection(self._path, shared)
 
     def _require_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
+        if self._shared is None:
             raise RuntimeError("SqliteWalRunner.open() was not called")
-        return self._conn
+        return self._shared.conn
 
     # ------------------------------------------------------------------------ Port: durable write
     async def submit(self, job: LifecycleJob) -> JobHandle:
@@ -360,27 +455,35 @@ class SqliteWalLeaseAdapter:
         self._clock: Clock = clock or SystemClock()
         self._lease_ttl_s = settings.lease_ttl_s
         self._lease_heartbeat_s = settings.lease_heartbeat_s
-        self._conn: sqlite3.Connection | None = None
-        self._lock = asyncio.Lock()
+        self._shared: _SharedConnection | None = None
 
     @property
     def is_open(self) -> bool:
-        return self._conn is not None
+        return self._shared is not None
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        """The connection's shared lock (AD-265/AD-272) — the SAME lock a :class:`SqliteWalRunner`
+        opened against this identical file gets too, so every ``BEGIN IMMEDIATE`` across BOTH
+        adapters is serialized against the others."""
+        if self._shared is None:
+            raise RuntimeError("SqliteWalLeaseAdapter.open() was not called")
+        return self._shared.lock
 
     async def open(self) -> None:
-        if self._conn is not None:
+        if self._shared is not None:
             return
-        self._conn = await asyncio.to_thread(_open_wal_connection, self._path)
+        self._shared = await _acquire_shared_connection(self._path)
 
     async def aclose(self) -> None:
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            await asyncio.to_thread(conn.close)
+        shared, self._shared = self._shared, None
+        if shared is not None:
+            await _release_shared_connection(self._path, shared)
 
     def _require_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
+        if self._shared is None:
             raise RuntimeError("SqliteWalLeaseAdapter.open() was not called")
-        return self._conn
+        return self._shared.conn
 
     def lease_name(self, prefix: UserPrefix) -> str:
         """The plane-qualified lease NAME (CANONICAL §7.5 convention; this task's canonical_rule)
