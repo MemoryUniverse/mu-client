@@ -47,6 +47,13 @@ class OutboxCorruptionError(ClientError):
     running healthy with a silently lost backlog (daemon-app-skeleton-spec.md §10)."""
 
 
+class EnrichmentQueueCorruptionError(ClientError):
+    """The S2 enrichment job-log WAL is unreadable at open (ADR-0055; AD-241) — mirrors
+    :class:`OutboxCorruptionError`'s stance exactly: refuse loud rather than run with a silently
+    lost/corrupted enrichment backlog. Never affects the raw memory rows themselves (a different
+    store) — only future enrichment is at risk when this is raised."""
+
+
 class ServiceNotWiredError(ClientError):
     """A surface was asked for a capability whose engine service the composition root could not
     build — REFUSED LOUD, never a fabricated answer (the same stance ``LocalMemory.ask`` takes in

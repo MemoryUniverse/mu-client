@@ -334,6 +334,62 @@ class SqliteOutbox:
         async with self._lock:
             return await asyncio.to_thread(_do)
 
+    # ------------------------------------------------------------------------------------ F4 fix
+    # FAULT-HUNT-0924.md F4a: this module had NO ``DELETE`` statement at all — every successfully
+    # delivered activity's raw ``activity_json`` sat here forever (measured: 374 acked rows, 307
+    # KB, 34 days old, zero deletions ever). The two methods below are the real fix — a
+    # time-based retention policy for the general case, plus an explicit hash-targeted delete for
+    # a caller that knows which content it needs gone right now.
+
+    async def purge_acked_before(self, cutoff: datetime) -> int:
+        """Retention policy: permanently ``DELETE`` every ``acked`` row whose ``enqueued_at`` is
+        older than ``cutoff``. Only ``acked`` rows are eligible — a ``pending``/``inflight`` row
+        is still on its way to (or mid-)delivery and deleting it would silently drop an
+        undelivered activity, breaking the at-least-once guarantee this store exists for
+        (module docstring §8.3); a ``dead`` row is left for :meth:`redrive_dead` or an operator,
+        never swept by age alone. Returns the number of rows actually removed (0 is a valid,
+        common answer — never a silent no-op with no signal).
+
+        Callers: the daemon's periodic retention sweep (``mu_client.daemon.maintenance.
+        MaintenanceLoop``, a policy-driven cadence over ``OutboxSettings.acked_retention_days`` —
+        this closes "retire acked outbox rows on a policy rather than never")."""
+        conn = self._require_conn()
+
+        def _do() -> int:
+            cur = conn.execute(
+                "DELETE FROM outbox WHERE state=? AND enqueued_at < ?",
+                (RecordState.ACKED.value, cutoff.isoformat()),
+            )
+            return int(cur.rowcount)
+
+        async with self._lock:
+            return await asyncio.to_thread(_do)
+
+    async def delete_by_content_hash(self, content_hash: str) -> int:
+        """Permanently ``DELETE`` every ``acked`` or ``dead`` row carrying this exact
+        ``content_hash`` — the targeted leg of a caller-driven delete/forget (e.g. a future
+        ``LocalMemory.delete`` wiring reaching down to its captured raw copy), closing the "no
+        delete path anywhere" half of F4a for a specific memory rather than by age.
+
+        A ``pending``/``inflight`` row matching this hash is deliberately left untouched and NOT
+        counted — the SAME at-least-once reasoning as :meth:`purge_acked_before` applies, and a
+        row still in flight for content the caller just asked to forget is exactly the bounded,
+        named residue :class:`mu_client.consent.residue.ClientCascadeResidue.
+        OUTBOX_INFLIGHT_ROW_NOT_PURGED` reports — it is purged once it acks (the caller may retry,
+        or the retention sweep will reclaim it later on age alone). Returns the number of rows
+        actually removed."""
+        conn = self._require_conn()
+
+        def _do() -> int:
+            cur = conn.execute(
+                "DELETE FROM outbox WHERE content_hash=? AND state IN (?,?)",
+                (content_hash, RecordState.ACKED.value, RecordState.DEAD.value),
+            )
+            return int(cur.rowcount)
+
+        async with self._lock:
+            return await asyncio.to_thread(_do)
+
     async def _count(self, state: RecordState) -> int:
         conn = self._require_conn()
 

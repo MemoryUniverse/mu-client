@@ -57,6 +57,7 @@ from mu_client.host import LocalMemoryHost
 from mu_client.inject.recall_bridge import RecallInjectBridge
 from mu_client.lifecycle.precompact import PreCompactPromoter
 from mu_client.lifecycle.session_save import SessionSaveTrigger
+from mu_client.outbox.retention import OutboxRetentionLoop
 from mu_client.outbox.sqlite_outbox import SqliteOutbox
 from mu_client.runners.sqlite_wal import SqliteWalLeaseAdapter, SqliteWalRunner
 from mu_client.workers.ingest_client import InProcessLocalIngest
@@ -89,6 +90,10 @@ class LocalDaemon:
         self._pool: WorkerPool | None = None
         self._ipc: IpcServer | None = None
         self._maintenance: MaintenanceLoop | None = None
+        # FAULT-HUNT-0924.md F4a — the outbox retention sweep (mu_client.outbox.retention), a
+        # 5th supervised task, independent of MaintenanceLoop (see that module's own docstring for
+        # why it is not folded in there).
+        self._outbox_retention: OutboxRetentionLoop | None = None
         # Declared here (not only assigned in start()) so shutdown() is safe even if the daemon is
         # torn down before start() ever ran — the same discipline every sibling above follows.
         self._session_save: SessionSaveTrigger | None = None
@@ -319,6 +324,10 @@ class LocalDaemon:
             bus=self._host.bus, lifecycle_manager=self._lifecycle_manager
         )
 
+        # 8b) OUTBOX RETENTION — the 5th supervised task (FAULT-HUNT-0924.md F4a): the SAME real
+        #     outbox opened in step 2 above, never a second handle.
+        self._outbox_retention = OutboxRetentionLoop(self._outbox, settings=self._settings.outbox)
+
         await self._supervise()
 
     async def _drain_lifecycle_jobs(self) -> None:
@@ -350,15 +359,22 @@ class LocalDaemon:
 
     async def _supervise(self) -> None:
         """One ``TaskGroup``, fixed task set (daemon-app-skeleton-spec.md §3.2): the pool, the IPC
-        server, the maintenance loop (memory-lifecycle-manager-spec.md §14 slice 1 / S1-07), and
-        the lifecycle job-drain loop (integrate-phase, closing ``SqliteWalRunner``'s own "a later
-        worker loop drains through this" seam) are the four top-level supervised tasks THIS stage
-        owns. Started as a background task (not awaited here) so ``start()`` returns once the
-        daemon is live — ``lifespan()``'s caller awaits its own stop signal, then drives
-        ``shutdown()``."""
-        if self._pool is None or self._ipc is None or self._maintenance is None:
+        server, the maintenance loop (memory-lifecycle-manager-spec.md §14 slice 1 / S1-07), the
+        lifecycle job-drain loop (integrate-phase, closing ``SqliteWalRunner``'s own "a later
+        worker loop drains through this" seam), and the outbox retention sweep
+        (FAULT-HUNT-0924.md F4a, ``mu_client.outbox.retention.OutboxRetentionLoop``) are the five
+        top-level supervised tasks THIS stage owns. Started as a background task (not awaited
+        here) so ``start()`` returns once the daemon is live — ``lifespan()``'s caller awaits its
+        own stop signal, then drives ``shutdown()``."""
+        if (
+            self._pool is None
+            or self._ipc is None
+            or self._maintenance is None
+            or self._outbox_retention is None
+        ):
             raise RuntimeError("_supervise() called before start() finished wiring")
         pool, ipc, maintenance = self._pool, self._ipc, self._maintenance
+        outbox_retention = self._outbox_retention
 
         async def _run() -> None:
             async with asyncio.TaskGroup() as tg:
@@ -366,6 +382,7 @@ class LocalDaemon:
                 tg.create_task(ipc.serve())  # bind() already ran; this just accepts + serve_forever
                 tg.create_task(maintenance.run())
                 tg.create_task(self._drain_lifecycle_jobs())
+                tg.create_task(outbox_retention.run())
                 self._tg = tg
 
         # The socket is already bound (ipc.bind() ran above, awaited); this task just runs the
@@ -383,6 +400,8 @@ class LocalDaemon:
             await self._ipc.stop_accepting()  # 1. stop new /capture handoffs
         if self._maintenance is not None:
             await self._maintenance.stop()  # 1b. stop firing new lifecycle sweeps
+        if self._outbox_retention is not None:
+            await self._outbox_retention.stop()  # 1b'. stop firing new retention sweeps
         self._drain_stop.set()  # 1c. let the lifecycle job-drain loop finish its current poll+exit
         if self._pool is not None:
             await self._pool.drain_and_stop()  # 2. drain in-flight outbox -> remember -> ack

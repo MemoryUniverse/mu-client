@@ -92,6 +92,32 @@ class ClientCascadeResidue(StrEnum):
     #: leave an owner believing the agent's contributions were withdrawn from the room.
     POSTED_AGENT_RESULTS_RETAINED = "posted_agent_results_retained"
 
+    #: FAULT-HUNT-0924.md F4a. A revoke (or a targeted ``delete()``) may reach the memory tiers and
+    #: still leave the RAW captured activity sitting in ``SqliteOutbox`` — the outbox purges a
+    #: matching row (:meth:`~mu_client.outbox.sqlite_outbox.SqliteOutbox.delete_by_content_hash`)
+    #: only for a row already ``acked``/``dead``; one still ``pending``/``inflight`` for this exact
+    #: content is deliberately left alone (deleting an in-flight row would silently break the
+    #: at-least-once delivery guarantee the outbox exists for) and purged only once it settles —
+    #: by that same targeted call being retried, or by the age-based retention sweep
+    #: (``mu_client.outbox.retention.OutboxRetentionLoop``, ``OutboxSettings.
+    #: acked_retention_days``) reclaiming it later regardless. Before this fix there was no purge
+    #: path at all, targeted or by age — this residue is the honest, bounded window that replaces
+    #: the previous unbounded "forever" gap.
+    OUTBOX_ROW_PENDING_SETTLEMENT_OR_RETENTION = "outbox_row_pending_settlement_or_retention"
+
+    #: FAULT-HUNT-0924.md F4b/F4c. A memory's ``delete()`` GCs its ``ContextRepository`` artifact
+    #: body only when no OTHER live ``MemoryItem`` still references it
+    #: (``SurfaceFacade._maybe_gc_artifact`` — content-addressed storage means two distinct
+    #: captures of identical text can share one blob) and only when the reverse-reference check
+    #: can actually be answered (``MtmTierRepository.by_artifact`` is unimplemented on every MTM
+    #: backend but Qdrant today — a verified, separate, reported gap; on those backends this GC is
+    #: a safe no-op, never a wrong delete). A SHARE REVOKE (as opposed to a memory ``delete()``)
+    #: does not touch the artifact store at all: revoking access to a room does not delete the
+    #: local captures that fed it.
+    ARTIFACT_BODY_RETAINED_PENDING_REFERENCE_CHECK = (
+        "artifact_body_retained_pending_reference_check"
+    )
+
 
 class ResidueExplanation(BaseModel):
     """One residue, in terms an owner can act on."""
@@ -190,6 +216,18 @@ _CLIENT_TEXT: Final[dict[str, tuple[bool, str]]] = {
         True,
         "Messages the agent already posted stay in the room. They were legitimately shared, and "
         "the room's history is never rewritten.",
+    ),
+    ClientCascadeResidue.OUTBOX_ROW_PENDING_SETTLEMENT_OR_RETENTION: (
+        False,
+        "This device's local delivery queue may still hold a copy of this content until it "
+        "finishes sending (or fails permanently) and the queue's own cleanup runs. It is removed "
+        "automatically; it is never sent anywhere new.",
+    ),
+    ClientCascadeResidue.ARTIFACT_BODY_RETAINED_PENDING_REFERENCE_CHECK: (
+        False,
+        "This device's local content store keeps the underlying text as long as any other memory "
+        "still points at the same captured content, or while it cannot yet confirm nothing does. "
+        "It is removed once nothing references it.",
     ),
 }
 

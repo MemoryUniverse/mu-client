@@ -307,6 +307,19 @@ class OutboxSettings(BaseModel):
     base_backoff_s: float = 0.5
     poll_interval_s: float = 0.5
 
+    # FAULT-HUNT-0924.md F4a: acked rows were retained FOREVER (measured: 374 rows, 307 KB, 34
+    # days, zero deletions ever) — no policy existed at all, not even a generous one. These two
+    # fields ARE the policy (DEV-STANDARDS rule 3: no hardcoded retention window lives in
+    # `mu_client.outbox.retention.OutboxRetentionLoop`, only here). 30 days: long enough that a
+    # replay/audit need noticed within a month still finds the row, short enough that "forever"
+    # stops being true. An operator who wants a different window sets `MU_OUTBOX__ACKED_
+    # RETENTION_DAYS`; nothing below re-derives this number.
+    acked_retention_days: int = 30
+    #: How often the retention sweep runs. Independent of `poll_interval_s` (that cadence drains
+    #: the LIVE queue; this one age-sweeps the DEAD-to-this-process rows) — a slow, cheap
+    #: background pass, never the hot delivery path.
+    retention_sweep_interval_s: float = 3600.0
+
 
 class InjectSettings(BaseModel):
     """capture-spec.md §10/§7.2 (the F4 10k budget). ``env: MU_INJECT__*``."""

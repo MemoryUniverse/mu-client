@@ -3,7 +3,7 @@ itself is a leaf adapter, not something the DEV-STANDARDS integration-only rule 
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -129,3 +129,79 @@ async def test_quarantine_raw_is_hash_indexed(outbox: SqliteOutbox) -> None:
     await outbox.quarantine_raw(HostKind.CLAUDE_CODE, b'{"bad": true}', reason="schema_drift")
     # No public read API is pinned for dead_letter rows this stage; this just proves the write
     # path does not raise on real WAL SQLite.
+
+
+# ═══════════════════════════════════════════════════ F4a: this store finally has a delete path ═
+# FAULT-HUNT-0924.md F4a: before these two methods existed, this file had NO `DELETE` statement
+# anywhere — an acked row's raw `activity_json` sat on disk forever (measured on a real daemon:
+# 374 rows, 307 KB, 34 days, zero deletions ever).
+
+
+async def _acked(outbox: SqliteOutbox, offset: str, *, text: str = "hello") -> None:
+    rec = await outbox.append(_activity(offset=offset, text=text))
+    await outbox.ack([rec.seq])
+
+
+async def test_purge_acked_before_removes_only_old_acked_rows(outbox: SqliteOutbox) -> None:
+    await _acked(outbox, "old")
+    await _acked(outbox, "new")
+    # Backdate the "old" row's enqueued_at directly (SqliteOutbox stamps it at append time; there
+    # is no public "as of" append parameter, and there should not be one just for a test).
+    conn = outbox._conn
+    assert conn is not None
+    conn.execute(
+        "UPDATE outbox SET enqueued_at = ? WHERE activity_id = ?",
+        ((datetime.now(UTC) - timedelta(days=40)).isoformat(), "act-old"),
+    )
+
+    removed = await outbox.purge_acked_before(datetime.now(UTC) - timedelta(days=30))
+
+    assert removed == 1
+    assert await outbox.outbox_depth() == 0  # neither row was pending/inflight to begin with
+
+
+async def test_purge_acked_before_never_removes_pending_or_inflight_rows(
+    outbox: SqliteOutbox,
+) -> None:
+    """The at-least-once guarantee this store exists for: an undelivered row must never be swept
+    by age alone, no matter how old it looks."""
+    rec = await outbox.append(_activity(offset="still-pending"))
+    conn = outbox._conn
+    assert conn is not None
+    conn.execute(
+        "UPDATE outbox SET enqueued_at = ? WHERE seq = ?",
+        ((datetime.now(UTC) - timedelta(days=400)).isoformat(), rec.seq),
+    )
+
+    removed = await outbox.purge_acked_before(datetime.now(UTC))
+
+    assert removed == 0
+    assert await outbox.outbox_depth() == 1  # still there, still deliverable
+
+
+async def test_delete_by_content_hash_removes_acked_and_dead_rows(outbox: SqliteOutbox) -> None:
+    rec1 = await outbox.append(_activity(offset="a1", text="dup content"))
+    await outbox.ack([rec1.seq])
+    rec2 = await outbox.append(_activity(offset="a2", text="dup content"))
+    await outbox.dead_letter(rec2.seq, error="permanent")
+
+    removed = await outbox.delete_by_content_hash("deadbeef")  # _activity()'s fixed content_hash
+
+    assert removed == 2
+
+
+async def test_delete_by_content_hash_leaves_an_inflight_row_for_the_same_hash(
+    outbox: SqliteOutbox,
+) -> None:
+    """The residue `mu_client.consent.residue.ClientCascadeResidue.
+    OUTBOX_ROW_PENDING_SETTLEMENT_OR_RETENTION` names: a row still in flight for content a caller
+    just asked to forget is left alone, not silently dropped mid-delivery."""
+    acked = await outbox.append(_activity(offset="acked-1", text="hello"))
+    await outbox.ack([acked.seq])
+    still_pending = await outbox.append(_activity(offset="pending-1", text="hello"))
+    del still_pending  # kept PENDING — never acked, never dead-lettered
+
+    removed = await outbox.delete_by_content_hash("deadbeef")
+
+    assert removed == 1  # only the acked row
+    assert await outbox.outbox_depth() == 1  # the pending row survives, undisturbed
