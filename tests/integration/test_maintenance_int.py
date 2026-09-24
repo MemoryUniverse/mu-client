@@ -110,6 +110,14 @@ class _CursorAwareConsolidateStub:
             self._cursor = max(i.created_at.timestamp() for i in newly_consumed)
         return JobHandle(job_id=f"stub-{len(self.seen_ids)}", submitted_at=datetime.now(UTC))
 
+    async def rescue_pre_ttl_user(self, user_prefix: UserPrefix) -> JobHandle:
+        """FAULT-HUNT-0924 F5 fix (ADR 0054): `LifecycleManagerPort` Protocol completeness only —
+        this class's tests drive `loop._fire_sweep` directly, never the pre-TTL loop, so this is
+        never actually called; it exists so `MaintenanceLoop(lifecycle_manager=self)` type-checks
+        against the full Protocol rather than only the one method this stub's tests exercise."""
+        del user_prefix
+        return JobHandle(job_id="unused-rescue-stub", submitted_at=datetime.now(UTC))
+
 
 def _item(*, ns: Namespace, content: str) -> MemoryItem:
     return MemoryItem(
@@ -211,11 +219,21 @@ async def test_pre_ttl_loop_lands_at_least_floor_window_over_interval_ticks_befo
     t0 = time.monotonic()
 
     class _PreTtlObserverStub:
-        async def sweep_user(self, user_prefix: UserPrefix) -> JobHandle:
+        # FAULT-HUNT-0924 F5 fix (ADR 0054): `MaintenanceLoop._pre_ttl_loop` now calls
+        # `rescue_pre_ttl_user`, never `sweep_user` — a stub that only implemented `sweep_user`
+        # would silently observe ZERO ticks (an AttributeError inside the supervised loop task,
+        # swallowed by nothing recording it here) and this test would false-pass on a broken loop.
+        async def rescue_pre_ttl_user(self, user_prefix: UserPrefix) -> JobHandle:
             del user_prefix
             present = (await stm.get(ns, item.id)) is not None
             tick_observations.append((time.monotonic() - t0, present))
             return JobHandle(job_id="obs", submitted_at=datetime.now(UTC))
+
+        async def sweep_user(self, user_prefix: UserPrefix) -> JobHandle:
+            """`LifecycleManagerPort` Protocol completeness only — `maintenance_interval_s=3600`
+            never fires in this test's short window, so this is never actually called."""
+            del user_prefix
+            return JobHandle(job_id="unused-sweep-stub", submitted_at=datetime.now(UTC))
 
     item = _item(ns=ns, content="Ada lives in Paris")
     try:

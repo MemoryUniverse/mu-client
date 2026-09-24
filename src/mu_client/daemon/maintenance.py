@@ -84,6 +84,16 @@ class LifecycleManagerPort(Protocol):
         """Durable enqueue of one lifecycle sweep for ``user_prefix``; returns fast (spec §5)."""
         ...
 
+    async def rescue_pre_ttl_user(self, user_prefix: UserPrefix) -> JobHandle:
+        """FAULT-HUNT-0924 F5 fix (ADR 0054): the NARROW sibling of :meth:`sweep_user` —
+        ``PromotionService.rescue_pre_ttl`` only, never the session-boundary promotion leg, the
+        ``scan_for_demotion`` enumeration/demotion leg, or retention. This is what
+        :meth:`MaintenanceLoop._pre_ttl_loop`'s short, frequent cadence is meant to call; before
+        this method existed, that loop had no narrow verb to call and fired :meth:`sweep_user`
+        instead, running the ENTIRE sweep every ``pre_ttl_scan_interval_s`` (120s default, 720x a
+        day) rather than the intended once-a-day ``maintenance_interval_s`` cadence."""
+        ...
+
 
 class MaintenanceEnvSettings(LifecycleSettings, BaseSettings):
     """Env-activated :class:`LifecycleSettings` (``MU_LIFECYCLE__*``) — mirrors MMA's demo
@@ -136,6 +146,15 @@ class _UnwiredLifecycleManager:
         )
         return JobHandle(job_id=f"unwired-{uuid.uuid4().hex}", submitted_at=datetime.now(UTC))
 
+    async def rescue_pre_ttl_user(self, user_prefix: UserPrefix) -> JobHandle:
+        log_degraded(
+            component="lifecycle",
+            mode="rescue_pre_ttl_user",
+            reason=DegradeReason.HOST_WIRING_ABSENT,
+            detail=f"user_prefix={user_prefix}",
+        )
+        return JobHandle(job_id=f"unwired-{uuid.uuid4().hex}", submitted_at=datetime.now(UTC))
+
 
 class MaintenanceLoop:
     """The 3rd supervised daemon task (``daemon/app.py::_supervise``) — see module docstring for
@@ -162,6 +181,15 @@ class MaintenanceLoop:
         # One-sweep-per-user in-process floor (module docstring) — complements, never replaces,
         # sweep_user's own cross-process LifecycleLeasePort acquisition.
         self._inflight: set[UserPrefix] = set()
+        # FAULT-HUNT-0924 F5 fix (ADR 0054): a SEPARATE in-process floor for the narrow pre-TTL
+        # rescue call, deliberately not sharing `_inflight` with the full sweep. The two calls
+        # serve different purposes on different cadences (a 120s rescue vs. a 24h backstop) and
+        # both ultimately serialize on the SAME cross-process `LifecycleLeasePort` lease inside
+        # `MemoryLifecycleManager._run_under_lease` — sharing this in-process set would let an
+        # in-flight full sweep for a user silently coalesce away that user's rescue tick (or vice
+        # versa) for up to the full duration of the OTHER call, defeating the whole point of
+        # decoupling the two cadences (spec §7b MAJOR-4 fix) at the one layer that still could.
+        self._inflight_rescue: set[UserPrefix] = set()
 
         self._sub_captured: Subscription | None = None
         self._sub_promoted: Subscription | None = None
@@ -171,6 +199,8 @@ class MaintenanceLoop:
         self.maintenance_tick_count = 0
         self.pre_ttl_tick_count = 0
         self.coalesced_count = 0
+        self.rescue_fire_count = 0
+        self.rescue_coalesced_count = 0
 
     @property
     def settings(self) -> LifecycleSettings:
@@ -224,6 +254,20 @@ class MaintenanceLoop:
         finally:
             self._inflight.discard(user_prefix)
 
+    async def _fire_rescue(self, user_prefix: UserPrefix) -> None:
+        """FAULT-HUNT-0924 F5 fix (ADR 0054): the pre-TTL loop's own narrow fire, calling
+        ``LifecycleManagerPort.rescue_pre_ttl_user`` — NEVER ``sweep_user`` (see
+        :attr:`_inflight_rescue` for why this keeps its own coalescing floor)."""
+        if user_prefix in self._inflight_rescue:
+            self.rescue_coalesced_count += 1
+            return
+        self._inflight_rescue.add(user_prefix)
+        try:
+            await self._mlm.rescue_pre_ttl_user(user_prefix)
+            self.rescue_fire_count += 1
+        finally:
+            self._inflight_rescue.discard(user_prefix)
+
     # ---------------------------------------------------------------------------------- run/stop
     async def run(self) -> None:
         """Started as the 3rd ``TaskGroup`` member (``daemon/app.py::_supervise``, one additional
@@ -268,9 +312,19 @@ class MaintenanceLoop:
         (``pre_ttl_scan_interval_s <= pre_ttl_window_s / 2``) is enforced at config-authoring time
         by ``LifecycleSettings``' own field defaults (S0-07, 120<=150); this loop only supplies
         the cadence — which items are inside their window and get rescued is entirely
-        ``sweep_user``'s (PromotionService's) decision, not this loop's."""
+        ``PromotionService.rescue_pre_ttl``'s decision, not this loop's.
+
+        **FAULT-HUNT-0924 F5 fix (ADR 0054).** This loop used to call the SAME
+        ``_sweep_active_users`` body as :meth:`_periodic_maintenance_loop` — i.e. the full
+        ``sweep_user`` (promotion's session-boundary leg + the whole ``scan_for_demotion``
+        enumeration/demotion leg + retention), not merely a rescue scan. That made the documented
+        24h ``maintenance_interval_s`` cadence decorative (a strict subset of what this 120s loop
+        already ran) and enforced F1's demotion horizon with two-minute granularity instead of
+        daily, for no correctness benefit — ``rescue_pre_ttl`` itself had no caller at all. This
+        loop now calls :meth:`_sweep_active_users_rescue`, the narrow counterpart, exclusively.
+        """
         while not self._stop.is_set():
-            await self._sweep_active_users(cap=self._settings.max_users_per_sweep)
+            await self._sweep_active_users_rescue(cap=self._settings.max_users_per_sweep)
             self.pre_ttl_tick_count += 1
             try:
                 await asyncio.wait_for(
@@ -285,6 +339,11 @@ class MaintenanceLoop:
         event loop's other supervised tasks (``WorkerPool.run``'s capture-drain, ``IpcServer``'s
         accept loop).
 
+        The FULL sweep (``sweep_user``) — called ONLY by :meth:`_periodic_maintenance_loop`'s 24h
+        backstop cadence (FAULT-HUNT-0924 F5 fix, ADR 0054: this used to ALSO be
+        :meth:`_pre_ttl_loop`'s body, which was the defect). See :meth:`_sweep_active_users_rescue`
+        for the narrow pre-TTL-only sibling.
+
         Discovery gap (integrate-phase note, spec §7's "hybrid discovery"): this loop's only user
         directory is the ACTIVE-user registry populated by bus events — the spec's
         ``full_scan_interval_s`` "slow full-scan backstop... so a user with no recent events still
@@ -294,4 +353,14 @@ class MaintenanceLoop:
         """
         for user_prefix in list(self._active_users)[:cap]:
             await self._fire_sweep(user_prefix)
+            await asyncio.sleep(0)
+
+    async def _sweep_active_users_rescue(self, *, cap: int) -> None:
+        """The narrow pre-TTL-only counterpart to :meth:`_sweep_active_users` (FAULT-HUNT-0924 F5
+        fix, ADR 0054) — same bounded-pass/cooperative-yield shape, but fires
+        ``rescue_pre_ttl_user`` instead of ``sweep_user`` for every active user, so the 120s
+        cadence this feeds costs a narrow STM scan, never a full promotion+demotion+retention
+        sweep."""
+        for user_prefix in list(self._active_users)[:cap]:
+            await self._fire_rescue(user_prefix)
             await asyncio.sleep(0)

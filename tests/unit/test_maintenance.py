@@ -38,11 +38,16 @@ def _ns(*, user: str, session: str = "s1", workspace: str = "ws", org: str = "or
 
 class _RecordingLifecycleManager:
     """A minimal :class:`~mu_client.daemon.maintenance.LifecycleManagerPort` stub — records every
-    ``sweep_user`` call (user + monotonic order), optionally gated by an ``asyncio.Event`` so a
-    test can hold a "sweep in flight" window open to exercise the coalescing floor."""
+    ``sweep_user`` call (user + monotonic order) AND every ``rescue_pre_ttl_user`` call
+    SEPARATELY (FAULT-HUNT-0924 F5 fix, ADR 0054: the two are no longer the same call, and a test
+    that cannot tell them apart cannot tell the defect the fix removed from a working system —
+    see ``test_pre_ttl_loop_calls_rescue_pre_ttl_user_never_the_full_sweep`` below), optionally
+    gated by an ``asyncio.Event`` so a test can hold a "call in flight" window open to exercise
+    the coalescing floor."""
 
     def __init__(self, *, gate: asyncio.Event | None = None) -> None:
         self.calls: list[UserPrefix] = []
+        self.rescue_calls: list[UserPrefix] = []
         self._gate = gate
 
     async def sweep_user(self, user_prefix: UserPrefix) -> JobHandle:
@@ -50,6 +55,14 @@ class _RecordingLifecycleManager:
             await self._gate.wait()
         self.calls.append(user_prefix)
         return JobHandle(job_id=f"job-{len(self.calls)}", submitted_at=datetime.now(UTC))
+
+    async def rescue_pre_ttl_user(self, user_prefix: UserPrefix) -> JobHandle:
+        if self._gate is not None:
+            await self._gate.wait()
+        self.rescue_calls.append(user_prefix)
+        return JobHandle(
+            job_id=f"rescue-job-{len(self.rescue_calls)}", submitted_at=datetime.now(UTC)
+        )
 
 
 @pytest.fixture
@@ -244,7 +257,40 @@ async def test_periodic_loop_sweeps_active_users_registered_via_bus_events(
     await loop.stop()
     await run_task
 
-    assert UserPrefix(ns) in mlm.calls, "the pre-TTL periodic loop must sweep the active user"
+    # FAULT-HUNT-0924 F5 fix (ADR 0054): the pre-TTL loop calls the NARROW rescue verb, never the
+    # full sweep — `mlm.calls` (sweep_user) must stay empty here (maintenance_interval_s=3600
+    # never ticks in this window); only `mlm.rescue_calls` records the pre-TTL loop's own fire.
+    assert UserPrefix(ns) in mlm.rescue_calls, "the pre-TTL loop must rescue the active user"
+    assert mlm.calls == [], (
+        "the pre-TTL loop must NEVER call the full sweep_user (F5: this was the defect — both "
+        "periodic loops called the same full-sweep body)"
+    )
+
+
+async def test_pre_ttl_loop_never_calls_the_full_sweep(bus: InprocBus) -> None:
+    """FAULT-HUNT-0924 F5 regression (ADR 0054): dedicated test for the defect itself — the
+    24h-cadence ``maintenance_interval_s`` loop and the 120s-cadence ``pre_ttl_scan_interval_s``
+    loop must call TWO DIFFERENT verbs on ``LifecycleManagerPort``. Before the fix, both loops
+    called ``sweep_user`` (the full promotion+demotion+retention sweep) — this test fails on that
+    prior behaviour because ``mlm.calls`` would be non-empty from the pre-TTL loop alone, with
+    ``maintenance_interval_s`` set far outside this test's window."""
+    settings = LifecycleSettings(
+        maintenance_interval_s=3600, pre_ttl_scan_interval_s=1, batch_size=1000
+    )
+    mlm = _RecordingLifecycleManager()
+    loop = MaintenanceLoop(bus=bus, lifecycle_manager=mlm, settings=settings)
+
+    run_task = asyncio.create_task(loop.run())
+    await asyncio.sleep(0.05)
+    ns = _ns(user="erin")
+    await bus.publish(MemoryCaptured(namespace=ns, ids=["m1"], tier=Tier.STM))
+
+    await asyncio.sleep(1.3)  # >= 1 pre-TTL tick, 0 maintenance ticks
+    await loop.stop()
+    await run_task
+
+    assert mlm.rescue_calls, "the pre-TTL loop must fire rescue_pre_ttl_user on its own cadence"
+    assert mlm.calls == [], "the pre-TTL loop must never fire the full sweep_user"
 
 
 async def test_run_unsubscribes_on_stop_so_further_events_are_not_observed(bus: InprocBus) -> None:
