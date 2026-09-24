@@ -248,6 +248,11 @@ class LocalDaemon:
         #    session's at-risk STM turns to a durable tier before the host compacts/deletes them,
         #    instead of the pre-Phase-3 silent swallow. Gated by ``precompact_promote_enabled``
         #    (default ON); when OFF the promoter is ``None`` and PreCompact reverts to skip-and-ack.
+        # PROTOTYPE-DEBT-0924.md B2: ``bridge=bridge`` wires the SAME ``RecallInjectBridge``
+        # instance built above (step 4) so a PreCompact ALSO drops the bridge's belief that it
+        # already delivered this session's context — not just promoting the at-risk turns, but
+        # making them injectable again on the very next pull. `bridge` is already constructed by
+        # this point (built before the lifecycle manager, above), so no reorder was needed.
         precompact_promoter: PreCompactPromoter | None = None
         if self._settings.capture.precompact_promote_enabled:
             precompact_promoter = PreCompactPromoter(
@@ -255,6 +260,7 @@ class LocalDaemon:
                 org=self._settings.default_namespace,
                 workspace=self._settings.default_workspace,
                 user=self._settings.default_user,
+                bridge=bridge,
             )
         # 3b. The two EVENT-DRIVEN consolidation triggers (session_save.py) — SESSION_END (the
         #     buffer is closing) and capture PRESSURE (the buffer is filling). Same η the capture

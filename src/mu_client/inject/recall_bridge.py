@@ -896,13 +896,22 @@ class RecallInjectBridge:
         for a ``SessionStart`` that resumes an existing ``session_id``. Returns whether anything
         was cleared, so a caller can log a content-free outcome.
 
-        **REPORTED, not wired — the one line this lane may not write.** ``PreCompact`` reaches the
-        client today at ``workers/ingest_client.py:93`` (``ActivityKind.PRE_COMPACT`` ->
-        ``PreCompactPromoter.on_precompact``) and never reaches ``inject/`` at all; a grep for
-        ``PreCompact`` across ``src/mu_client/`` hits ``capture/``, ``lifecycle/`` and ``workers/``
-        and nothing here. ``workers/ingest_client.py`` is outside this lane's file ownership, so
-        the seam is built and tested here and the call is reported. Until it is wired, the only
-        recovery from a compaction is ``hot_session_ttl_s`` expiry or a daemon restart."""
+        **WIRED for PreCompact (PROTOTYPE-DEBT-0924.md B2, closed).** ``PreCompactPromoter.
+        on_precompact`` (``lifecycle/precompact.py``) calls this — through the narrow
+        ``ContextResetSinkPort`` structural seam, so this module still never imports
+        ``lifecycle/`` — right after ``promote_session_now`` returns, and the daemon composition
+        root (``daemon/app.py``, step "PreCompactPromoter") passes it the SAME
+        ``RecallInjectBridge`` instance already wired as the ``WarmRecallCacheServicePort``.
+        Proven end-to-end in ``tests/unit/test_precompact_routing.py`` (spy) and
+        ``tests/unit/test_live_context_assembly.py`` (real bridge, real digest clear).
+
+        **The ``SessionStart``-resume half is STILL NOT wired** — a resumed ``SessionStart`` maps
+        to ``ActivityKind.SESSION_META`` (``capture/parsers.py:192``), which
+        ``InProcessLocalIngest`` still drops as a plain control-kind skip; nothing inspects the
+        hook's ``source`` field for ``"resume"`` and nothing routes it here. Left as a reported gap
+        (out of B2's evidenced scope — the audit's cited call site was PreCompact only) rather than
+        built speculatively: until it lands, resuming a compacted/cleared session recovers only via
+        ``hot_session_ttl_s`` expiry or a daemon restart, same as PreCompact did before this fix."""
         return self._states.clear_digest(self._namespace(session_id, user))
 
     def last_rendered(self, session_id: str) -> str | None:

@@ -1315,8 +1315,10 @@ async def test_a_host_context_reset_makes_the_suppressed_facts_injectable_again(
     Claude Code compaction preserves ``session_id``, so after a ``PreCompact`` the daemon keeps
     suppressing exactly the facts the model just lost. Without this seam the only recovery is
     ``hot_session_ttl_s`` (1800 s) of idleness or a daemon restart: the lean delta degrades not to
-    re-sending everything but to never re-sending anything. REPORTED: the call site
-    (``workers/ingest_client.py:93``) is outside this lane's file ownership."""
+    re-sending everything but to never re-sending anything. This test drives the seam directly
+    (unit-level); the real call site is now wired at ``lifecycle/precompact.py::on_precompact``
+    (PROTOTYPE-DEBT-0924.md B2) and re-verified from that side in
+    ``tests/unit/test_precompact_routing.py::test_promoter_clears_the_bridge_after_promoting``."""
     recall = cast(AsyncMock, started_host._memory.recall)  # type: ignore[union-attr]
     bridge = RecallInjectBridge(started_host, settings=InjectSettings(), recall_dir=tmp_path)
     recall.return_value = _listing(_item("the deploy target is staging-eu"))

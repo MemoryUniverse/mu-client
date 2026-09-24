@@ -44,6 +44,20 @@ class _SpyPromoter:
         self.calls.append((ns, force))
 
 
+class _SpyBridge:
+    """Records ``on_host_context_reset`` calls — satisfies ``ContextResetSinkPort`` structurally
+    (PROTOTYPE-DEBT-0924.md B2: the real collaborator is ``RecallInjectBridge``, proven separately
+    in ``tests/unit/test_live_context_assembly.py``)."""
+
+    def __init__(self, *, result: bool = True) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+        self._result = result
+
+    def on_host_context_reset(self, session_id: str, *, user: str | None = None) -> bool:
+        self.calls.append((session_id, user))
+        return self._result
+
+
 class _SpyOnPrecompact:
     """Records ``on_precompact`` — stands in for ``PreCompactPromoter`` in the ingest routing test.
 
@@ -121,6 +135,48 @@ async def test_promoter_builds_session_namespace_and_forces_promotion() -> None:
     assert ns == Namespace(
         org="orgX", workspace="wsX", user="alice", session="sess-42", visibility=Visibility.PRIVATE
     )
+
+
+async def test_promoter_clears_the_bridge_after_promoting() -> None:
+    """PROTOTYPE-DEBT-0924.md B2: a wired ``bridge`` has its warm-cache belief dropped for exactly
+    this session/user, and only AFTER the promotion call — never instead of it, never before (a
+    reset dropped before the promotion lands would race a concurrent recall into re-caching the
+    stale belief)."""
+    order: list[str] = []
+
+    class _OrderedPromoter(_SpyPromoter):
+        async def promote_session_now(self, ns: Namespace, *, force: bool = False) -> None:
+            order.append("promote")
+            await super().promote_session_now(ns, force=force)
+
+    class _OrderedBridge(_SpyBridge):
+        def on_host_context_reset(self, session_id: str, *, user: str | None = None) -> bool:
+            order.append("reset")
+            return super().on_host_context_reset(session_id, user=user)
+
+    promoter_spy = _OrderedPromoter()
+    bridge_spy = _OrderedBridge(result=True)
+    promoter = PreCompactPromoter(
+        promoter=promoter_spy, org="orgX", workspace="wsX", user="alice", bridge=bridge_spy
+    )
+
+    await promoter.on_precompact(_activity(ActivityKind.PRE_COMPACT, text=None, session="sess-42"))
+
+    assert order == ["promote", "reset"], "promotion must complete BEFORE the bridge is cleared"
+    assert bridge_spy.calls == [
+        ("sess-42", "alice")
+    ], "on_host_context_reset must be called with the SAME session id and user the promotion used"
+
+
+async def test_promoter_without_bridge_still_promotes_unchanged() -> None:
+    """Backward compatibility: ``bridge=None`` (the pre-B2 default) must promote exactly as before
+    and never raise for the missing collaborator."""
+    promoter_spy = _SpyPromoter()
+    promoter = PreCompactPromoter(promoter=promoter_spy, org="o", workspace="w", user="u")
+
+    await promoter.on_precompact(_activity(ActivityKind.PRE_COMPACT, text=None, session="s1"))
+
+    assert len(promoter_spy.calls) == 1
 
 
 async def test_promoter_rejects_misrouted_non_precompact_activity() -> None:

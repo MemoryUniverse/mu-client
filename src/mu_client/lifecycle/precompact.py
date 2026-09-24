@@ -53,6 +53,25 @@ class SessionPromoterPort(Protocol):
     async def promote_session_now(self, ns: Namespace, *, force: bool = False) -> None: ...
 
 
+@runtime_checkable
+class ContextResetSinkPort(Protocol):
+    """The one method this promoter needs from the inject side —
+    ``mu_client.inject.recall_bridge.RecallInjectBridge.on_host_context_reset`` satisfies this
+    structurally (PEP 544). Kept narrow (not the whole ``WarmRecallCacheServicePort`` surface,
+    which does not even declare this method — see ``mu_engine/lifecycle/manager.py:242-252``) so a
+    unit test can drive this half with a tiny in-process spy while the integration proof runs the
+    real bridge.
+
+    **Why this exists (PROTOTYPE-DEBT-0924.md B2).** Promotion and injection are two DIFFERENT
+    beliefs about the same compaction: promotion saves the at-risk STM turns from being lost;
+    injection has to stop believing it already delivered them, or the daemon keeps suppressing
+    (§5.3's lean-delta dedup) facts the host just forgot. Without this call the promoted turns are
+    durable but invisible until ``hot_session_ttl_s`` (1800s) idles out or the daemon restarts —
+    the fix this port closes."""
+
+    def on_host_context_reset(self, session_id: str, *, user: str | None = None) -> bool: ...
+
+
 class PreCompactPromoter:
     """Promote-before-delete owner for the ``PreCompact`` control event (Phase 3).
 
@@ -68,18 +87,28 @@ class PreCompactPromoter:
         org: str,
         workspace: str,
         user: str,
+        bridge: ContextResetSinkPort | None = None,
     ) -> None:
         self._promoter = promoter
         self._org = org
         self._workspace = workspace
         self._user = user
+        # PROTOTYPE-DEBT-0924.md B2: the daemon composition root passes the REAL
+        # ``RecallInjectBridge`` here (``daemon/app.py``). ``None`` (unit tests, or a caller that
+        # genuinely has no bridge) keeps the pre-fix behaviour: promote runs, the warm-cache belief
+        # is left untouched — a documented no-op, never a silent skip of the promotion itself.
+        self._bridge = bridge
 
     async def on_precompact(self, activity: RawActivity) -> None:
         """Force-promote the activity's session's at-risk STM turns into a durable tier before the
-        host compacts/deletes them. Raises on a misrouted (non-PreCompact) activity — a caller bug,
-        never silently ignored. Any store failure inside ``promote_session_now`` PROPAGATES (the
-        outbox worker's retry/dead-letter path handles it) — this method never swallows a real
-        failure into a fake success (DEV-STANDARDS rule 8)."""
+        host compacts/deletes them, THEN drop the inject bridge's belief that it already delivered
+        this session's context (B2) — otherwise the promoted turns are durable but the daemon keeps
+        suppressing them from the compacted window until ``hot_session_ttl_s`` idles out or a
+        restart. Raises on a misrouted (non-PreCompact) activity — a caller bug, never silently
+        ignored. Any store failure inside ``promote_session_now`` PROPAGATES (the outbox worker's
+        retry/dead-letter path handles it) — this method never swallows a real failure into a fake
+        success (DEV-STANDARDS rule 8). The bridge call is local dict-pop bookkeeping (``recall_
+        bridge.py::invalidate`` is the same shape) — it cannot itself raise a store error."""
         if activity.kind is not ActivityKind.PRE_COMPACT:
             raise ValueError(
                 f"PreCompactPromoter.on_precompact received a non-PreCompact activity "
@@ -101,3 +130,10 @@ class PreCompactPromoter:
         # about to drop them. Reuses PromotionService.promote_session's real STM->MTM promote +
         # MTM->LTM distill machinery; the manager publishes its own MemoryPromoted events.
         await self._promoter.promote_session_now(ns, force=True)
+        if self._bridge is not None:
+            cleared = self._bridge.on_host_context_reset(activity.session_id, user=self._user)
+            _log.info(
+                "precompact.warm_cache_belief_cleared",
+                session=activity.session_id,
+                cleared=cleared,
+            )
