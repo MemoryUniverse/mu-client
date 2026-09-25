@@ -43,6 +43,8 @@ from mu_client.errors import ClientNotStartedError
 if TYPE_CHECKING:
     from mu_contracts.ports.observability import MetricSink, Tracer
     from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
+    from mu_engine.services.conflict.inbox import ConflictInboxProjector
+    from mu_engine.services.conflict.resolution import ConflictResolutionService
     from mu_engine.services.health.service import MemoryHealthService
     from mu_engine.services.pin.service import PinService
     from mu_engine.storage.user_registry import UserPrefixRegistryPort
@@ -187,6 +189,21 @@ class LocalMemoryHost:
         upsert or cannot count the partition's pin bound. Same passthrough discipline as
         :attr:`health`."""
         return self._require_memory().pin
+
+    @property
+    def conflict_inbox(self) -> ConflictInboxProjector:
+        """The owned ``LocalMemory``'s conflict-inbox READ projector (``LocalMemory.conflict_inbox``
+        -> ``LocalContainer.conflict_inbox``, AD-300). Unlike :attr:`health`/:attr:`pin`, never
+        ``None`` — it answers on every binding. Passed straight into ``IpcServer(conflicts=...)``
+        and the MCP engine holder; this host never constructs one."""
+        return self._require_memory().conflict_inbox
+
+    @property
+    def conflict_resolution(self) -> ConflictResolutionService:
+        """The owned ``LocalMemory``'s conflict-resolution WRITE service
+        (``LocalMemory.conflict_resolution`` -> ``LocalContainer.conflict_resolution``, AD-300).
+        Same passthrough discipline as :attr:`health`."""
+        return self._require_memory().conflict_resolution
 
     @property
     def user_registry(self) -> UserPrefixRegistryPort | None:

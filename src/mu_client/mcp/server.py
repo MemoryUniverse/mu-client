@@ -43,6 +43,8 @@ from mu_client.mcp.guard import SharedPrivateGuard
 from mu_client.mcp.surface import withdrawn_tool_names
 
 if TYPE_CHECKING:
+    from mu_engine.services.conflict.inbox import ConflictInboxProjector
+    from mu_engine.services.conflict.resolution import ConflictResolutionService
     from mu_engine.services.health import MemoryHealthService
     from mu_engine.services.pin import PinService
     from mu_local.local_memory import LocalMemory
@@ -144,6 +146,8 @@ class _EngineHolder:
         self._bridge: RecallInjectBridge | None = None
         self._health: MemoryHealthService | None = None
         self._pin: PinService | None = None
+        self._conflict_inbox: ConflictInboxProjector | None = None
+        self._conflict_resolution: ConflictResolutionService | None = None
 
     def set(
         self,
@@ -152,17 +156,23 @@ class _EngineHolder:
         *,
         health: MemoryHealthService | None = None,
         pin: PinService | None = None,
+        conflict_inbox: ConflictInboxProjector | None = None,
+        conflict_resolution: ConflictResolutionService | None = None,
     ) -> None:
         self._memory = memory
         self._bridge = bridge
         self._health = health
         self._pin = pin
+        self._conflict_inbox = conflict_inbox
+        self._conflict_resolution = conflict_resolution
 
     def clear(self) -> None:
         self._memory = None
         self._bridge = None
         self._health = None
         self._pin = None
+        self._conflict_inbox = None
+        self._conflict_resolution = None
 
     @property
     def memory(self) -> LocalMemory:
@@ -187,6 +197,18 @@ class _EngineHolder:
     @property
     def pin(self) -> PinService | None:
         return self._pin
+
+    #: AD-300: unlike ``health``/``pin`` these are never ``None`` on this binding
+    #: (``LocalContainer`` builds both unconditionally — ``mu_local/composition.py``), but stay
+    #: ``| None``-shaped for the SAME "raise-if-unstarted, not raise-if-unwired" contract as the
+    #: two above, so a future daemonless/degraded binding has somewhere to express absence.
+    @property
+    def conflict_inbox(self) -> ConflictInboxProjector | None:
+        return self._conflict_inbox
+
+    @property
+    def conflict_resolution(self) -> ConflictResolutionService | None:
+        return self._conflict_resolution
 
 
 def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
@@ -224,7 +246,16 @@ def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
         # Still ``| None``-shaped: on a vector backend with no partition-walk primitive the
         # container builds neither service and the tools keep refusing loudly (ServiceNotWiredError)
         # instead of fabricating a health view or acking a pin no store would persist.
-        holder.set(memory, bridge, health=memory.health, pin=memory.pin)
+        holder.set(
+            memory,
+            bridge,
+            health=memory.health,
+            pin=memory.pin,
+            # AD-300: same passthrough discipline as health/pin — from THIS lifespan's own real
+            # LocalMemory, never a second composition root.
+            conflict_inbox=memory.conflict_inbox,
+            conflict_resolution=memory.conflict_resolution,
+        )
         try:
             yield {}
         finally:
@@ -540,6 +571,50 @@ def build_server(*, settings: ClientSettings | None = None) -> FastMCP:
     ) -> dict[str, Any]:
         return await tools.tool_unpin(
             holder.pin, settings=resolved, memory_id=memory_id, user=user, session=session
+        )
+
+    @server.tool(
+        name="conflicts",
+        description="List this agent's own PENDING conflicts — memories that disagree with each "
+        "other and are waiting on a decision — with both sides of each named. Read-only: lists "
+        "nothing else and changes nothing. Content-free except each side's body, which is not "
+        "hydrated on this binding yet (renders empty).",
+    )
+    async def conflicts(  # pyright: ignore[reportUnusedFunction]
+        user: str = default_user,
+        session: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.tool_conflicts(
+            holder.conflict_inbox, settings=resolved, user=user, session=session
+        )
+
+    @server.tool(
+        name="conflicts_resolve",
+        description="Record a decision on ONE pending conflict (id from 'conflicts'): "
+        "'supersede' (needs winner_id) picks a winner and invalidates the other side; "
+        "'keep_both' leaves both active; 'merge' (needs winner_id + merged_text_ref) composes a "
+        "new item from both; 'quarantine' (needs winner_id) parks the loser out of recall; "
+        "'dismiss' says 'not a conflict' and will not re-open on the same facts. Returns "
+        "immediately with the record's new state — the actual change lands in the background, "
+        "not inline with this call.",
+    )
+    async def conflicts_resolve(  # pyright: ignore[reportUnusedFunction]
+        conflict_id: str,
+        kind: str,
+        winner_id: str | None = None,
+        merged_text_ref: str | None = None,
+        user: str = default_user,
+        session: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.tool_conflicts_resolve(
+            holder.conflict_resolution,
+            settings=resolved,
+            conflict_id=conflict_id,
+            kind=kind,
+            winner_id=winner_id,
+            merged_text_ref=merged_text_ref,
+            user=user,
+            session=session,
         )
 
     @server.resource(

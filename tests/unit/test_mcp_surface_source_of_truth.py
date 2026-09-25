@@ -19,6 +19,7 @@ from mu_client.config import ClientSettings, McpSettings
 from mu_client.mcp.server import build_server
 from mu_client.mcp.surface import (
     AUTOMATIC_TOOL_NAMES,
+    CONFLICTS_TOOL_NAMES,
     HEALTH_TOOL_NAMES,
     PIN_TOOL_NAMES,
     REGISTERED_TOOL_NAMES,
@@ -28,16 +29,20 @@ from mu_client.mcp.surface import (
 
 pytestmark = pytest.mark.unit
 
-#: Every flag combination. Eight, not one: the whole point of three INDEPENDENT gates is that they
-#: compose, and a declaration that happened to be right only on the default surface would be a
-#: declaration that is wrong the moment an owner flips a flag.
-_ALL_FLAG_COMBOS = tuple(itertools.product((False, True), repeat=3))
+#: Every flag combination. Sixteen, not one: the whole point of FOUR INDEPENDENT gates (AD-300
+#: added the fourth, ``expose_conflicts_tools``) is that they compose, and a declaration that
+#: happened to be right only on the default surface would be a declaration that is wrong the
+#: moment an owner flips a flag.
+_ALL_FLAG_COMBOS = tuple(itertools.product((False, True), repeat=4))
 
 
-def _settings(automatic: bool, health: bool, pin: bool) -> ClientSettings:
+def _settings(automatic: bool, health: bool, pin: bool, conflicts: bool = False) -> ClientSettings:
     return ClientSettings(
         mcp=McpSettings(
-            expose_automatic_tools=automatic, expose_health_tool=health, expose_pin_tools=pin
+            expose_automatic_tools=automatic,
+            expose_health_tool=health,
+            expose_pin_tools=pin,
+            expose_conflicts_tools=conflicts,
         )
     )
 
@@ -50,16 +55,17 @@ async def test_registered_tool_names_is_exactly_what_the_server_registers() -> N
     **MUTATION:** drop ``"ask"`` from ``REGISTERED_TOOL_NAMES`` -> RED (``ask`` appears in the real
     manager and not in the declaration). Adding a spurious ``"nonexistent"`` -> RED the other way.
     """
-    server = build_server(settings=_settings(True, True, True))
+    server = build_server(settings=_settings(True, True, True, True))
     real = {tool.name for tool in await server.list_tools()}
     assert real == set(REGISTERED_TOOL_NAMES)
 
 
-@pytest.mark.parametrize(("automatic", "health", "pin"), _ALL_FLAG_COMBOS)
+@pytest.mark.parametrize(("automatic", "health", "pin", "conflicts"), _ALL_FLAG_COMBOS)
 async def test_offered_tool_names_matches_the_real_manager_under_every_flag_combination(
-    automatic: bool, health: bool, pin: bool
+    automatic: bool, health: bool, pin: bool, conflicts: bool
 ) -> None:
-    """The declared OFFERED set equals what a model can really call, for all eight configurations.
+    """The declared OFFERED set equals what a model can really call, for all sixteen
+    configurations.
 
     ⚠ **What this test can and CANNOT catch, stated because the first version of it over-claimed.**
     ``build_server`` now withdraws through :func:`withdrawn_tool_names`, so both sides of this
@@ -72,15 +78,15 @@ async def test_offered_tool_names_matches_the_real_manager_under_every_flag_comb
     :func:`test_each_gate_actually_withdraws_its_own_tools` below, which asserts against the real
     manager without consulting the gate at all. Both are needed; neither is sufficient.
     """
-    settings = _settings(automatic, health, pin)
+    settings = _settings(automatic, health, pin, conflicts)
     server = build_server(settings=settings)
     real = {tool.name for tool in await server.list_tools()}
     assert real == set(offered_tool_names(settings.mcp))
 
 
-@pytest.mark.parametrize(("automatic", "health", "pin"), _ALL_FLAG_COMBOS)
+@pytest.mark.parametrize(("automatic", "health", "pin", "conflicts"), _ALL_FLAG_COMBOS)
 def test_offered_and_withdrawn_partition_the_registered_set(
-    automatic: bool, health: bool, pin: bool
+    automatic: bool, health: bool, pin: bool, conflicts: bool
 ) -> None:
     """No tool may be both offered and withdrawn, and none may be neither.
 
@@ -90,7 +96,7 @@ def test_offered_and_withdrawn_partition_the_registered_set(
     **MUTATION:** make ``offered_tool_names`` return ``REGISTERED_TOOL_NAMES`` unconditionally ->
     RED (the two sets overlap on every combination that withdraws anything).
     """
-    mcp = _settings(automatic, health, pin).mcp
+    mcp = _settings(automatic, health, pin, conflicts).mcp
     offered, withdrawn = offered_tool_names(mcp), withdrawn_tool_names(mcp)
     assert offered | withdrawn == REGISTERED_TOOL_NAMES
     assert offered & withdrawn == frozenset()
@@ -101,20 +107,21 @@ def test_every_gated_name_is_a_registered_name() -> None:
 
     **MUTATION:** add ``"promote_all"`` to ``AUTOMATIC_TOOL_NAMES`` -> RED.
     """
-    gated = AUTOMATIC_TOOL_NAMES | HEALTH_TOOL_NAMES | PIN_TOOL_NAMES
+    gated = AUTOMATIC_TOOL_NAMES | HEALTH_TOOL_NAMES | PIN_TOOL_NAMES | CONFLICTS_TOOL_NAMES
     assert gated <= REGISTERED_TOOL_NAMES
 
 
 @pytest.mark.parametrize(
     ("flags", "gated_names"),
     [
-        ((False, True, True), AUTOMATIC_TOOL_NAMES),
-        ((True, False, True), HEALTH_TOOL_NAMES),
-        ((True, True, False), PIN_TOOL_NAMES),
+        ((False, True, True, True), AUTOMATIC_TOOL_NAMES),
+        ((True, False, True, True), HEALTH_TOOL_NAMES),
+        ((True, True, False, True), PIN_TOOL_NAMES),
+        ((True, True, True, False), CONFLICTS_TOOL_NAMES),
     ],
 )
 async def test_each_gate_actually_withdraws_its_own_tools(
-    flags: tuple[bool, bool, bool], gated_names: frozenset[str]
+    flags: tuple[bool, bool, bool, bool], gated_names: frozenset[str]
 ) -> None:
     """Each gate OFF removes exactly its own tools from the REAL manager, and nothing else.
 
@@ -123,7 +130,7 @@ async def test_each_gate_actually_withdraws_its_own_tools(
 
     **MUTATION:** in ``withdrawn_tool_names``, replace ``if not mcp.expose_pin_tools`` with
     ``if False`` -> RED on the ``PIN_TOOL_NAMES`` case (``pin``/``unpin`` are still callable with
-    the flag off). Same for either other gate. VERIFIED RED for all three.
+    the flag off). Same for either other gate. VERIFIED RED for all four.
     """
     server = build_server(settings=_settings(*flags))
     real = {tool.name for tool in await server.list_tools()}

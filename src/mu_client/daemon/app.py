@@ -322,6 +322,14 @@ class LocalDaemon:
             lifecycle_manager=self._lifecycle_manager,
             health=self._host.health,
             pin=self._host.pin,
+            # AD-300 (conflict-resolution-async-design.md §5): same passthrough discipline as
+            # ``health=``/``pin=`` above — from the SAME ``LocalMemory`` this daemon already
+            # owns, never a second composition root. Unlike ``health``/``pin`` these are never
+            # ``None`` on this binding (``LocalContainer`` builds both unconditionally), but the
+            # accessor still goes through ``self._host`` rather than reaching into the container
+            # directly, matching every other surface here.
+            conflict_inbox=self._host.conflict_inbox,
+            conflict_resolution=self._host.conflict_resolution,
             consent=self._consent,
         )
         await self._ipc.bind()

@@ -25,6 +25,7 @@ from mu_client.config import McpSettings
 
 __all__ = [
     "AUTOMATIC_TOOL_NAMES",
+    "CONFLICTS_TOOL_NAMES",
     "HEALTH_TOOL_NAMES",
     "PIN_TOOL_NAMES",
     "REGISTERED_TOOL_NAMES",
@@ -42,6 +43,10 @@ HEALTH_TOOL_NAMES: frozenset[str] = frozenset({"health"})
 
 #: The lifecycle OVERRIDE pair (§7.2). Withdrawn unless ``MU_MCP__EXPOSE_PIN_TOOLS=true``.
 PIN_TOOL_NAMES: frozenset[str] = frozenset({"pin", "unpin"})
+
+#: conflict-resolution-async-design.md §5 (AD-300). Withdrawn unless
+#: ``MU_MCP__EXPOSE_CONFLICTS_TOOLS=true``.
+CONFLICTS_TOOL_NAMES: frozenset[str] = frozenset({"conflicts", "conflicts_resolve"})
 
 #: Every tool ``build_server`` registers, before any withdrawal. Kept in decorator order so a
 #: reader can diff it against ``mcp/server.py`` by eye.
@@ -61,6 +66,8 @@ REGISTERED_TOOL_NAMES: frozenset[str] = frozenset(
         "health",
         "pin",
         "unpin",
+        "conflicts",
+        "conflicts_resolve",
     }
 )
 
@@ -79,6 +86,8 @@ def withdrawn_tool_names(mcp: McpSettings) -> frozenset[str]:
         withdrawn |= HEALTH_TOOL_NAMES
     if not mcp.expose_pin_tools:
         withdrawn |= PIN_TOOL_NAMES
+    if not mcp.expose_conflicts_tools:
+        withdrawn |= CONFLICTS_TOOL_NAMES
     return frozenset(withdrawn)
 
 

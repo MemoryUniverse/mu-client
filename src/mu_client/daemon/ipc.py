@@ -69,6 +69,30 @@ from mu_contracts.domain.model.memory import Namespace
 from mu_client.capture.model import HostKind
 from mu_client.capture.parsers import ParserRegistry
 from mu_client.config import DaemonIpcSettings
+from mu_client.conflicts import (
+    CONFLICT_INBOX_UNWIRED,
+    CONFLICT_RESOLUTION_UNWIRED,
+    CONFLICT_SURFACE_ERRORS,
+    CONFLICTS_LIST_ROUTE,
+    CONFLICTS_RESOLVE_ROUTE,
+    conflict_failure_response,
+    manual_decision_of,
+)
+from mu_client.conflicts import (
+    ValidationError as ConflictValidationError,
+)
+from mu_client.conflicts import (
+    local_scope as conflict_local_scope,
+)
+from mu_client.conflicts import (
+    malformed_request_response as conflict_malformed_request_response,
+)
+from mu_client.conflicts import (
+    namespace_on_the_wire as conflict_namespace_on_the_wire,
+)
+from mu_client.conflicts import (
+    private_plane_refusal as conflict_private_plane_refusal,
+)
 from mu_client.consent.ipc_surface import (
     AGENT_SHARE_REVOKE_ROUTE,
     AGENT_SHARE_ROUTE,
@@ -107,6 +131,8 @@ if TYPE_CHECKING:
     # MemoryLifecycleManager, only calls warm-read methods on one handed to it, so no runtime
     # import is needed on this socket-front-door module's own import surface.
     from mu_engine.lifecycle.manager import MemoryLifecycleManager
+    from mu_engine.services.conflict.inbox import ConflictInboxProjector
+    from mu_engine.services.conflict.resolution import ConflictResolutionService
     from mu_engine.services.health import MemoryHealthService
     from mu_engine.services.pin import PinService
 
@@ -126,6 +152,8 @@ class IpcServer:
         lifecycle_manager: MemoryLifecycleManager | None = None,
         health: MemoryHealthService | None = None,
         pin: PinService | None = None,
+        conflict_inbox: ConflictInboxProjector | None = None,
+        conflict_resolution: ConflictResolutionService | None = None,
         consent: AgentShareConsentService | None = None,
     ) -> None:
         self._settings = settings
@@ -141,6 +169,15 @@ class IpcServer:
         # pinning surface (spec §7). NEVER constructed here — this class does not own them.
         self._health = health
         self._pin = pin
+        # AD-300 (conflict-resolution-async-design.md §5): unlike ``health``/``pin``,
+        # ``LocalContainer.conflict_inbox``/``.conflict_resolution`` are built UNCONDITIONALLY
+        # (they read/write ``ConflictRecordRepository`` directly, never the tier router's
+        # ``enumerate``) — but the params stay optional here on the SAME contract as ``health``/
+        # ``pin`` regardless: IpcServer never constructs a service it is handed, and a caller
+        # that has not wired one (e.g. a test double, or a future daemonless binding) gets the
+        # same named 503 rather than an ``AttributeError`` on ``None``.
+        self._conflict_inbox = conflict_inbox
+        self._conflict_resolution = conflict_resolution
         # Decision D4's client-side consent surface. Optional on the SAME contract as ``health``/
         # ``pin`` and for a stronger reason: FULL-LOCAL is the norm and a device with no server
         # configured (``ConsentSettings.server_base_url is None``) genuinely has no agent share to
@@ -258,6 +295,10 @@ class IpcServer:
             return await self._route_pin(request)
         if route == UNPIN_ROUTE:
             return await self._route_unpin(request)
+        if route == CONFLICTS_LIST_ROUTE:
+            return await self._route_conflicts_list(request)
+        if route == CONFLICTS_RESOLVE_ROUTE:
+            return await self._route_conflicts_resolve(request)
         if route == AGENT_SHARE_ROUTE:
             return await self._route_agent_share(request)
         if route == AGENT_SHARE_REVOKE_ROUTE:
@@ -477,6 +518,55 @@ class IpcServer:
         except PIN_SURFACE_ERRORS as exc:
             return pin_failure_response(exc)
         return {"status": 200, **result.model_dump(mode="json")}
+
+    # ---- conflict resolution (conflict-resolution-async-design.md §5, AD-300) ------------------
+
+    async def _route_conflicts_list(self, request: dict[str, Any]) -> dict[str, Any]:
+        """``/conflicts`` -> ``ConflictInboxProjector.view`` — the caller's own pending conflicts,
+        both sides of each named (§5's ``ConflictInboxView``). Read-pure, like ``/health``: the
+        projector holds no queue and no write port, so this route structurally cannot resolve,
+        dismiss or otherwise mutate what it lists."""
+        if self._conflict_inbox is None:
+            return unwired_response(CONFLICT_INBOX_UNWIRED)
+        try:
+            ns = conflict_namespace_on_the_wire(request)
+        except (KeyError, TypeError, ValueError):
+            return conflict_malformed_request_response()
+        refusal = conflict_private_plane_refusal(ns)
+        if refusal is not None:
+            return refusal
+        try:
+            view = await self._conflict_inbox.view(conflict_local_scope(ns), ns)
+        except CONFLICT_SURFACE_ERRORS as exc:
+            return conflict_failure_response(exc)
+        return {"status": 200, **view.model_dump(mode="json")}
+
+    async def _route_conflicts_resolve(self, request: dict[str, Any]) -> dict[str, Any]:
+        """``/conflicts/resolve`` -> ``ConflictResolutionService.resolve`` — record one human
+        decision on one conflict (supersede / keep_both / merge / quarantine / dismiss, §5's
+        write-action vocabulary). Returns the record's NEW state immediately; the decision does
+        NOT execute inline (§5 line 218) — the actual supersession lands on the background
+        DISTILL worker, same as every other write this daemon enqueues rather than applies."""
+        if self._conflict_resolution is None:
+            return unwired_response(CONFLICT_RESOLUTION_UNWIRED)
+        try:
+            ns = conflict_namespace_on_the_wire(request)
+            conflict_id = str(request["conflict_id"])
+            if not conflict_id:
+                raise ValueError("conflict_id must not be empty")
+            decision = manual_decision_of(request, ns=ns)
+        except (KeyError, TypeError, ValueError, ConflictValidationError):
+            return conflict_malformed_request_response()
+        refusal = conflict_private_plane_refusal(ns)
+        if refusal is not None:
+            return refusal
+        try:
+            record = await self._conflict_resolution.resolve(
+                conflict_local_scope(ns), ns, conflict_id, decision
+            )
+        except CONFLICT_SURFACE_ERRORS as exc:
+            return conflict_failure_response(exc)
+        return {"status": 200, **record.model_dump(mode="json")}
 
 
 def _peer_is_self(writer: asyncio.StreamWriter) -> bool:

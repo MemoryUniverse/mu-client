@@ -130,6 +130,8 @@ TOOL_SUMMARIES: Final[dict[str, str]] = {
     "health": "read the health lens over your whole private memory",
     "pin": "pin one of your memories so the lifecycle never forgets it",
     "unpin": "remove a pin you set",
+    "conflicts": "list your memories that disagree with each other, awaiting a decision",
+    "conflicts_resolve": "record your decision on one of those disagreements",
 }
 
 #: The SHARED-plane vocabulary this client recognises. Exactly one name exists in the system

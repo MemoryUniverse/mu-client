@@ -24,11 +24,15 @@ from mu_contracts.contracts.views import (
 from mu_contracts.domain.model.pin import PinRequest
 from mu_engine.storage.domain.memory import MemoryTier
 
+from mu_client.conflicts import local_scope as conflict_local_scope
+from mu_client.conflicts import namespace_for as conflict_namespace_for
 from mu_client.errors import ServiceNotWiredError
 from mu_client.mcp.guard import SharedPrivateGuard
 from mu_client.memory_health import local_scope, namespace_for, parse_health_flags
 
 if TYPE_CHECKING:
+    from mu_engine.services.conflict.inbox import ConflictInboxProjector
+    from mu_engine.services.conflict.resolution import ConflictResolutionService
     from mu_engine.services.health import MemoryHealthService
     from mu_engine.services.pin import PinService
 
@@ -40,6 +44,8 @@ __all__ = [
     "tool_add",
     "tool_ask",
     "tool_build_context",
+    "tool_conflicts",
+    "tool_conflicts_resolve",
     "tool_consolidate",
     "tool_delete",
     "tool_demote",
@@ -463,3 +469,64 @@ async def tool_unpin(
     ns = namespace_for(settings, user=user, session=session)
     result = await pin.unpin(local_scope(ns), ns, memory_id)
     return result.model_dump(mode="json")
+
+
+# ---- conflict resolution (conflict-resolution-async-design.md §5, AD-300) -----------------------
+# Same division-of-labour rationale as health/pin above: the AGENT is the reader/resolver here
+# (there is no other party inside the host to ask), so these two are gated behind
+# ``MU_MCP__EXPOSE_CONFLICTS_TOOLS`` (mcp/surface.py) rather than on by default.
+
+
+async def tool_conflicts(
+    conflict_inbox: ConflictInboxProjector | None,
+    *,
+    settings: ClientSettings,
+    user: str,
+    session: str | None,
+) -> dict[str, Any]:
+    """``conflicts`` — the caller's own pending conflicts, both sides of each named
+    (``ConflictInboxView``). Read-pure: the projector holds no queue and no write port, so this
+    tool structurally cannot resolve, dismiss or otherwise mutate what it lists. Content-free
+    EXCEPT ``ConflictMemberView.content``, which renders empty on this binding — no
+    ``ConflictMemberHydrator`` is wired yet (AD-300, reported)."""
+    if conflict_inbox is None:
+        raise ServiceNotWiredError("ConflictInboxProjector")
+    ns = conflict_namespace_for(settings, user=user, session=session)
+    view = await conflict_inbox.view(conflict_local_scope(ns), ns)
+    return view.model_dump(mode="json")
+
+
+async def tool_conflicts_resolve(
+    conflict_resolution: ConflictResolutionService | None,
+    *,
+    settings: ClientSettings,
+    conflict_id: str,
+    kind: str,
+    user: str,
+    session: str | None,
+    winner_id: str | None = None,
+    merged_text_ref: str | None = None,
+) -> dict[str, Any]:
+    """``conflicts_resolve`` — record one decision on one pending conflict: ``supersede``
+    (pick ``winner_id``), ``keep_both``, ``merge`` (``winner_id`` + ``merged_text_ref``),
+    ``quarantine`` (``winner_id``) or ``dismiss`` (§5's write-action vocabulary). Returns the
+    record's NEW state immediately — the decision does NOT execute inline (§5 line 218); the
+    actual supersession lands on the background DISTILL worker. ``resolved_by`` is the caller's
+    own η.user (audit only, never read from the model — there is exactly one principal on this
+    plane, the same discipline ``local_scope`` applies everywhere else on it).
+    """
+    if conflict_resolution is None:
+        raise ServiceNotWiredError("ConflictResolutionService")
+    # Imported lazily, matching ``mu_client.conflicts.manual_decision_of`` — read here and
+    # nowhere else in this module.
+    from mu_engine.services.conflict.resolution import ManualDecision, ManualDecisionKind
+
+    ns = conflict_namespace_for(settings, user=user, session=session)
+    decision = ManualDecision(
+        kind=ManualDecisionKind(kind),
+        winner_id=winner_id,
+        merged_text_ref=merged_text_ref,
+        resolved_by=ns.user,
+    )
+    record = await conflict_resolution.resolve(conflict_local_scope(ns), ns, conflict_id, decision)
+    return record.model_dump(mode="json")

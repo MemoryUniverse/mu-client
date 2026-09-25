@@ -299,6 +299,18 @@ class McpSettings(BaseModel):
     # — on the agent-facing surface. Independent of `expose_health_tool` on purpose.
     expose_pin_tools: bool = False
 
+    # ---- conflict resolution (conflict-resolution-async-design.md §5, AD-300) ---------------
+    # Same OFF-by-default, independent-flag discipline as `expose_health_tool`/`expose_pin_tools`
+    # above, for the SAME reasons: `conflicts` (list) is read-pure like `health`;
+    # `conflicts_resolve` is a lifecycle-changing decision like `pin`/`unpin` — but the two are
+    # gated by ONE flag here rather than split, because unlike health/pin an agent cannot usefully
+    # see a conflict it cannot also resolve (the whole point of the tool is "here are two facts
+    # that disagree — decide"), so splitting them would only ever be turned on together.
+    #
+    # env: MU_MCP__EXPOSE_CONFLICTS_TOOLS — default OFF. ON puts `conflicts`/`conflicts_resolve`
+    # on the agent-facing surface, closing the MCP leg of AD-300's three read/write faces.
+    expose_conflicts_tools: bool = False
+
 
 class OutboxSettings(BaseModel):
     """capture-spec.md §10/§8.3, same literal default path as ``ClientSettings.outbox_db_path``

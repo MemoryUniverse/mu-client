@@ -23,6 +23,8 @@ from typing import Any, TypeVar
 
 from mu_contracts.contracts.recall import RecallResult
 from mu_contracts.contracts.views import MemoryWriteResult
+from mu_contracts.domain.model.conflict import ConflictRecord
+from mu_contracts.domain.model.conflict_inbox import ConflictInboxView
 from mu_contracts.domain.model.health import MemoryHealthView
 from mu_contracts.domain.model.pin import PinResult
 from mu_engine.storage.domain.memory import MemoryTier
@@ -33,6 +35,13 @@ from mu_client.capture.codex import backfill_codex
 from mu_client.capture.hook import capture_once, replay_spool
 from mu_client.capture.model import HostKind
 from mu_client.config import get_client_settings, render_endpoint_env
+from mu_client.conflicts import (
+    CONFLICTS_LIST_ROUTE,
+    CONFLICTS_RESOLVE_ROUTE,
+)
+from mu_client.conflicts import (
+    namespace_for as conflict_namespace_for,
+)
 from mu_client.consent.composition import open_consent_service
 from mu_client.consent.wire import NAMED_REASON_RULE
 from mu_client.daemon.app import LocalDaemon
@@ -118,6 +127,47 @@ def _build_parser() -> argparse.ArgumentParser:
     unpin_p.add_argument("memory_id", help="The id of the memory to unpin.")
     unpin_p.add_argument("--user", default=None, help="Overrides ClientSettings.default_user.")
     unpin_p.add_argument("--session", default=None, help="Session id (default: 'default').")
+
+    # ---- conflict resolution (conflict-resolution-async-design.md §5, AD-300) ------------------
+    # A conflict FULL-LOCAL can already detect and, once a human decides, apply (AD-269) — but
+    # until this had no verb to see one or say what to do about it. Same daemon-socket discipline
+    # as health/pin/unpin above (nested subparser, mirroring `mu outbox redrive`).
+    conflicts_p = sub.add_parser(
+        "conflicts", help="See and resolve memories that disagree with each other (AD-300)."
+    )
+    conflicts_sub = conflicts_p.add_subparsers(dest="conflicts_action", required=True)
+
+    conflicts_list_p = conflicts_sub.add_parser(
+        "list", help="List your pending conflicts, both sides of each. Read-only."
+    )
+    conflicts_list_p.add_argument("--user", default=None, help="Overrides default_user.")
+    conflicts_list_p.add_argument(
+        "--session", default=None, help="Session id (default: 'default')."
+    )
+
+    conflicts_resolve_p = conflicts_sub.add_parser(
+        "resolve", help="Record your decision on one pending conflict."
+    )
+    conflicts_resolve_p.add_argument("conflict_id", help="The id from 'mu conflicts list'.")
+    conflicts_resolve_p.add_argument(
+        "kind",
+        choices=["supersede", "keep_both", "merge", "quarantine", "dismiss"],
+        help="supersede/merge/quarantine need --winner-id; merge also needs --merged-text-ref; "
+        "keep_both and dismiss take neither.",
+    )
+    conflicts_resolve_p.add_argument(
+        "--winner-id", default=None, dest="winner_id", help="The memory id that wins."
+    )
+    conflicts_resolve_p.add_argument(
+        "--merged-text-ref",
+        default=None,
+        dest="merged_text_ref",
+        help="A REFERENCE to the merged draft (kind=merge only) — never the merged text itself.",
+    )
+    conflicts_resolve_p.add_argument("--user", default=None, help="Overrides default_user.")
+    conflicts_resolve_p.add_argument(
+        "--session", default=None, help="Session id (default: 'default')."
+    )
 
     # ---- Decision D4: the agent-share consent surface -----------------------------------------
     # D4 §4.2-D step 4 asks for an explicit opt-in flow that "shows the exposes-vs-private
@@ -443,6 +493,67 @@ def _render_pin(result: PinResult) -> None:
     )
 
 
+def _render_conflicts_list(view: ConflictInboxView) -> None:
+    """Content-free by construction (``ConflictInboxView`` is a ``ContentFreeModel`` throughout
+    EXCEPT ``ConflictMemberView.content``, which this binding wires no hydrator for yet — see
+    :mod:`mu_client.conflicts` — so a member's body prints empty until AD-300's own reported gap
+    closes; the conflict itself, both member ids and which side the strategy would pick are
+    real."""
+    alert = " [BACKLOG]" if view.backlog_alert else ""
+    print(f"pending={view.pending_count}{alert}")
+    if not view.pending:
+        print("(no pending conflicts)")
+        return
+    for item in view.pending:
+        print(
+            f"{item.conflict_id}  {item.state.value}  method={item.method}  "
+            f"confidence={item.detected_confidence:.2f}  policy={item.effective_policy.value}"
+        )
+        for member in item.members:
+            pick = " [proposed winner]" if member.is_proposed_winner else ""
+            body = f"  {member.content}" if member.content else "  (body not hydrated)"
+            print(f"    {member.memory_id}  {member.tier.value}{pick}{body}")
+
+
+def _render_conflicts_resolve(record: ConflictRecord) -> None:
+    print(
+        f"conflict_id={record.conflict_id} state={record.state.value} "
+        f"resolution_kind={record.resolution_kind.value if record.resolution_kind else '-'} "
+        f"resolved_winner_id={record.resolved_winner_id or '-'}"
+    )
+
+
+async def _run_conflicts_list(args: argparse.Namespace) -> int:
+    settings = get_client_settings()
+    ns = conflict_namespace_for(settings, user=args.user, session=args.session)
+    reply = await IpcClient(settings.ipc).request(
+        CONFLICTS_LIST_ROUTE, {"namespace": list(ns.parts())}
+    )
+    if reply.get("status") != 200:
+        return _render_ipc_failure(reply)
+    _render_conflicts_list(_reply_body(ConflictInboxView, reply))
+    return 0
+
+
+async def _run_conflicts_resolve(args: argparse.Namespace) -> int:
+    settings = get_client_settings()
+    ns = conflict_namespace_for(settings, user=args.user, session=args.session)
+    reply = await IpcClient(settings.ipc).request(
+        CONFLICTS_RESOLVE_ROUTE,
+        {
+            "namespace": list(ns.parts()),
+            "conflict_id": args.conflict_id,
+            "kind": args.kind,
+            "winner_id": args.winner_id,
+            "merged_text_ref": args.merged_text_ref,
+        },
+    )
+    if reply.get("status") != 200:
+        return _render_ipc_failure(reply)
+    _render_conflicts_resolve(_reply_body(ConflictRecord, reply))
+    return 0
+
+
 async def _run_health(args: argparse.Namespace) -> int:
     settings = get_client_settings()
     ns = namespace_for(settings, user=args.user, session=args.session)
@@ -696,6 +807,11 @@ async def _run(argv: Sequence[str]) -> int:
         return await _run_health(args)
     if args.command in (PIN_ROUTE, UNPIN_ROUTE):
         return await _run_pin(args, route=args.command)
+    if args.command == "conflicts":
+        if args.conflicts_action == "list":
+            return await _run_conflicts_list(args)
+        if args.conflicts_action == "resolve":
+            return await _run_conflicts_resolve(args)
     if args.command == "agent-share":
         return await _run_agent_share(args)
     if args.command == "outbox":
