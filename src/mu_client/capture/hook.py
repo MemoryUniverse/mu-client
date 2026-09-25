@@ -246,7 +246,9 @@ async def _direct_append_or_spool(
         _spool(settings, host, raw)
         return
 
-    outbox = SqliteOutbox(settings.outbox.outbox_path)
+    outbox = SqliteOutbox(
+        settings.outbox.outbox_path, credential_policy=settings.capture.credential_policy
+    )
     try:
         await outbox.open()
         await outbox.append(activity)

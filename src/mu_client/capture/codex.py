@@ -454,7 +454,9 @@ async def backfill_codex(
         or session_id_from_rollout_name(rollout_path.expanduser())
         or (rollout_path.expanduser().stem)
     )
-    outbox = SqliteOutbox(settings.outbox.outbox_path)
+    outbox = SqliteOutbox(
+        settings.outbox.outbox_path, credential_policy=settings.capture.credential_policy
+    )
     await outbox.open()
     try:
         checkpoint = await outbox.load_checkpoint(_source_id(resolved))

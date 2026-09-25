@@ -177,7 +177,10 @@ class LocalDaemon:
 
         # 2) DURABILITY SPINE — the SQLite-WAL outbox (capture-spec.md §8.3). replay of any
         #    INFLIGHT->PENDING crash-recovery runs inside SqliteOutbox.open().
-        self._outbox = SqliteOutbox(self._settings.outbox.outbox_path)
+        self._outbox = SqliteOutbox(
+            self._settings.outbox.outbox_path,
+            credential_policy=self._settings.capture.credential_policy,
+        )
         await self._outbox.open()
         # Recover any hook-client spool (idempotent, UNIQUE(activity_id)).
         await replay_spool(self._settings, self._outbox)

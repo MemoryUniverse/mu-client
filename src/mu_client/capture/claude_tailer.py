@@ -484,7 +484,9 @@ async def backfill_thinking(
         decision_importance=settings.capture.thinking_decision_importance,
         finding_importance=settings.capture.thinking_finding_importance,
     )
-    outbox = SqliteOutbox(settings.outbox.outbox_path)
+    outbox = SqliteOutbox(
+        settings.outbox.outbox_path, credential_policy=settings.capture.credential_policy
+    )
     await outbox.open()
     try:
         sid = session_id or transcript_path.expanduser().stem

@@ -34,3 +34,6 @@ data/
 .serena/
 logs/
 .mu_data/
+
+# per-lane git worktrees — never committed
+.worktrees/

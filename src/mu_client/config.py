@@ -41,6 +41,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from mu_contracts.config.settings import StorageSettings
+from mu_engine.platform.observability import CredentialPolicy
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -219,6 +220,15 @@ class CaptureSettings(BaseModel):
     # costs a bounded extraction; too high a value leaves memory session-trapped for longer.
     # env: MU_CAPTURE__CONSOLIDATE_EVERY_N_CAPTURES
     consolidate_every_n_captures: int = Field(default=20, ge=1)
+
+    # AD-294 — the owner's policy for a credential a user dictates into a captured turn, threaded
+    # into the daemon outbox (`SqliteOutbox._apply_credential_policy`) at every real capture entry
+    # point (daemon, `mu capture-once`, the Claude Code + Codex tailers). Reuses the SAME
+    # `CredentialPolicy` enum + `_CREDENTIAL_VALUE_PATTERNS` catalog the engine's
+    # `IngestSettings.credential_policy` applies at `IngestService.remember` — one policy value,
+    # two enforcement points (capture-time here, ingest-time there), never two matchers. Default
+    # REDACT (AD-294's sane default). env: MU_CAPTURE__CREDENTIAL_POLICY (`redact`|`refuse`|`mark`)
+    credential_policy: CredentialPolicy = Field(default=CredentialPolicy.REDACT)
 
 
 class McpSettings(BaseModel):

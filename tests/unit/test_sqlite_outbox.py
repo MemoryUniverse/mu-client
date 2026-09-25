@@ -3,16 +3,21 @@ itself is a leaf adapter, not something the DEV-STANDARDS integration-only rule 
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from mu_engine.platform.observability import CredentialInTextRejectedError, CredentialPolicy
 
 from mu_client.capture.model import ActivityKind, HostKind, RawActivity
 from mu_client.outbox.model import RecordState
 from mu_client.outbox.sqlite_outbox import SqliteOutbox
 
 pytestmark = pytest.mark.unit
+
+#: SYNTHETIC — a made-up body in the real Anthropic-key format (never a real credential).
+_FAKE_ANTHROPIC_KEY = "sk-ant-api03-" + "Zq7" * 14
 
 
 def _activity(offset: str = "off-1", text: str | None = "hello") -> RawActivity:
@@ -205,3 +210,70 @@ async def test_delete_by_content_hash_leaves_an_inflight_row_for_the_same_hash(
 
     assert removed == 1  # only the acked row
     assert await outbox.outbox_depth() == 1  # the pending row survives, undisturbed
+
+
+# ── AD-294: capture-time credential redaction ──────────────────────────────────────────────────
+# Reuses the AD-267 catalog (`mu_engine.platform.observability`) — proven here at the OTHER
+# choke point it must also cover (`SqliteOutbox.append`, this repo's own "daemon outbox" —
+# `mu_contracts.domain.model.enrichment`'s module docstring names it that, by contrast with the
+# content-free enrichment queue). Fast + local: SQLite is an embedded leaf adapter, no VM store
+# needed, same precedent every other test in this file already follows.
+
+
+async def test_append_redacts_a_credential_shaped_text_by_default(tmp_path: Path) -> None:
+    """Default `SqliteOutbox()` (no `credential_policy=` argument) must still redact — proves the
+    DEFAULT is REDACT, not merely that redaction exists when explicitly asked for."""
+    box = SqliteOutbox(tmp_path / "outbox.sqlite")
+    await box.open()
+    text = f"my anthropic key is {_FAKE_ANTHROPIC_KEY}, remember I use Anthropic"
+
+    rec = await box.append(_activity(offset="cred-redact", text=text))
+
+    stored = rec.activity.text or ""
+    assert _FAKE_ANTHROPIC_KEY not in stored
+    assert "[REDACTED:anthropic_key]" in stored
+    assert "remember I use Anthropic" in stored, "REDACT must keep the surrounding memory"
+
+    conn = box._conn
+    assert conn is not None
+    row = conn.execute(
+        "SELECT activity_json, content_hash FROM outbox WHERE activity_id=?",
+        (rec.activity.activity_id,),
+    ).fetchone()
+    assert _FAKE_ANTHROPIC_KEY not in row[0], "the credential must never reach the durable row"
+    assert row[1] == hashlib.sha256(stored.encode("utf-8")).hexdigest(), (
+        "content_hash must be recomputed from the REDACTED text, not left describing raw content "
+        "nothing durable holds any more"
+    )
+
+
+async def test_append_under_refuse_policy_writes_no_row_at_all(tmp_path: Path) -> None:
+    box = SqliteOutbox(tmp_path / "outbox.sqlite", credential_policy=CredentialPolicy.REFUSE)
+    await box.open()
+    text = f"my anthropic key is {_FAKE_ANTHROPIC_KEY}"
+
+    with pytest.raises(CredentialInTextRejectedError, match="anthropic_key") as excinfo:
+        await box.append(_activity(offset="cred-refuse", text=text))
+
+    assert _FAKE_ANTHROPIC_KEY not in str(excinfo.value), "rule 3: never repeat the value"
+    assert await box.outbox_depth() == 0, "REFUSE must raise BEFORE the transaction, not after"
+
+
+async def test_append_under_mark_policy_keeps_text_byte_for_byte(tmp_path: Path) -> None:
+    box = SqliteOutbox(tmp_path / "outbox.sqlite", credential_policy=CredentialPolicy.MARK)
+    await box.open()
+    text = f"my anthropic key is {_FAKE_ANTHROPIC_KEY}"
+
+    rec = await box.append(_activity(offset="cred-mark", text=text))
+
+    assert rec.activity.text == text, "MARK stores verbatim — unlike REDACT, unlike REFUSE"
+
+
+async def test_append_leaves_control_kind_text_none_activities_alone(tmp_path: Path) -> None:
+    """A pure-control activity (`text=None`) must not trip the redaction pass at all."""
+    box = SqliteOutbox(tmp_path / "outbox.sqlite")
+    await box.open()
+
+    rec = await box.append(_activity(offset="ctrl-1", text=None))
+
+    assert rec.activity.text is None

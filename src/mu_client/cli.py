@@ -628,7 +628,9 @@ async def _run_backfill_codex(args: argparse.Namespace) -> int:
 
 async def _run_flush() -> int:
     settings = get_client_settings()
-    outbox = SqliteOutbox(settings.outbox.outbox_path)
+    outbox = SqliteOutbox(
+        settings.outbox.outbox_path, credential_policy=settings.capture.credential_policy
+    )
     await outbox.open()
     try:
         replayed = await replay_spool(settings, outbox)

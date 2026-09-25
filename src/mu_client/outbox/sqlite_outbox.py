@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from mu_engine.platform.observability import CredentialPolicy, redact_credentials
+
 from mu_client.capture.model import CaptureCheckpoint, HostKind, RawActivity
 from mu_client.errors import OutboxCorruptionError
 from mu_client.outbox.model import OutboxBatch, OutboxRecord, RecordState
@@ -63,15 +65,29 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 class SqliteOutbox:
     """capture-spec.md §8.3 ``OutboxPort`` — the ONE implementation the daemon and the daemonless
     ``mu capture-once``/``mu flush`` CLI paths share (daemon-app-skeleton-spec.md §6 "Skeleton
     obligation": one outbox, one substrate, differing only in trigger)."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self, path: Path, *, credential_policy: CredentialPolicy = CredentialPolicy.REDACT
+    ) -> None:
         self._path = path.expanduser()
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
+        # AD-294 — default REDACT so every EXISTING call site (this outbox is constructed at five
+        # capture entry points: the daemon, `mu capture-once`, the Claude Code transcript tailer,
+        # the Codex tailer, and tests) is protected without needing to change, exactly the
+        # "additive, backward-compatible default" precedent this codebase already uses (e.g.
+        # `IngestSettings.stm_dedup`). A caller that wants the owner's actual configured policy
+        # threads `settings.capture.credential_policy` explicitly (`daemon/app.py`,
+        # `capture/hook.py`, `capture/claude_tailer.py`, `capture/codex.py`, `cli.py`).
+        self._credential_policy = credential_policy
 
     @property
     def is_open(self) -> bool:
@@ -116,13 +132,50 @@ class SqliteOutbox:
             raise RuntimeError("SqliteOutbox.open() was not called")
         return self._conn
 
+    def _apply_credential_policy(self, activity: RawActivity) -> RawActivity:
+        """AD-294 — reuse the AD-267 credential-shape catalog
+        (:func:`mu_engine.platform.observability.redact_credentials`) on ``activity.text`` before
+        it is ever serialized into a row. Pure, synchronous, no I/O, no logging (rule 3 — a
+        matched shape name reaches only the raised ``CredentialInTextRejectedError`` message under
+        ``REFUSE``, never a log call).
+
+        Under ``CredentialPolicy.MARK`` this is a no-op at this layer: ``RawActivity`` is the
+        pinned adapter-edge wire shape (capture-spec.md §4.1, "verbatim shape") and gains no new
+        field here; the mark itself is applied once, structurally, in
+        ``IngestService.remember`` (`credential_shaped` on the resulting `MemoryItem`) rather
+        than duplicated onto this transport type.
+
+        Known, documented gap for ``REFUSE`` at THIS layer (not the engine's `remember`, which has
+        no checkpoint concept): the raised exception propagates to the caller before the source
+        checkpoint advances, so a tailer/hook that does not itself skip the offending offset will
+        see the SAME raw record again next read and refuse it again — REFUSE's guarantee here is
+        "never durably stored", not "exactly-once forward progress past a refusal". Out of this
+        lane's scope; not hidden (DEV-STANDARDS: a tracked gap, not a silent one)."""
+        if activity.text is None:
+            return activity
+        outcome = redact_credentials(activity.text, policy=self._credential_policy)
+        if not outcome.credential_shaped or outcome.text == activity.text:
+            return activity
+        return activity.model_copy(
+            update={"text": outcome.text, "content_hash": _sha256_text(outcome.text)}
+        )
+
     # --------------------------------------------------------------------------------- durability
     async def append(
         self, activity: RawActivity, *, checkpoint: CaptureCheckpoint | None = None
     ) -> OutboxRecord:
         """One transaction: record + checkpoint advance together, fsync'd (``synchronous=FULL``)
         before returning. ``INSERT OR IGNORE`` + ``UNIQUE(activity_id)`` makes a redelivery a
-        no-op — the SAME row (not a duplicate) is returned either way."""
+        no-op — the SAME row (not a duplicate) is returned either way.
+
+        AD-294 — ``activity`` is run through :meth:`_apply_credential_policy` FIRST, before the
+        transaction below, so a credential-shaped ``text`` never reaches ``activity_json`` (this
+        row is the one durable client-side store built to carry raw captured content — see
+        ``mu_contracts.domain.model.enrichment``'s module docstring, which names this exact table
+        "the daemon outbox" as the deliberate contrast to the content-free enrichment queue).
+        Under ``CredentialPolicy.REFUSE`` this raises before the transaction opens — no partial
+        row, no checkpoint advance for a refused activity."""
+        activity = self._apply_credential_policy(activity)
         conn = self._require_conn()
 
         def _do() -> tuple[int, str, int, str]:
