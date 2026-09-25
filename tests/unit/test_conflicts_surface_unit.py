@@ -339,8 +339,7 @@ async def test_mu_conflicts_resolve_drives_the_daemon(
     cli_daemon(daemon.settings)
 
     assert (
-        await cli._run(["conflicts", "resolve", "c1", "supersede", "--winner-id", "incoming"])
-        == 0
+        await cli._run(["conflicts", "resolve", "c1", "supersede", "--winner-id", "incoming"]) == 0
     )
     out = capsys.readouterr().out
     assert "state=resolved" in out
@@ -374,9 +373,7 @@ async def test_conflicts_tools_are_independently_gated() -> None:
     assert {"conflicts", "conflicts_resolve"} <= on
     # Turning the OTHER flags on must not also expose these — two different product rules.
     off = await _tool_names(
-        ClientSettings(
-            mcp={"expose_health_tool": True, "expose_pin_tools": True}, model=None
-        )
+        ClientSettings(mcp={"expose_health_tool": True, "expose_pin_tools": True}, model=None)
     )
     assert {"conflicts", "conflicts_resolve"} & off == set()
 
